@@ -90,6 +90,7 @@ struct ContentView: View {
     @EnvironmentObject var player: MixPlayer
     @State private var selection: SidebarItem? = .library
     @State private var renaming: UUID?
+    @FocusState private var renameFocused: Bool
 
     var body: some View {
         NavigationSplitView {
@@ -99,12 +100,17 @@ struct ContentView: View {
                 }
                 Section("Playlists") {
                     ForEach($library.playlists) { $playlist in
-                        Group {
+                        Label {
                             if renaming == playlist.id {
-                                TextField("Name", text: $playlist.name).onSubmit { renaming = nil; library.save() }
+                                TextField("Name", text: $playlist.name)
+                                    .focused($renameFocused)
+                                    .onSubmit { endRename() }
+                                    .onAppear { renameFocused = true }
                             } else {
-                                Label(playlist.name, systemImage: player.queue?.context == playlist.id ? "speaker.wave.2.fill" : "music.note.list")
+                                Text(playlist.name)
                             }
+                        } icon: {
+                            Image(systemName: player.queue?.context == playlist.id ? "speaker.wave.2.fill" : "music.note.list")
                         }
                         .tag(SidebarItem.playlist(playlist.id))
                         .contextMenu {
@@ -115,18 +121,20 @@ struct ContentView: View {
                 }
             }
             .navigationSplitViewColumnWidth(min: 180, ideal: 210)
+            // Clicking away ends a rename as Return does; without this the field stayed up indefinitely.
+            .onChange(of: renameFocused) { _, focused in if !focused { endRename() } }
             .safeAreaInset(edge: .bottom) {
                 Button { newPlaylist() } label: { Label("New Playlist", systemImage: "plus") }
                     .buttonStyle(.plain).foregroundStyle(.secondary).padding(10).frame(maxWidth: .infinity, alignment: .leading)
             }
         } detail: {
-            Group {
+            // A plain stack rather than a safe-area inset: the playlist's split view is AppKit-backed and ignores
+            // insets, so the bar would cover its last row.
+            VStack(spacing: 0) {
                 switch selection {
                 case .playlist(let id): PlaylistView(playlistID: id).id(id)
                 default: LibraryView()
                 }
-            }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
                 if player.queue != nil { NowPlayingBar() }
             }
         }
@@ -140,6 +148,12 @@ struct ContentView: View {
         library.save()
         selection = .playlist(p.id)
         renaming = p.id
+    }
+
+    private func endRename() {
+        guard renaming != nil else { return }
+        renaming = nil
+        library.save()
     }
 
     private func delete(_ id: UUID) {
