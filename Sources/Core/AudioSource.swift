@@ -2,6 +2,8 @@ import Accelerate
 import AVFoundation
 import CryptoKit
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 let sampleRate = 44100.0
 
@@ -59,6 +61,30 @@ enum AudioSource {
         try await export.export(to: tmp, as: .m4a)
         try FileManager.default.moveItem(at: tmp, to: out)
         return out
+    }
+
+    /// The file's cover art as a JPEG thumbnail, read from its tags once and cached at `cache` (an empty file there
+    /// means the song has none). Full-size art runs to megabytes decoded, too much to hold for every row.
+    static func artwork(for url: URL, cachedAt cache: URL) async -> Data? {
+        if let data = try? Data(contentsOf: cache) { return data.isEmpty ? nil : data }
+        guard let items = try? await AVURLAsset(url: url).load(.commonMetadata) else { return nil } // retry next launch
+        var thumb: Data?
+        if let item = items.first(where: { $0.commonKey == .commonKeyArtwork }),
+           let raw = try? await item.load(.dataValue),
+           let source = CGImageSourceCreateWithData(raw as CFData, nil),
+           let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+               kCGImageSourceCreateThumbnailFromImageAlways: true,
+               kCGImageSourceCreateThumbnailWithTransform: true,
+               kCGImageSourceThumbnailMaxPixelSize: 256,
+           ] as CFDictionary) {
+            let out = NSMutableData()
+            if let dest = CGImageDestinationCreateWithData(out, UTType.jpeg.identifier as CFString, 1, nil) {
+                CGImageDestinationAddImage(dest, image, [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary)
+                if CGImageDestinationFinalize(dest) { thumb = out as Data }
+            }
+        }
+        try? (thumb ?? Data()).write(to: cache, options: .atomic)
+        return thumb
     }
 
     /// Decodes a file to 44.1 kHz stereo float.

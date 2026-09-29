@@ -35,13 +35,30 @@ final class MixRenderer {
         return AVAudioUnitEffect(audioComponentDescription: d)
     }
 
-    /// Renders `items` in sequence. The first song starts at `startTime`; rendering stops `tail` seconds after the
-    /// last song's entering transition ends (or at the last song's end if `tail` is nil).
+    static let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
+
+    /// Which song the listener hears: the index into the rendered items and its song time.
+    struct Position { let index: Int; let songTime: Double }
+
+    /// Renders `items` in sequence to a file. See `render(_:startTime:tail:progress:write:)`.
     static func render(_ items: [Item], startTime: Double, tail: Double?, to output: URL,
                        progress: ((Double) -> Void)? = nil) throws -> Double {
+        let file = try AVAudioFile(forWriting: output, settings: format.settings)
+        defer { file.close() }
+        return try render(items, startTime: startTime, tail: tail, progress: progress) { buffer, _ in
+            try file.write(from: buffer)
+            return true
+        }
+    }
+
+    /// Renders `items` in sequence, handing each block to `write` until it returns false. The first song starts at
+    /// `startTime`; rendering stops `tail` seconds after the last song's entering transition ends (or at the last
+    /// song's end if `tail` is nil). A song without a `leaving` side hands over to the next when it ends, with no
+    /// transition. Returns the seconds rendered.
+    static func render(_ items: [Item], startTime: Double, tail: Double?, progress: ((Double) -> Void)? = nil,
+                       write: (AVAudioPCMBuffer, Position) throws -> Bool) throws -> Double {
         _ = registerSonic
         let block: AVAudioFrameCount = 512
-        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
         let engine = AVAudioEngine()
         try engine.enableManualRenderingMode(.offline, format: format, maximumFrameCount: block)
         let master = AVAudioMixerNode()
@@ -58,24 +75,34 @@ final class MixRenderer {
         try engine.start()
         defer { engine.stop() }
 
-        let file = try AVAudioFile(forWriting: output, settings: format.settings)
-        defer { file.close() }
         let buffer = AVAudioPCMBuffer(pcmFormat: engine.manualRenderingFormat, frameCapacity: block)!
+        // Songs are decoded when the one before them starts and released when they finish, so a long playlist holds
+        // at most about three songs in memory instead of all of them.
+        try chains[0].load()
+        if chains.count > 1 { try chains[1].load() }
         chains[0].position = max(0, startTime) * sampleRate
         chains[0].active = true
         let last = chains.count - 1
         let total = max(1, (chains.last?.duration ?? 1) + chains.dropLast().map(\.duration).reduce(0, +) - startTime)
-        var t = 0.0, stopAt: Double?
+        var t = 0.0, stopAt: Double?, current = 0
         while true {
             for i in 0..<last where chains[i].active && !chains[i + 1].active {
-                if let leaving = chains[i].item.leaving, chains[i].songTime >= leaving.start {
+                let handoff = chains[i].item.leaving.map { chains[i].songTime >= $0.start } ?? chains[i].finished
+                if handoff {
                     chains[i + 1].position = (chains[i + 1].item.entering?.start ?? 0) * sampleRate
                     chains[i + 1].active = true
+                    if i + 2 <= last { try chains[i + 2].load() }
                 }
             }
             for c in chains where c.active && !c.finished {
                 if let leaving = c.item.leaving, c.songTime >= leaving.end { c.finished = true }
                 if c.songTime >= c.duration { c.finished = true }
+                if c.finished { c.unload() }
+            }
+            // The listener's song changes halfway through the transition into the next one.
+            if current < last, chains[current + 1].active,
+               chains[current + 1].songTime >= chains[current + 1].item.entering.map({ ($0.start + $0.end) / 2 }) ?? 0 {
+                current += 1
             }
             if stopAt == nil, chains[last].active {
                 if let tail, let entering = chains[last].item.entering, chains[last].songTime >= entering.end {
@@ -88,7 +115,7 @@ final class MixRenderer {
             if t > total + 120 { break } // safety
             chains.forEach { $0.apply() }
             guard try engine.renderOffline(block, to: buffer) == .success else { break }
-            try file.write(from: buffer)
+            guard try write(buffer, Position(index: current, songTime: chains[current].songTime)) else { break }
             t += Double(block) / sampleRate
             progress?(min(1, t / total))
         }
@@ -98,7 +125,8 @@ final class MixRenderer {
 
 private final class Chain {
     let item: MixRenderer.Item
-    let audio: AVAudioPCMBuffer
+    private(set) var audio: AVAudioPCMBuffer?
+    let duration: Double
     var position: Double = 0
     var active = false
     var finished = false
@@ -115,23 +143,24 @@ private final class Chain {
     var units = [String: AVAudioUnitEffect]()
 
     var songTime: Double { position / sampleRate }
-    var duration: Double { Double(audio.frameLength) / sampleRate }
 
     init(item: MixRenderer.Item, format: AVAudioFormat) throws {
         self.item = item
-        audio = try AudioSource.loadPCM(item.audio)
+        let file = try AVAudioFile(forReading: item.audio)
+        duration = Double(file.length) / file.processingFormat.sampleRate
         var this: Chain!
+        // Offline rendering pulls this block synchronously on the rendering thread, the same thread that loads and
+        // unloads `audio`, so it needs no locking.
         source = AVAudioSourceNode(format: format) { isSilence, _, frameCount, abl in
             let buffers = UnsafeMutableAudioBufferListPointer(abl)
             let chain = this!
-            let total = Int(chain.audio.frameLength)
             var produced = 0
-            if chain.active && !chain.finished {
+            if chain.active && !chain.finished, let audio = chain.audio {
                 let start = Int(chain.position)
-                produced = max(0, min(Int(frameCount), total - start))
+                produced = max(0, min(Int(frameCount), Int(audio.frameLength) - start))
                 for (c, buf) in buffers.enumerated() {
                     let dst = buf.mData!.assumingMemoryBound(to: Float.self)
-                    let src = chain.audio.floatChannelData![min(c, Int(chain.audio.format.channelCount) - 1)]
+                    let src = audio.floatChannelData![min(c, Int(audio.format.channelCount) - 1)]
                     for i in 0..<produced { dst[i] = src[start + i] }
                     for i in produced..<Int(frameCount) { dst[i] = 0 }
                 }
@@ -149,6 +178,9 @@ private final class Chain {
             if let u = MixRenderer.effect(sub) { units[box] = u }
         }
     }
+
+    func load() throws { if audio == nil { audio = try AudioSource.loadPCM(item.audio) } }
+    func unload() { audio = nil }
 
     func attach(to engine: AVAudioEngine, destination: AVAudioMixerNode, bus: AVAudioNodeBus, format: AVAudioFormat) {
         let nodes: [AVAudioNode] = [source, stretch, mixer, output] + Array(gains.values) + Array(units.values)

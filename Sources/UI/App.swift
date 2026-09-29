@@ -43,11 +43,13 @@ struct ExportMixCommand: View {
 struct PinkDiamondApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var library = Library()
+    @StateObject private var player = MixPlayer()
 
     var body: some Scene {
         WindowGroup("pink diamond") {
             ContentView()
                 .environmentObject(library)
+                .environmentObject(player)
                 .frame(minWidth: 1000, minHeight: 650)
         }
         .windowStyle(.hiddenTitleBar)
@@ -61,6 +63,7 @@ enum SidebarItem: Hashable { case library, playlist(UUID) }
 
 struct ContentView: View {
     @EnvironmentObject var library: Library
+    @EnvironmentObject var player: MixPlayer
     @State private var selection: SidebarItem? = .library
     @State private var renaming: UUID?
 
@@ -76,7 +79,7 @@ struct ContentView: View {
                             if renaming == playlist.id {
                                 TextField("Name", text: $playlist.name).onSubmit { renaming = nil; library.save() }
                             } else {
-                                Label(playlist.name, systemImage: "music.note.list")
+                                Label(playlist.name, systemImage: player.queue?.context == playlist.id ? "speaker.wave.2.fill" : "music.note.list")
                             }
                         }
                         .tag(SidebarItem.playlist(playlist.id))
@@ -93,9 +96,14 @@ struct ContentView: View {
                     .buttonStyle(.plain).foregroundStyle(.secondary).padding(10).frame(maxWidth: .infinity, alignment: .leading)
             }
         } detail: {
-            switch selection {
-            case .playlist(let id): PlaylistView(playlistID: id).id(id)
-            default: LibraryView()
+            Group {
+                switch selection {
+                case .playlist(let id): PlaylistView(playlistID: id).id(id)
+                default: LibraryView()
+                }
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if player.queue != nil { NowPlayingBar() }
             }
         }
         .tint(Theme.accent)
@@ -111,6 +119,7 @@ struct ContentView: View {
     }
 
     private func delete(_ id: UUID) {
+        if player.queue?.context == id { player.stop() }
         library.playlists.removeAll { $0.id == id }
         library.save()
         if selection == .playlist(id) { selection = .library }

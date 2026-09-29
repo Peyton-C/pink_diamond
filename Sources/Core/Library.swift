@@ -7,11 +7,13 @@ struct Song: Codable, Identifiable, Hashable {
     var path: String
     var title: String
     var artist: String
+    var album: String?               // nil until read from the file's tags (older libraries predate it)
     var genre: Genre = .pop
     var isStem: Bool
     var fileKey: String
 
     var url: URL { URL(fileURLWithPath: path) }
+    var albumName: String { album ?? "" }
     var fakeCatalogID: String { "99" + String(fileKey.prefix(8)) }
 }
 
@@ -38,6 +40,8 @@ final class Library: ObservableObject {
     @Published private(set) var states: [UUID: SongState] = [:]
     @Published private(set) var analyses: [UUID: SongAnalysis] = [:]
     @Published private(set) var plans: [String: PlanState] = [:]
+    @Published private(set) var artwork: [UUID: NSImage] = [:]
+    private var albumArtwork: [String: NSImage] = [:]   // updated alongside `artwork`, whose publish redraws
     private var playable: [UUID: URL] = [:]
     private var pendingPlans: Set<String> = []
     private var analysisQueue: [UUID] = []
@@ -48,6 +52,13 @@ final class Library: ObservableObject {
     init() {
         load()
         for song in songs { enqueue(song.id) }
+        let existing = songs
+        Task {
+            for song in existing {
+                if song.album == nil { await loadMetadata(song.id) }
+                await loadArtwork(song.id)
+            }
+        }
     }
 
     // MARK: Persistence
@@ -94,7 +105,10 @@ final class Library: ObservableObject {
             let song = Song(path: f.path, title: name, artist: "", isStem: stem, fileKey: fileKey(f))
             songs.append(song)
             enqueue(song.id)
-            Task { await self.loadMetadata(song.id) }
+            Task {
+                await self.loadMetadata(song.id)
+                await self.loadArtwork(song.id)
+            }
         }
         save()
     }
@@ -109,16 +123,37 @@ final class Library: ObservableObject {
         guard let song = song(id) else { return }
         let asset = AVURLAsset(url: song.url)
         guard let items = try? await asset.load(.commonMetadata) else { return }
-        var title: String?, artist: String?
+        var title: String?, artist: String?, album: String?
         for item in items {
             if item.commonKey == .commonKeyTitle { title = try? await item.load(.stringValue) }
             if item.commonKey == .commonKeyArtist { artist = try? await item.load(.stringValue) }
+            if item.commonKey == .commonKeyAlbumName { album = try? await item.load(.stringValue) }
         }
         guard let i = songs.firstIndex(where: { $0.id == id }) else { return }
         if let title, !title.isEmpty { songs[i].title = title }
         if let artist { songs[i].artist = artist }
+        songs[i].album = album ?? ""
         save()
     }
+
+    private func loadArtwork(_ id: UUID) async {
+        guard let song = song(id) else { return }
+        let cache = AppPaths.cacheDir("artwork").appendingPathComponent(song.fileKey + ".jpg")
+        if let data = await AudioSource.artwork(for: song.url, cachedAt: cache), let image = NSImage(data: data) {
+            artwork[id] = image
+            if !song.albumName.isEmpty, albumArtwork[albumKey(song)] == nil { albumArtwork[albumKey(song)] = image }
+        }
+    }
+
+    /// A song's cover art: its own, or else that of another song from the same album and artist. Stem files often
+    /// carry none while the plain release beside them does.
+    func cover(_ id: UUID) -> NSImage? {
+        if let own = artwork[id] { return own }
+        guard let song = song(id), !song.albumName.isEmpty else { return nil }
+        return albumArtwork[albumKey(song)]
+    }
+
+    private func albumKey(_ song: Song) -> String { "\(song.artist.lowercased())|\(song.albumName.lowercased())" }
 
     // MARK: Analysis
 
@@ -201,5 +236,26 @@ final class Library: ObservableObject {
             }
         }
         return .planning
+    }
+
+    /// Renderer items for playing `ids` in order. Every song must be analyzed and every transition planned or
+    /// failed; a failed transition becomes a straight cut to the next song rather than blocking the whole mix.
+    func mixItems(_ ids: [UUID]) throws -> [MixRenderer.Item] {
+        func side(_ a: UUID, _ b: UUID) throws -> TransitionPlan? {
+            switch plan(from: a, to: b) {
+            case .ready(let p): return p
+            case .failed: return nil
+            case .planning, nil: throw PlannerError("Some transitions aren't planned yet; wait for every ◆ to appear.")
+            }
+        }
+        if let missing = ids.first(where: { playableURL($0) == nil || analyses[$0] == nil }) {
+            throw PlannerError("\(song(missing)?.title ?? "A song") isn't analyzed yet.")
+        }
+        return try ids.enumerated().map { i, id in
+            let audio = playableURL(id)!, a = analyses[id]!
+            let entering = i > 0 ? try side(ids[i - 1], id)?.incoming : nil
+            let leaving = i + 1 < ids.count ? try side(id, ids[i + 1])?.outgoing : nil
+            return MixRenderer.Item(audio: audio, beats: a.beats, entering: entering, leaving: leaving)
+        }
     }
 }

@@ -5,11 +5,12 @@ struct TransitionRef: Hashable { let from: UUID; let to: UUID }
 
 struct PlaylistView: View {
     @EnvironmentObject var library: Library
+    @EnvironmentObject var player: MixPlayer
     let playlistID: UUID
     @State private var selected: TransitionRef?
     @State private var exporting = false
     @State private var exportProgress = 0.0
-    @State private var exportError: String?
+    @State private var failure: (title: String, message: String)?
 
     private var playlist: Playlist? { library.playlists.first { $0.id == playlistID } }
 
@@ -30,15 +31,31 @@ struct PlaylistView: View {
         .navigationTitle(playlist?.name ?? "Playlist")
         // Export lives in the menu bar (File → Export Mix…), fed by this playlist while it's focused.
         .focusedSceneValue(\.exportMix, (playlist?.songIDs.count ?? 0) >= 2 && !exporting ? { export() } : nil)
+        .toolbar {
+            ToolbarItem {
+                let current = player.queue?.context == playlistID
+                let playing = current && !player.isPaused
+                Button { current ? player.togglePause() : play(from: 0) } label: {
+                    Label(playing ? "Pause" : "Play", systemImage: playing ? "pause.fill" : "play.fill")
+                }
+                .help(current ? (playing ? "Pause" : "Resume") : "Play the whole playlist with its transitions")
+                    .disabled(playlist?.songIDs.isEmpty ?? true)
+            }
+        }
         .overlay(alignment: .bottom) {
             if exporting {
                 ProgressView("Rendering mix…", value: exportProgress).padding().frame(width: 320)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10)).padding()
             }
         }
-        .alert("Export failed", isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) {
+        .alert(failure?.title ?? "", isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
             Button("OK") {}
-        } message: { Text(exportError ?? "") }
+        } message: { Text(failure?.message ?? "") }
+    }
+
+    private func play(from index: Int) {
+        guard let playlist else { return }
+        do { try player.play(playlist, from: index, in: library) } catch { failure = ("Can't play", String(describing: error)) }
     }
 
     private var list: some View {
@@ -46,8 +63,12 @@ struct PlaylistView: View {
             if let playlist {
                 ForEach(Array(playlist.songIDs.enumerated()), id: \.offset) { index, id in
                     VStack(alignment: .leading, spacing: 4) {
-                        SongRow(song: library.song(id), analysis: library.analyses[id], index: index + 1)
+                        SongRow(song: library.song(id), artwork: library.cover(id), analysis: library.analyses[id], index: index + 1,
+                                playing: player.queue?.context == playlistID && player.currentPosition == index)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                            .onTapGesture(count: 2) { play(from: index) }
+                            .contextMenu { Button("Play from Here") { play(from: index) } }
                         if index + 1 < playlist.songIDs.count {
                             let ref = TransitionRef(from: id, to: playlist.songIDs[index + 1])
                             TransitionRow(ref: ref, state: library.plan(from: ref.from, to: ref.to), selected: selected == ref)
@@ -101,21 +122,8 @@ struct PlaylistView: View {
         panel.allowedContentTypes = [.wav]
         panel.nameFieldStringValue = "\(playlist.name).wav"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let ids = playlist.songIDs
-        var items: [MixRenderer.Item] = []
-        for (i, id) in ids.enumerated() {
-            guard let audio = library.playableURL(id), let a = library.analyses[id] else {
-                exportError = "\(library.song(id)?.title ?? "A song") isn't analyzed yet."
-                return
-            }
-            let entering = i > 0 ? planIfReady(TransitionRef(from: ids[i - 1], to: id))?.incoming : nil
-            let leaving = i + 1 < ids.count ? planIfReady(TransitionRef(from: id, to: ids[i + 1]))?.outgoing : nil
-            if (i > 0 && entering == nil) || (i + 1 < ids.count && leaving == nil) {
-                exportError = "Some transitions aren't planned yet; wait for every ◆ to appear."
-                return
-            }
-            items.append(MixRenderer.Item(audio: audio, beats: a.beats, entering: entering, leaving: leaving))
-        }
+        let items: [MixRenderer.Item]
+        do { items = try library.mixItems(playlist.songIDs) } catch { failure = ("Export failed", String(describing: error)); return }
         exporting = true
         exportProgress = 0
         Task.detached {
@@ -125,19 +133,37 @@ struct PlaylistView: View {
                 }
                 await MainActor.run { exporting = false; NSWorkspace.shared.activateFileViewerSelecting([url]) }
             } catch {
-                await MainActor.run { exporting = false; exportError = String(describing: error) }
+                await MainActor.run { exporting = false; failure = ("Export failed", String(describing: error)) }
             }
         }
     }
 }
 
+extension MixPlayer {
+    /// Plays `playlist` from the song at `index` to its end.
+    func play(_ playlist: Playlist, from index: Int, in library: Library) throws {
+        let ids = Array(playlist.songIDs[index...])
+        play(try library.mixItems(ids), queue: Queue(context: playlist.id, ids: ids, startIndex: index))
+    }
+}
+
 struct SongRow: View {
     let song: Song?
+    let artwork: NSImage?
     let analysis: SongAnalysis?
     let index: Int
+    var playing = false
     var body: some View {
         HStack(spacing: 10) {
-            Text("\(index)").font(.system(size: 11, weight: .bold)).foregroundStyle(.secondary).frame(width: 22)
+            Group {
+                if playing {
+                    Image(systemName: "speaker.wave.2.fill").foregroundStyle(Theme.accent)
+                } else {
+                    Text("\(index)").font(.system(size: 11, weight: .bold)).foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 22)
+            Artwork(image: artwork, size: 34)
             VStack(alignment: .leading, spacing: 1) {
                 Text(song?.title ?? "Missing song").font(.system(size: 13, weight: .semibold))
                 Text([song?.artist, song?.genre.rawValue].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
