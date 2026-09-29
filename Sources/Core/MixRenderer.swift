@@ -102,7 +102,9 @@ private final class Chain {
     var position: Double = 0
     var active = false
     var finished = false
-    private var bypassed = true
+    // Effect units start active (with factory defaults, e.g. AUHipass at 6.9 kHz), so this must start false: the
+    // first apply() outside a transition then really bypasses them.
+    private var bypassed = false
     private var tempo = 120.0
 
     let source: AVAudioSourceNode
@@ -201,6 +203,12 @@ private final class Chain {
         guard let side = side(at: s) else {
             stretch.rate = 1
             if !bypassed { bypassed = true; units.values.forEach { $0.bypass = true } }
+            // Belt and braces: park the filters wide open in case a unit ignores bypass.
+            for (code, w) in (item.leaving ?? item.entering)?.wiring ?? [:] {
+                guard let unit = units[w.box] else { continue }
+                AudioUnitSetParameter(unit.audioUnit, w.index, kAudioUnitScope_Global, 0, AudioUnitParameterValue(w.defaultValue), 0)
+                if code == "RXxt" { tempo = w.defaultValue }
+            }
             for (box, g) in gains { g.outputVolume = box == "Gain4" ? 0 : 1 }
             output.outputVolume = 1
             return

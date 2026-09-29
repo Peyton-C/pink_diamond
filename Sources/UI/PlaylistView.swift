@@ -15,7 +15,7 @@ struct PlaylistView: View {
 
     var body: some View {
         VSplitView {
-            list.frame(minHeight: 200)
+            list.frame(maxWidth: .infinity, minHeight: 200)
             Group {
                 if let selected, let plan = planIfReady(selected) {
                     TransitionView(ref: selected, plan: plan)
@@ -24,8 +24,9 @@ struct PlaylistView: View {
                                            description: Text("Click the ◆ between two songs to open it in the deck view"))
                 }
             }
-            .frame(minHeight: 360)
+            .frame(maxWidth: .infinity, minHeight: 360)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle(playlist?.name ?? "Playlist")
         .toolbar {
             ToolbarItem {
@@ -51,6 +52,7 @@ struct PlaylistView: View {
                 ForEach(Array(playlist.songIDs.enumerated()), id: \.offset) { index, id in
                     VStack(alignment: .leading, spacing: 4) {
                         SongRow(song: library.song(id), analysis: library.analyses[id], index: index + 1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         if index + 1 < playlist.songIDs.count {
                             let ref = TransitionRef(from: id, to: playlist.songIDs[index + 1])
                             TransitionRow(ref: ref, state: library.plan(from: ref.from, to: ref.to), selected: selected == ref)

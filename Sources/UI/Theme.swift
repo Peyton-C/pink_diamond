@@ -34,6 +34,8 @@ struct StyleChip: View {
             if let id = plan.styleID { Text("\(id)").opacity(0.6) }
         }
         .font(.system(size: 11, weight: .semibold))
+        .lineLimit(1)
+        .fixedSize()
         .padding(.horizontal, 8).padding(.vertical, 3)
         .background(Theme.styleColor(plan.algorithm).opacity(0.22), in: Capsule())
         .foregroundStyle(Theme.styleColor(plan.algorithm))
