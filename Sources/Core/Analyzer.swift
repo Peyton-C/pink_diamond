@@ -15,6 +15,16 @@ struct SongAnalysis: Codable {
     var audioAnalysisJSON: Data      // Apple `audio-analysis` resource
     var flexAnalysisJSON: Data       // Apple `flexml-analysis` resource
     var waveform: Waveform
+
+    var summary: SongSummary { SongSummary(bpm: bpm, key: key, duration: duration) }
+}
+
+/// What the library lists about a song. Kept apart from SongAnalysis, which runs to hundreds of KB (the waveform),
+/// so the library can show every song without reading every analysis.
+struct SongSummary: Codable, Equatable {
+    var bpm: Int
+    var key: String
+    var duration: Double
 }
 
 enum Genre: String, CaseIterable, Codable, Identifiable {

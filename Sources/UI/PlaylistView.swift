@@ -71,7 +71,7 @@ struct PlaylistView: View {
             if let playlist {
                 ForEach(Array(playlist.songIDs.enumerated()), id: \.offset) { index, id in
                     VStack(alignment: .leading, spacing: 4) {
-                        SongRow(song: library.song(id), artwork: library.cover(id), analysis: library.analyses[id], index: index + 1,
+                        SongRow(song: library.song(id), artwork: library.cover(id), summary: library.summaries[id], index: index + 1,
                                 playing: player.queue?.context == playlistID && player.currentPosition == index)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(Rectangle())
@@ -150,7 +150,7 @@ struct PlaylistView: View {
 struct SongRow: View {
     let song: Song?
     let artwork: NSImage?
-    let analysis: SongAnalysis?
+    let summary: SongSummary?
     let index: Int
     var playing = false
     var body: some View {
@@ -170,9 +170,9 @@ struct SongRow: View {
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
-            if let analysis {
-                Text("\(analysis.bpm) BPM").monospacedDigit()
-                KeyBadge(key: analysis.key).frame(width: 44, alignment: .trailing)
+            if let summary {
+                Text("\(summary.bpm) BPM").monospacedDigit()
+                KeyBadge(key: summary.key).frame(width: 44, alignment: .trailing)
             } else {
                 ProgressView().controlSize(.small)
             }

@@ -166,7 +166,7 @@ final class MixPlayer: ObservableObject {
             MPNowPlayingInfoPropertyElapsedPlaybackTime: songTime,
             MPNowPlayingInfoPropertyPlaybackRate: isPaused ? 0.0 : 1.0,
         ]
-        if let duration = library.analyses[id]?.duration { now[MPMediaItemPropertyPlaybackDuration] = duration }
+        if let duration = library.summaries[id]?.duration { now[MPMediaItemPropertyPlaybackDuration] = duration }
         if let image = library.cover(id) {
             now[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
         }

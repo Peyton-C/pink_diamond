@@ -69,8 +69,13 @@ final class MixRenderer {
         try engine.enableManualRenderingMode(.offline, format: format, maximumFrameCount: block)
         let master = AVAudioMixerNode()
         engine.attach(master)
-        let chains = try items.map { try Chain(item: $0, format: format) }
-        for (i, c) in chains.enumerated() { c.attach(to: engine, destination: master, bus: AVAudioNodeBus(i), format: format) }
+        // Songs take turns on three slots, each the plan's DSP graph, built before the engine starts. Three are
+        // enough: at most two songs overlap, and a slot's previous song has long finished when the next one loads.
+        // Building a graph per song instead held nine audio units per song for the whole render, and adding one to
+        // the running engine delays it unpredictably (4,096 frames when first to play, 536 when incoming, which
+        // throws the beat match off by 12 ms).
+        let slots = (0..<min(3, items.count)).map { Slot(engine: engine, destination: master, bus: AVAudioNodeBus($0)) }
+        let chains = try items.enumerated().map { i, item in try Chain(item: item, slot: slots[i % slots.count]) }
         if let limiter = effect("lmtr") {
             engine.attach(limiter)
             engine.connect(master, to: limiter, format: format)
@@ -78,13 +83,14 @@ final class MixRenderer {
         } else {
             engine.connect(master, to: engine.mainMixerNode, format: format)
         }
+        try chains[0].load()
         try engine.start()
         defer { engine.stop() }
 
         let buffer = AVAudioPCMBuffer(pcmFormat: engine.manualRenderingFormat, frameCapacity: block)!
-        // Songs are decoded a couple of seconds after the one before them starts and released when they finish, so a
-        // long playlist holds at most about three songs in memory, and playback (or a seek) waits on one decode only.
-        try chains[0].load()
+        // Songs are decoded a couple of seconds after the one before them starts (or five seconds before their
+        // transition, whichever is first) and released when they finish, so a long playlist holds at most about three
+        // songs in memory, and playback (or a seek) waits on one decode only.
         chains[0].position = max(0, startTime) * sampleRate
         chains[0].active = true
         var activatedAt = [Double](repeating: 0, count: chains.count)
@@ -93,7 +99,9 @@ final class MixRenderer {
         var t = 0.0, stopAt: Double?, current = 0, deck = 0
         while true {
             for i in 0..<last where chains[i].active && !chains[i + 1].active {
-                if t >= activatedAt[i] + 2 { try chains[i + 1].load() }
+                if t >= activatedAt[i] + 2 || chains[i].item.leaving.map({ chains[i].songTime >= $0.start - 5 }) == true {
+                    try chains[i + 1].load()
+                }
                 let handoff = chains[i].item.leaving.map { chains[i].songTime >= $0.start } ?? chains[i].finished
                 if handoff {
                     var start = chains[i + 1].item.entering?.start ?? 0
@@ -145,39 +153,28 @@ final class MixRenderer {
     }
 }
 
-private final class Chain {
-    let item: MixRenderer.Item
-    private(set) var audio: AVAudioPCMBuffer?
-    let duration: Double
-    var position: Double = 0
-    var active = false
-    var finished = false
-    // Effect units start active (with factory defaults, e.g. AUHipass at 6.9 kHz), so this must start false: the
-    // first apply() outside a transition then really bypasses them.
-    private var bypassed = false
-    private var tempo = 120.0
-
-    let source: AVAudioSourceNode
+/// One set of nodes mirroring the plan's DSP graph, lent to one song at a time.
+private final class Slot {
+    weak var chain: Chain?
+    var source: AVAudioSourceNode!
     let stretch = AVAudioUnitTimePitch()
     let gains: [String: AVAudioMixerNode] = ["Gain1": .init(), "Gain2": .init(), "Gain3": .init(), "Gain4": .init()]
     let mixer = AVAudioMixerNode()
     let output = AVAudioMixerNode()
     var units = [String: AVAudioUnitEffect]()
+    // Effect units start active (with factory defaults, e.g. AUHipass at 6.9 kHz), so this must start false: the first
+    // apply() outside a transition then really bypasses them. It tracks the units' real state across songs.
+    var bypassed = false
+    private var used = false
 
-    var songTime: Double { position / sampleRate }
-
-    init(item: MixRenderer.Item, format: AVAudioFormat) throws {
-        self.item = item
-        let file = try AVAudioFile(forReading: item.audio)
-        duration = Double(file.length) / file.processingFormat.sampleRate
-        var this: Chain!
-        // Offline rendering pulls this block synchronously on the rendering thread, the same thread that loads and
-        // unloads `audio`, so it needs no locking.
-        source = AVAudioSourceNode(format: format) { isSilence, _, frameCount, abl in
+    init(engine: AVAudioEngine, destination: AVAudioMixerNode, bus: AVAudioNodeBus) {
+        let format = MixRenderer.format
+        // Offline rendering pulls this synchronously on the rendering thread, which also loads and unloads songs, so
+        // no locking. Unowned: the slot owns the node.
+        source = AVAudioSourceNode(format: format) { [unowned self] isSilence, _, frameCount, abl in
             let buffers = UnsafeMutableAudioBufferListPointer(abl)
-            let chain = this!
             var produced = 0
-            if chain.active && !chain.finished, let audio = chain.audio {
+            if let chain, chain.active, !chain.finished, let audio = chain.audio {
                 let start = Int(chain.position)
                 produced = max(0, min(Int(frameCount), Int(audio.frameLength) - start))
                 for (c, buf) in buffers.enumerated() {
@@ -194,37 +191,31 @@ private final class Chain {
             }
             return noErr
         }
-        this = self
         for (box, sub) in [("AURemixFX", "remx"), ("AUFilter", "filt"), ("AUHipass1", "hpas"), ("AULowpass1", "lpas"),
                            ("AUDelay", "dely"), ("AUReverb", "rvb2"), ("AUHipass2", "hpas"), ("AULowpass2", "lpas")] {
             if let u = MixRenderer.effect(sub) { units[box] = u }
         }
-    }
-
-    func load() throws { if audio == nil { audio = try AudioSource.loadPCM(item.audio) } }
-    func unload() { audio = nil }
-
-    func attach(to engine: AVAudioEngine, destination: AVAudioMixerNode, bus: AVAudioNodeBus, format: AVAudioFormat) {
         let nodes: [AVAudioNode] = [source, stretch, mixer, output] + Array(gains.values) + Array(units.values)
         nodes.forEach(engine.attach)
-        func chain(_ list: [AVAudioNode]) { for (a, b) in zip(list, list.dropFirst()) { engine.connect(a, to: b, format: format) } }
+        func link(_ list: [AVAudioNode]) { for (a, b) in zip(list, list.dropFirst()) { engine.connect(a, to: b, format: format) } }
         let u = { (k: String) -> [AVAudioNode] in self.units[k].map { [$0] } ?? [] }
         let dry: [AVAudioNode] = [source, stretch, gains["Gain1"]!] + u("AURemixFX") + u("AUFilter") + u("AUHipass1") + u("AULowpass1")
-        chain(dry)
+        link(dry)
         engine.connect(dry.last!, to: [AVAudioConnectionPoint(node: gains["Gain3"]!, bus: 0),
                                        AVAudioConnectionPoint(node: gains["Gain2"]!, bus: 0)], fromBus: 0, format: format)
-        chain([gains["Gain2"]!] + u("AUDelay") + u("AUReverb") + u("AUHipass2") + u("AULowpass2") + [gains["Gain4"]!])
+        link([gains["Gain2"]!] + u("AUDelay") + u("AUReverb") + u("AUHipass2") + u("AULowpass2") + [gains["Gain4"]!])
         engine.connect(gains["Gain3"]!, to: mixer, fromBus: 0, toBus: 0, format: format)
         engine.connect(gains["Gain4"]!, to: mixer, fromBus: 0, toBus: 1, format: format)
         engine.connect(mixer, to: output, format: format)
         engine.connect(output, to: destination, fromBus: 0, toBus: bus, format: format)
 
-        // RemixFX's tempo-synced effects get a musical clock from the song's beat grid.
+        // RemixFX's tempo-synced effects get a musical clock from the current song's beat grid.
         units["AURemixFX"]?.auAudioUnit.musicalContextBlock = { [unowned self] tempoOut, numOut, denOut, beatOut, offsetOut, downbeatOut in
-            tempoOut?.pointee = self.tempo
+            guard let chain else { return false }
+            tempoOut?.pointee = chain.tempo
             numOut?.pointee = 4
             denOut?.pointee = 4
-            let beat = self.beatPosition(self.songTime)
+            let beat = chain.beatPosition(chain.songTime)
             beatOut?.pointee = beat
             offsetOut?.pointee = 0
             downbeatOut?.pointee = (beat / 4).rounded(.down) * 4
@@ -232,7 +223,56 @@ private final class Chain {
         }
     }
 
-    private func beatPosition(_ t: Double) -> Double {
+    /// Hands the slot to `chain`, clearing what the last song left in the effects (reverb and delay tails, the time
+    /// stretcher's buffers). A fresh slot is left alone, so the first songs render exactly as they always have.
+    func claim(_ chain: Chain) {
+        if used {
+            ([stretch] + Array(units.values)).forEach { $0.reset() }
+            output.outputVolume = 1
+        }
+        used = true
+        self.chain = chain
+    }
+
+    func release(_ chain: Chain) {
+        guard self.chain === chain else { return }
+        self.chain = nil
+        output.outputVolume = 0   // nothing may leak through after a song's exit, reverb tails included
+    }
+}
+
+private final class Chain {
+    let item: MixRenderer.Item
+    let duration: Double
+    var position: Double = 0
+    var active = false
+    var finished = false
+    var tempo = 120.0
+    private(set) var audio: AVAudioPCMBuffer?
+    private let slot: Slot
+
+    var songTime: Double { position / sampleRate }
+
+    init(item: MixRenderer.Item, slot: Slot) throws {
+        self.item = item
+        self.slot = slot
+        let file = try AVAudioFile(forReading: item.audio)
+        duration = Double(file.length) / file.processingFormat.sampleRate
+    }
+
+    func load() throws {
+        guard audio == nil, !finished else { return }
+        audio = try AudioSource.loadPCM(item.audio)
+        slot.claim(self)
+    }
+
+    /// Releases the decoded audio and the slot.
+    func unload() {
+        audio = nil
+        slot.release(self)
+    }
+
+    func beatPosition(_ t: Double) -> Double {
         let beats = item.beats
         guard beats.count > 1 else { return t * tempo / 60 }
         var lo = 0, hi = beats.count - 1
@@ -249,35 +289,34 @@ private final class Chain {
     }
 
     func apply() {
+        // A finished song has given up its slot, which silenced it.
+        guard slot.chain === self, !finished else { return }
+        let g = slot
         let s = songTime
-        if finished {
-            output.outputVolume = 0 // nothing may leak through after the song's exit
-            return
-        }
         guard let side = side(at: s) else {
-            stretch.rate = 1
-            if !bypassed { bypassed = true; units.values.forEach { $0.bypass = true } }
+            g.stretch.rate = 1
+            if !g.bypassed { g.bypassed = true; g.units.values.forEach { $0.bypass = true } }
             // Belt and braces: park the filters wide open in case a unit ignores bypass.
             for (code, w) in (item.leaving ?? item.entering)?.wiring ?? [:] {
-                guard let unit = units[w.box] else { continue }
+                guard let unit = g.units[w.box] else { continue }
                 AudioUnitSetParameter(unit.audioUnit, w.index, kAudioUnitScope_Global, 0, AudioUnitParameterValue(w.defaultValue), 0)
                 if code == "RXxt" { tempo = w.defaultValue }
             }
-            for (box, g) in gains { g.outputVolume = box == "Gain4" ? 0 : 1 }
-            output.outputVolume = 1
+            for (box, gain) in g.gains { gain.outputVolume = box == "Gain4" ? 0 : 1 }
+            g.output.outputVolume = 1
             return
         }
-        stretch.rate = Float(side.rate(at: s))
+        g.stretch.rate = Float(side.rate(at: s))
         let bypass = (side.automations["bypa"]?.value(at: s) ?? 1) >= 0.5
-        if bypass != bypassed { bypassed = bypass; units.values.forEach { $0.bypass = bypass } }
+        if bypass != g.bypassed { g.bypassed = bypass; g.units.values.forEach { $0.bypass = bypass } }
         func value(_ code: String) -> Double? { side.automations[code]?.value(at: s) ?? side.wiring[code]?.defaultValue }
-        for (box, g) in gains {
+        for (box, gain) in g.gains {
             let code = side.wiring.first { $0.value.box == box }?.key
-            g.outputVolume = Float(code.flatMap(value) ?? (box == "Gain4" ? 0 : 1))
+            gain.outputVolume = Float(code.flatMap(value) ?? (box == "Gain4" ? 0 : 1))
         }
-        output.outputVolume = Float(side.automations["out_gain"]?.value(at: s) ?? 1)
+        g.output.outputVolume = Float(side.automations["out_gain"]?.value(at: s) ?? 1)
         for (code, w) in side.wiring {
-            guard let unit = units[w.box], let v = value(code) else { continue }
+            guard let unit = g.units[w.box], let v = value(code) else { continue }
             if code == "RXxt" { tempo = v }
             AudioUnitSetParameter(unit.audioUnit, w.index, kAudioUnitScope_Global, 0, AudioUnitParameterValue(v), 0)
         }

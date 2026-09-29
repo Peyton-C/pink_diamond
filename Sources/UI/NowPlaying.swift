@@ -12,7 +12,7 @@ struct NowPlayingBar: View {
     private var song: Song? { player.currentSongID.flatMap(library.song) }
 
     var body: some View {
-        let duration = song.flatMap { library.analyses[$0.id]?.duration } ?? 0
+        let duration = song.flatMap { library.summaries[$0.id]?.duration } ?? 0
         let time = scrubbing ?? min(player.songTime, duration)
         HStack(spacing: 12) {
             Artwork(image: song.flatMap { library.cover($0.id) }, size: 40)
