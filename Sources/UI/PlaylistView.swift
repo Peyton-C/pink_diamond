@@ -15,26 +15,21 @@ struct PlaylistView: View {
 
     var body: some View {
         VSplitView {
-            list.frame(maxWidth: .infinity, minHeight: 200)
             Group {
                 if let selected, let plan = planIfReady(selected) {
                     TransitionView(ref: selected, plan: plan)
                 } else {
                     ContentUnavailableView("Select a transition", systemImage: "arrow.down.forward.and.arrow.up.backward",
-                                           description: Text("Click the ◆ between two songs to open it in the deck view"))
+                                           description: Text("Click the ◆ between two songs below to open it in the deck view"))
                 }
             }
             .frame(maxWidth: .infinity, minHeight: 360)
+            list.frame(maxWidth: .infinity, minHeight: 200)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle(playlist?.name ?? "Playlist")
-        .toolbar {
-            ToolbarItem {
-                Button { export() } label: { Label("Export Mix", systemImage: "square.and.arrow.up") }
-                    .disabled((playlist?.songIDs.count ?? 0) < 2 || exporting)
-                    .help("Render the whole playlist as one continuous AutoMix")
-            }
-        }
+        // Export lives in the menu bar (File → Export Mix…), fed by this playlist while it's focused.
+        .focusedSceneValue(\.exportMix, (playlist?.songIDs.count ?? 0) >= 2 && !exporting ? { export() } : nil)
         .overlay(alignment: .bottom) {
             if exporting {
                 ProgressView("Rendering mix…", value: exportProgress).padding().frame(width: 320)

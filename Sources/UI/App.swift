@@ -18,7 +18,30 @@ struct Main {
     }
 }
 
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+}
+
+struct ExportMixKey: FocusedValueKey { typealias Value = () -> Void }
+
+extension FocusedValues {
+    var exportMix: (() -> Void)? {
+        get { self[ExportMixKey.self] }
+        set { self[ExportMixKey.self] = newValue }
+    }
+}
+
+struct ExportMixCommand: View {
+    @FocusedValue(\.exportMix) private var exportMix
+    var body: some View {
+        Button("Export Mix…") { exportMix?() }
+            .keyboardShortcut("e", modifiers: [.command, .shift])
+            .disabled(exportMix == nil)
+    }
+}
+
 struct PinkDiamondApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var library = Library()
 
     var body: some Scene {
@@ -28,6 +51,9 @@ struct PinkDiamondApp: App {
                 .frame(minWidth: 1000, minHeight: 650)
         }
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            CommandGroup(replacing: .importExport) { ExportMixCommand() }
+        }
     }
 }
 
