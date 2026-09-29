@@ -4,7 +4,7 @@ Apple Music AutoMix, without Apple Music
 pink diamond plays transitions between local songs with macOS's own AutoMix planner, and displays them like a DJ application, with a full waveform. beat grid and effect lane.
 
 ## Build
-Needs macOS 27 and Xcode (not just the Command Line Tools).
+Needs macOS 27 and Xcode 27.
 
 ```sh
 ./bundle.sh            # build/pink diamond.app
@@ -16,9 +16,8 @@ Needs macOS 27 and Xcode (not just the Command Line Tools).
 ## Use
 - **Library**: drop in audio files, Native Instruments `.stem.mp4` files, or whole folders. Each song is analyzed once (tempo, beats, bars, sections, key, loudness, vocals). Browse by Songs, Artists, Albums or Genres with the tabs in the toolbar; cover art comes from each file's tags. Keys show in Mixxx's key colours, in Lancelot (8A) or musical (Am) names, set in Settings.
 - **Playlists**: right-click songs in the Library → Add to Playlist, or drop files onto a playlist; drag to reorder. Between every two songs, the ◆ row shows the planned transition. Click it to open the deck view.
-- **Playback**: Play in a playlist's toolbar plays it through with every transition, and double-clicking a song plays from there. The bar at the bottom seeks within the song, and the media keys and Control Centre work too. It sounds exactly like Export Mix, and needs every song analyzed and every ◆ planned first. A transition that can't be planned becomes a straight cut.
-- **Deck view**: both songs' waveforms on the transition's timeline (coloured by low/mid/high), with beat grid, bars, sections (◆), the transition window and handoff point, and a lane for each automated effect, above the outgoing song and below the incoming one. While the playlist plays, the deck view scrolls with the playhead instead, songs alternating between deck A and deck B. **Preview** (space) renders and plays it with a moving playhead.
-- **Export Mix** renders the whole playlist as one WAV.
+- **Playback**: Play in a playlist's toolbar plays it through with every transition, and double-clicking a song plays from there. The bar at the bottom seeks within the song, and the media keys and Control Centre work too.
+- **Deck view**: both songs's RGB waveforms on the transition's timeline (coloured by low/mid/high), with beat grid, bars, sections (◆), the transition window and handoff point, and a lane for each automated effect. **Preview** (space) renders and plays it with a moving playhead.
 
 ## How it works
 | Path | What |
