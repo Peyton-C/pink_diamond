@@ -54,6 +54,17 @@ struct TransitionSide {
         }
         return s > end ? t + (s - end) : t
     }
+
+    /// Seconds since the transition started → song time; the inverse of `transitionTime(at:)`.
+    func songTime(atTransitionTime t: Double) -> Double {
+        guard t > 0 else { return start + t }
+        var lo = start, hi = end + t   // transitionTime is monotonic, and never slower than rate 0.01
+        for _ in 0..<40 {
+            let mid = (lo + hi) / 2
+            if transitionTime(at: mid) < t { lo = mid } else { hi = mid }
+        }
+        return lo
+    }
 }
 
 struct TransitionPlan {

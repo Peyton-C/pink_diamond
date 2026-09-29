@@ -146,7 +146,9 @@ struct SongTable: View {
             TableColumn("Artist", value: \.artist).width(min: 80, ideal: 150)
             TableColumn("Album", value: \.albumName).width(min: 80, ideal: 150)
             TableColumn("BPM") { song in Text(library.analyses[song.id].map { "\($0.bpm)" } ?? "–").monospacedDigit() }.width(44)
-            TableColumn("Key") { song in Text(library.analyses[song.id]?.key ?? "–") }.width(70)
+            TableColumn("Key") { song in
+                if let key = library.analyses[song.id]?.key { KeyBadge(key: key) } else { Text("–") }
+            }.width(48)
             TableColumn("Length") { song in
                 Text(library.analyses[song.id].map { Theme.time($0.duration).dropLast(2) } ?? "–").monospacedDigit()
             }.width(52)

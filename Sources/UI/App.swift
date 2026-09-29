@@ -42,8 +42,14 @@ struct ExportMixCommand: View {
 
 struct PinkDiamondApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var library = Library()
-    @StateObject private var player = MixPlayer()
+    @StateObject private var library: Library
+    @StateObject private var player: MixPlayer
+
+    init() {
+        let library = Library()
+        _library = StateObject(wrappedValue: library)
+        _player = StateObject(wrappedValue: MixPlayer(library: library))
+    }
 
     var body: some Scene {
         WindowGroup("pink diamond") {
@@ -56,6 +62,24 @@ struct PinkDiamondApp: App {
         .commands {
             CommandGroup(replacing: .importExport) { ExportMixCommand() }
         }
+        Settings { SettingsView() }
+    }
+}
+
+struct SettingsView: View {
+    @AppStorage(KeyNotation.storageKey) private var notation = KeyNotation.lancelot
+    var body: some View {
+        Form {
+            Picker("Key names", selection: $notation) {
+                ForEach(KeyNotation.allCases) { n in
+                    HStack { KeyBadge(key: "A minor", notation: n); Text(n.label) }.tag(n)
+                }
+            }
+            .pickerStyle(.radioGroup)
+        }
+        .padding(20)
+        .frame(width: 320)
+        .preferredColorScheme(.dark)
     }
 }
 

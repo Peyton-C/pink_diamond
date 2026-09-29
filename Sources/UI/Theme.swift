@@ -25,6 +25,67 @@ enum Theme {
     }
 }
 
+enum KeyNotation: String, CaseIterable, Identifiable {
+    case lancelot, musical
+    static let storageKey = "keyNotation"
+    var id: String { rawValue }
+    var label: String { self == .lancelot ? "Lancelot" : "Musical" }
+}
+
+/// A key as the analysis spells it ("Ab minor", "C# major"), in Lancelot notation and Mixxx's key colours.
+struct MusicalKey {
+    let tonic: String
+    let minor: Bool
+    let lancelot: Int?    // 1...12, nil if the tonic isn't recognised
+
+    // Lancelot numbers step round the circle of fifths: C major is 8B, its relative A minor 8A.
+    private static let major = ["B": 1, "F#": 2, "C#": 3, "Ab": 4, "Eb": 5, "Bb": 6, "F": 7, "C": 8, "G": 9, "D": 10, "A": 11, "E": 12]
+    private static let minorKeys = ["Ab": 1, "Eb": 2, "Bb": 3, "F": 4, "C": 5, "G": 6, "D": 7, "A": 8, "E": 9, "B": 10, "F#": 11, "C#": 12]
+
+    // Mixxx's default "Mixxx Key Colors" palette, indexed by Open Key number (C major and A minor are 1, i.e. 8B/8A),
+    // from src/util/color/predefinedcolorpalettes.cpp. A key and its relative minor share a colour.
+    private static let palette: [UInt32] = [0xFC4949, 0xFE642D, 0xF98C27, 0xFED600, 0x99FE00, 0x42FE3E,
+                                            0x0AD58F, 0x0AE7E7, 0x04C9FE, 0x3D8AFD, 0xAC64FE, 0xFD3FEA]
+
+    init(_ name: String) {
+        let parts = name.split(separator: " ")
+        tonic = parts.first.map(String.init) ?? name
+        minor = parts.count > 1 && parts[1] == "minor"
+        lancelot = (minor ? Self.minorKeys : Self.major)[tonic]
+    }
+
+    func text(_ notation: KeyNotation) -> String {
+        switch notation {
+        case .lancelot: lancelot.map { "\($0)\(minor ? "A" : "B")" } ?? tonic
+        case .musical: tonic + (minor ? "m" : "")
+        }
+    }
+
+    var color: Color {
+        guard let lancelot else { return .gray }
+        let rgb = Self.palette[(lancelot - 8 + 12) % 12]
+        return Color(red: Double(rgb >> 16 & 0xFF) / 255, green: Double(rgb >> 8 & 0xFF) / 255, blue: Double(rgb & 0xFF) / 255)
+    }
+}
+
+/// A key in a square of its Mixxx colour, like the key chips in DJ software.
+struct KeyBadge: View {
+    let key: String
+    var notation: KeyNotation?
+    @AppStorage(KeyNotation.storageKey) private var stored = KeyNotation.lancelot
+
+    var body: some View {
+        let k = MusicalKey(key)
+        Text(k.text(notation ?? stored))
+            .font(.system(size: 11, weight: .bold)).monospacedDigit()
+            .foregroundStyle(.black.opacity(0.85))
+            .frame(minWidth: 30)
+            .padding(.horizontal, 4).padding(.vertical, 2)
+            .background(k.color, in: RoundedRectangle(cornerRadius: 4))
+            .fixedSize()
+    }
+}
+
 struct StyleChip: View {
     let plan: TransitionPlan
     var body: some View {

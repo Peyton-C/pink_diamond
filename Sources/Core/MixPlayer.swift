@@ -1,52 +1,69 @@
 import AVFoundation
 import Foundation
+import MediaPlayer
 
-/// Plays songs in sequence with their transitions. MixRenderer runs ahead on a background thread and its output is
-/// queued on a realtime engine, so playback starts once the first second is rendered rather than after the whole mix,
-/// and it sounds exactly like Export Mix.
+/// Plays a playlist with its transitions. MixRenderer runs ahead on a background thread and its output is queued on a
+/// realtime engine, so playback starts once the first second is rendered rather than after the whole mix, and it
+/// sounds exactly like Export Mix. Registers with macOS's media controls (media keys, Control Centre).
 @MainActor
 final class MixPlayer: ObservableObject {
-    /// What is playing: `context` names the source (a playlist), `ids` the songs from `startIndex` on.
+    /// What is playing: the playlist, and a snapshot of its songs from `startIndex` on.
     struct Queue { let context: UUID; let ids: [UUID]; let startIndex: Int }
 
     @Published private(set) var queue: Queue?
     @Published private(set) var isPaused = false
-    /// Index into `queue.ids` of the song the listener hears, and its song time.
-    @Published private(set) var index = 0
-    @Published private(set) var songTime = 0.0
+    @Published private(set) var position: MixRenderer.Position?
     /// Song time at which the current song took over; transitions enter songs partway through.
     private(set) var enteredAt = 0.0
 
+    private let library: Library
     private let engine = AVAudioEngine()
     private let node = AVAudioPlayerNode()
     private var session: Session?
     private var timer: Timer?
 
+    /// Index into `queue.ids` of the song the listener hears, and its song time.
+    var index: Int { position?.index ?? 0 }
+    var songTime: Double { position?.songTime ?? 0 }
     var currentSongID: UUID? { queue.map { $0.ids[min(index, $0.ids.count - 1)] } }
-    /// Position of the current song in the source's full list.
+    /// Position of the current song in the playlist.
     var currentPosition: Int? { queue.map { $0.startIndex + index } }
 
-    init() {
-        engine.attach(node)
-        engine.connect(node, to: engine.mainMixerNode, format: MixRenderer.format)
+    /// The transition coming up or under way, with the song times of both its songs.
+    struct Deck: Equatable { let from: UUID; let to: UUID; let outTime: Double; let inTime: Double? }
+    var deck: Deck? {
+        guard let queue, let p = position, p.deck + 1 < queue.ids.count else { return nil }
+        return Deck(from: queue.ids[p.deck], to: queue.ids[p.deck + 1], outTime: p.deckOut, inTime: p.deckIn)
     }
 
-    func play(_ items: [MixRenderer.Item], queue: Queue) {
+    init(library: Library) {
+        self.library = library
+        engine.attach(node)
+        engine.connect(node, to: engine.mainMixerNode, format: MixRenderer.format)
+        registerRemoteCommands()
+    }
+
+    // MARK: Transport
+
+    /// Plays `playlist` from the song at `index`, starting `time` seconds into it.
+    func play(_ playlist: UUID, from index: Int, at time: Double = 0, paused: Bool = false) throws {
+        guard let ids = library.playlists.first(where: { $0.id == playlist })?.songIDs, ids.indices.contains(index) else { return }
+        let queue = Queue(context: playlist, ids: Array(ids[index...]), startIndex: index)
+        let items = try library.mixItems(queue.ids)
         stop()
-        guard !items.isEmpty else { return }
-        do { try engine.start() } catch { return }
+        do { try engine.start() } catch { throw PlannerError("couldn't start audio output: \(error)") }
         let session = Session()
         self.session = session
         self.queue = queue
-        index = 0
-        songTime = 0
-        enteredAt = 0
-        timer = Timer.scheduledTimer(withTimeInterval: 1 / 10, repeats: true) { [weak self] _ in
+        isPaused = paused
+        position = MixRenderer.Position(index: 0, songTime: time, deck: 0, deckOut: time, deckIn: nil)
+        enteredAt = time
+        timer = Timer.scheduledTimer(withTimeInterval: 1 / 30, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
         let node = node
         Thread.detachNewThread {
-            session.run(items, node: node) { event in
+            session.run(items, startTime: time, node: node) { event in
                 Task { @MainActor [weak self] in
                     guard let self, self.session === session else { return }
                     switch event {
@@ -56,12 +73,28 @@ final class MixPlayer: ObservableObject {
                 }
             }
         }
+        updateNowPlaying()
+    }
+
+    /// One song forward or back. Back within the first few seconds of a song goes to the one before it, later it
+    /// restarts the current song, as in Music.
+    func skip(_ step: Int) throws {
+        guard let queue, let position = currentPosition else { return }
+        let target = step < 0 && songTime - enteredAt > 3 ? position : position + step
+        try play(queue.context, from: max(0, target), paused: isPaused)
+    }
+
+    /// Jumps to `time` in the current song.
+    func seek(to time: Double) throws {
+        guard let queue, let position = currentPosition else { return }
+        try play(queue.context, from: position, at: max(0, time), paused: isPaused)
     }
 
     func togglePause() {
         guard session != nil else { return }
         isPaused.toggle()
         isPaused ? node.pause() : node.play()
+        updateNowPlaying()
     }
 
     func pause() { if !isPaused { togglePause() } }
@@ -74,47 +107,102 @@ final class MixPlayer: ObservableObject {
         timer?.invalidate()
         timer = nil
         queue = nil
+        position = nil
         isPaused = false
+        updateNowPlaying()
     }
 
     private func tick() {
         guard let session, let last = node.lastRenderTime, let t = node.playerTime(forNodeTime: last) else { return }
         let played = max(0, t.sampleTime)
         session.setPlayed(played)
-        if let mark = session.mark(at: played) {
-            if index != mark.position.index { index = mark.position.index; enteredAt = mark.position.songTime }
-            songTime = mark.position.songTime + Double(played - mark.frame) / sampleRate
+        guard let p = session.position(at: played) else { return }
+        let changed = p.index != position?.index
+        if changed { enteredAt = p.songTime }
+        position = p
+        if changed { updateNowPlaying() }
+    }
+
+    // MARK: Media controls
+
+    private func registerRemoteCommands() {
+        let center = MPRemoteCommandCenter.shared()
+        func handle(_ command: MPRemoteCommand, _ action: @escaping @MainActor (MixPlayer) throws -> Void) {
+            command.addTarget { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.queue != nil else { return .noActionableNowPlayingItem }
+                    do { try action(self); return .success } catch { return .commandFailed }
+                }
+            }
         }
+        handle(center.togglePlayPauseCommand) { $0.togglePause() }
+        handle(center.playCommand) { if $0.isPaused { $0.togglePause() } }
+        handle(center.pauseCommand) { $0.pause() }
+        handle(center.stopCommand) { $0.stop() }
+        handle(center.nextTrackCommand) { try $0.skip(1) }
+        handle(center.previousTrackCommand) { try $0.skip(-1) }
+        center.changePlaybackPositionCommand.addTarget { [weak self] event in
+            MainActor.assumeIsolated {
+                guard let self, self.queue != nil, let event = event as? MPChangePlaybackPositionCommandEvent else {
+                    return .noActionableNowPlayingItem
+                }
+                do { try self.seek(to: event.positionTime); return .success } catch { return .commandFailed }
+            }
+        }
+    }
+
+    /// Tells macOS what is playing. Sent on song changes, pauses and seeks; the system advances elapsed time itself.
+    private func updateNowPlaying() {
+        let info = MPNowPlayingInfoCenter.default()
+        guard let id = currentSongID, let song = library.song(id) else {
+            info.nowPlayingInfo = nil
+            info.playbackState = .stopped
+            return
+        }
+        var now: [String: Any] = [
+            MPMediaItemPropertyTitle: song.title,
+            MPMediaItemPropertyArtist: song.artist,
+            MPMediaItemPropertyAlbumTitle: song.albumName,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: songTime,
+            MPNowPlayingInfoPropertyPlaybackRate: isPaused ? 0.0 : 1.0,
+        ]
+        if let duration = library.analyses[id]?.duration { now[MPMediaItemPropertyPlaybackDuration] = duration }
+        if let image = library.cover(id) {
+            now[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+        }
+        info.nowPlayingInfo = now
+        info.playbackState = isPaused ? .paused : .playing
     }
 }
 
 /// One run of the renderer feeding the player node. Shared between the rendering thread and the main actor.
 private final class Session: @unchecked Sendable {
     enum Event { case ready, finished }
-    struct Mark { let frame: AVAudioFramePosition; let position: MixRenderer.Position }
+    private struct Mark { let frame: AVAudioFramePosition; let position: MixRenderer.Position }
 
     private let lock = NSLock()
     private var cancelled = false
     private var played: AVAudioFramePosition = 0
     private var marks: [Mark] = []
 
-    /// Seconds rendered ahead of the listener. Enough to cover decoding the next song, small enough that a
-    /// playlist edit or genre change is heard soon after a restart.
+    /// Seconds rendered ahead of the listener. Enough to cover decoding the next song; a seek or skip starts a new
+    /// session, so this costs nothing in responsiveness.
     private static let lead = 20.0
     private static let chunk = AVAudioFrameCount(sampleRate / 2)
 
     func cancel() { lock.withLock { cancelled = true } }
     func setPlayed(_ frame: AVAudioFramePosition) { lock.withLock { played = frame } }
 
-    func mark(at frame: AVAudioFramePosition) -> Mark? {
+    /// The position of the block playing at `frame`. Marks are per 512-frame block, so this is within 12 ms.
+    func position(at frame: AVAudioFramePosition) -> MixRenderer.Position? {
         lock.withLock {
-            guard let i = marks.lastIndex(where: { $0.frame <= frame }) else { return marks.first }
+            guard let i = marks.lastIndex(where: { $0.frame <= frame }) else { return nil }
             marks.removeFirst(i)   // earlier marks are behind the listener for good
-            return marks.first
+            return marks.first?.position
         }
     }
 
-    func run(_ items: [MixRenderer.Item], node: AVAudioPlayerNode, notify: @escaping (Event) -> Void) {
+    func run(_ items: [MixRenderer.Item], startTime: Double, node: AVAudioPlayerNode, notify: @escaping (Event) -> Void) {
         let format = MixRenderer.format
         var pending = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: Self.chunk)!
         var scheduled: AVAudioFramePosition = 0
@@ -135,12 +223,10 @@ private final class Session: @unchecked Sendable {
             if !announced, scheduled >= AVAudioFramePosition(sampleRate) || last { announced = true; notify(.ready) }
         }
 
-        _ = try? MixRenderer.render(items, startTime: 0, tail: nil) { block, position in
+        _ = try? MixRenderer.render(items, startTime: startTime, tail: nil) { block, position in
             if lock.withLock({ cancelled }) { return false }
-            if pending.frameLength == 0 {
-                let mark = Mark(frame: scheduled, position: position)
-                lock.withLock { marks.append(mark) }
-            }
+            let mark = Mark(frame: scheduled + AVAudioFramePosition(pending.frameLength), position: position)
+            lock.withLock { marks.append(mark) }
             let n = Int(block.frameLength), at = Int(pending.frameLength)
             for c in 0..<Int(format.channelCount) {
                 (pending.floatChannelData![c] + at).update(from: block.floatChannelData![c], count: n)

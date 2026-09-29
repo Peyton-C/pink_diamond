@@ -37,8 +37,14 @@ final class MixRenderer {
 
     static let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
 
-    /// Which song the listener hears: the index into the rendered items and its song time.
-    struct Position { let index: Int; let songTime: Double }
+    /// Where playback is, reported with every block.
+    struct Position {
+        let index: Int          // the song the listener hears (index into the items)
+        let songTime: Double
+        let deck: Int           // the outgoing song of the transition coming up or under way
+        let deckOut: Double     // that song's song time
+        let deckIn: Double?     // the incoming song's song time, once it has started
+    }
 
     /// Renders `items` in sequence to a file. See `render(_:startTime:tail:progress:write:)`.
     static func render(_ items: [Item], startTime: Double, tail: Double?, to output: URL,
@@ -76,22 +82,31 @@ final class MixRenderer {
         defer { engine.stop() }
 
         let buffer = AVAudioPCMBuffer(pcmFormat: engine.manualRenderingFormat, frameCapacity: block)!
-        // Songs are decoded when the one before them starts and released when they finish, so a long playlist holds
-        // at most about three songs in memory instead of all of them.
+        // Songs are decoded a couple of seconds after the one before them starts and released when they finish, so a
+        // long playlist holds at most about three songs in memory, and playback (or a seek) waits on one decode only.
         try chains[0].load()
-        if chains.count > 1 { try chains[1].load() }
         chains[0].position = max(0, startTime) * sampleRate
         chains[0].active = true
+        var activatedAt = [Double](repeating: 0, count: chains.count)
         let last = chains.count - 1
         let total = max(1, (chains.last?.duration ?? 1) + chains.dropLast().map(\.duration).reduce(0, +) - startTime)
-        var t = 0.0, stopAt: Double?, current = 0
+        var t = 0.0, stopAt: Double?, current = 0, deck = 0
         while true {
             for i in 0..<last where chains[i].active && !chains[i + 1].active {
+                if t >= activatedAt[i] + 2 { try chains[i + 1].load() }
                 let handoff = chains[i].item.leaving.map { chains[i].songTime >= $0.start } ?? chains[i].finished
                 if handoff {
-                    chains[i + 1].position = (chains[i + 1].item.entering?.start ?? 0) * sampleRate
+                    var start = chains[i + 1].item.entering?.start ?? 0
+                    // Starting (or seeking) into the middle of a transition: bring the incoming song in at the same
+                    // point of it, not at its beginning.
+                    if let leaving = chains[i].item.leaving, let entering = chains[i + 1].item.entering,
+                       chains[i].songTime > leaving.start + 0.05 {
+                        start = entering.songTime(atTransitionTime: leaving.transitionTime(at: chains[i].songTime))
+                    }
+                    try chains[i + 1].load()
+                    chains[i + 1].position = start * sampleRate
                     chains[i + 1].active = true
-                    if i + 2 <= last { try chains[i + 2].load() }
+                    activatedAt[i + 1] = t
                 }
             }
             for c in chains where c.active && !c.finished {
@@ -104,6 +119,10 @@ final class MixRenderer {
                chains[current + 1].songTime >= chains[current + 1].item.entering.map({ ($0.start + $0.end) / 2 }) ?? 0 {
                 current += 1
             }
+            if deck < last, chains[deck + 1].active,
+               chains[deck + 1].songTime >= chains[deck + 1].item.entering?.end ?? 0 {
+                deck += 1
+            }
             if stopAt == nil, chains[last].active {
                 if let tail, let entering = chains[last].item.entering, chains[last].songTime >= entering.end {
                     stopAt = t + tail
@@ -115,7 +134,10 @@ final class MixRenderer {
             if t > total + 120 { break } // safety
             chains.forEach { $0.apply() }
             guard try engine.renderOffline(block, to: buffer) == .success else { break }
-            guard try write(buffer, Position(index: current, songTime: chains[current].songTime)) else { break }
+            let incoming = deck < last && chains[deck + 1].active ? chains[deck + 1].songTime : nil
+            let position = Position(index: current, songTime: chains[current].songTime,
+                                    deck: deck, deckOut: chains[deck].songTime, deckIn: incoming)
+            guard try write(buffer, position) else { break }
             t += Double(block) / sampleRate
             progress?(min(1, t / total))
         }

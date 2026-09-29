@@ -17,7 +17,9 @@ struct PlaylistView: View {
     var body: some View {
         VSplitView {
             Group {
-                if let selected, let plan = planIfReady(selected) {
+                if player.queue?.context == playlistID {
+                    LiveDeckView()
+                } else if let selected, let plan = planIfReady(selected) {
                     TransitionView(ref: selected, plan: plan)
                 } else {
                     ContentUnavailableView("Select a transition", systemImage: "arrow.down.forward.and.arrow.up.backward",
@@ -28,6 +30,7 @@ struct PlaylistView: View {
             list.frame(maxWidth: .infinity, minHeight: 200)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onChange(of: liveRef) { _, new in if let new { selected = new } }
         .navigationTitle(playlist?.name ?? "Playlist")
         // Export lives in the menu bar (File → Export Mix…), fed by this playlist while it's focused.
         .focusedSceneValue(\.exportMix, (playlist?.songIDs.count ?? 0) >= 2 && !exporting ? { export() } : nil)
@@ -54,8 +57,13 @@ struct PlaylistView: View {
     }
 
     private func play(from index: Int) {
-        guard let playlist else { return }
-        do { try player.play(playlist, from: index, in: library) } catch { failure = ("Can't play", String(describing: error)) }
+        do { try player.play(playlistID, from: index) } catch { failure = ("Can't play", String(describing: error)) }
+    }
+
+    /// While this playlist plays, the transition coming up or under way.
+    private var liveRef: TransitionRef? {
+        guard let deck = player.deck, player.queue?.context == playlistID else { return nil }
+        return TransitionRef(from: deck.from, to: deck.to)
     }
 
     private var list: some View {
@@ -71,7 +79,7 @@ struct PlaylistView: View {
                             .contextMenu { Button("Play from Here") { play(from: index) } }
                         if index + 1 < playlist.songIDs.count {
                             let ref = TransitionRef(from: id, to: playlist.songIDs[index + 1])
-                            TransitionRow(ref: ref, state: library.plan(from: ref.from, to: ref.to), selected: selected == ref)
+                            TransitionRow(ref: ref, state: library.plan(from: ref.from, to: ref.to), selected: (liveRef ?? selected) == ref)
                                 .onTapGesture { selected = ref }
                         }
                     }
@@ -139,14 +147,6 @@ struct PlaylistView: View {
     }
 }
 
-extension MixPlayer {
-    /// Plays `playlist` from the song at `index` to its end.
-    func play(_ playlist: Playlist, from index: Int, in library: Library) throws {
-        let ids = Array(playlist.songIDs[index...])
-        play(try library.mixItems(ids), queue: Queue(context: playlist.id, ids: ids, startIndex: index))
-    }
-}
-
 struct SongRow: View {
     let song: Song?
     let artwork: NSImage?
@@ -172,7 +172,7 @@ struct SongRow: View {
             Spacer()
             if let analysis {
                 Text("\(analysis.bpm) BPM").monospacedDigit()
-                Text(analysis.key).frame(width: 64, alignment: .trailing)
+                KeyBadge(key: analysis.key).frame(width: 44, alignment: .trailing)
             } else {
                 ProgressView().controlSize(.small)
             }

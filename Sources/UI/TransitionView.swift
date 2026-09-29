@@ -63,6 +63,7 @@ struct TransitionView: View {
     var body: some View {
         let out = SideTimeline(side: plan.outgoing, isOutgoing: true, duration: plan.duration)
         let inc = SideTimeline(side: plan.incoming, isOutgoing: false, duration: plan.duration)
+        let playhead = player.playhead
         VStack(alignment: .leading, spacing: 10) {
             header
             GeometryReader { geo in
@@ -71,13 +72,16 @@ struct TransitionView: View {
                     VStack(spacing: 6) {
                         TimeRuler(range: range, duration: plan.duration, pivot: plan.pivot)
                             .frame(height: 18)
+                        // Each song's effects sit on its outer side, the outgoing song's above it and the incoming
+                        // song's below, so the two waveforms stay together in the middle.
+                        EffectLanes(plan: plan, timeline: out, color: Theme.outgoing, range: range, playhead: playhead)
                         DeckLane(title: from?.title ?? "outgoing", color: Theme.outgoing, timeline: out,
-                                 analysis: library.analyses[ref.from], range: range, plan: plan, playhead: player.playhead)
+                                 analysis: library.analyses[ref.from], range: range, plan: plan, playhead: playhead)
                             .frame(height: 92)
                         DeckLane(title: to?.title ?? "incoming", color: Theme.incoming, timeline: inc,
-                                 analysis: library.analyses[ref.to], range: range, plan: plan, playhead: player.playhead)
+                                 analysis: library.analyses[ref.to], range: range, plan: plan, playhead: playhead)
                             .frame(height: 92)
-                        EffectLanes(plan: plan, out: out, inc: inc, range: range, playhead: player.playhead)
+                        EffectLanes(plan: plan, timeline: inc, color: Theme.incoming, range: range, playhead: playhead)
                     }
                     .frame(width: geo.size.width)
                 }
@@ -173,7 +177,9 @@ struct DeckLane: View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.system(size: 11, weight: .semibold)).foregroundStyle(color).lineLimit(2)
-                if let analysis { Text("\(analysis.bpm) BPM · \(analysis.key)").font(.system(size: 10)).foregroundStyle(.secondary) }
+                if let analysis {
+                    HStack(spacing: 5) { Text("\(analysis.bpm) BPM").font(.system(size: 10)).foregroundStyle(.secondary); KeyBadge(key: analysis.key) }
+                }
             }
             .frame(width: 104, alignment: .leading).padding(.trailing, 6)
             Canvas { ctx, size in draw(&ctx, size) }
@@ -230,8 +236,8 @@ struct DeckLane: View {
 
 struct EffectLanes: View {
     let plan: TransitionPlan
-    let out: SideTimeline
-    let inc: SideTimeline
+    let timeline: SideTimeline
+    let color: Color
     let range: ClosedRange<Double>
     let playhead: Double?
 
@@ -244,17 +250,15 @@ struct EffectLanes: View {
     }
 
     private var lanes: [Lane] {
-        var result: [Lane] = []
-        for (timeline, color, tag) in [(out, Theme.outgoing, "out"), (inc, Theme.incoming, "in")] {
-            let autos = timeline.side.automations.values.filter { $0.moves && $0.id != "bypa" }
-            for a in autos.sorted(by: { order($0.id) < order($1.id) }) {
-                result.append(Lane(id: "\(tag).\(a.id)", name: EffectCatalog.name(a.id), automation: a, timeline: timeline, color: color))
-            }
-        }
-        return result
+        timeline.side.automations.values.filter { $0.moves && $0.id != "bypa" }
+            .sorted { Self.order($0.id) < Self.order($1.id) }
+            .map { Lane(id: $0.id, name: EffectCatalog.name($0.id), automation: $0, timeline: timeline, color: color) }
     }
 
-    private func order(_ id: String) -> String {
+    /// On/off effects draw as blocks rather than curves.
+    static func isToggle(_ id: String) -> Bool { id.hasPrefix("RX") && id.hasSuffix("e") }
+
+    static func order(_ id: String) -> String {
         let rank = ["ts_rate": "0", "out_gain": "1"][id] ?? (EffectCatalog.family(of: id) == "filters" ? "2" : "3")
         return rank + id
     }
@@ -273,7 +277,7 @@ struct EffectLanes: View {
         }
     }
 
-    private func normalize(_ a: Automation, _ v: Double) -> Double {
+    static func normalize(_ a: Automation, _ v: Double) -> Double {
         let id = a.id
         if id.hasSuffix("f") && (id.hasPrefix("RX") || id.hasPrefix("HP") || id.hasPrefix("LP")) || id == "Fcf1" {
             return (log10(max(v, 20)) - log10(20)) / (log10(20000) - log10(20))   // cutoff: log scale
@@ -288,14 +292,14 @@ struct EffectLanes: View {
         let width = Double(size.width), h = Double(size.height)
         let x = { (t: Double) in xPosition(t, range, width) }
         ctx.fill(Path(CGRect(x: x(0), y: 0, width: x(plan.duration) - x(0), height: h)), with: .color(Theme.accent.opacity(0.05)))
-        let isToggle = lane.id.hasSuffix("e") && lane.automation.id.hasPrefix("RX") || lane.automation.id == "RXte"
+        let isToggle = Self.isToggle(lane.automation.id)
         var path = Path()
         var fill = Path()
         var started = false
         for col in stride(from: max(0, x(0)), through: min(width, x(plan.duration)), by: 1) {
             let t = range.lowerBound + col / width * (range.upperBound - range.lowerBound)
             guard let s = lane.timeline.songTime(at: t), let v = lane.automation.value(at: s) else { continue }
-            let n = normalize(lane.automation, v)
+            let n = Self.normalize(lane.automation, v)
             if isToggle {
                 if n > 0.5 { fill.addRect(CGRect(x: col, y: 3, width: 1, height: h - 6)) }
             } else {
