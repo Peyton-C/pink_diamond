@@ -49,7 +49,7 @@ file or stem  ->   SongAnalysis  ->  Transition JSON ->  sides, automation -> WA
 | Path | What |
 | --- | --- |
 | `Sources/Core/` | Everything that isn't UI, runnable headless through `--selftest` |
-| `Sources/UI/` | SwiftUI views; they read `Library` and never call the planner or renderer directly except to preview or export |
+| `Sources/UI/` | SwiftUI views; they go through `Library` and `MixPlayer` rather than calling the planner or renderer themselves |
 | `bundle.sh` | The only build. There is no Xcode project; do not add one without asking |
 
 pink diamond reproduces Apple Music's AutoMix, so the analysis it feeds the planner must match Apple's format, not an approximation of it. When the planner behaves differently from Music, suspect the analysis before the planner. Several fields that look cosmetic are load-bearing: the video cue scores decide which genre styles are possible, genres need Apple's catalog identifier objects, and non-finite loudness breaks the planner's JSON decoding.
