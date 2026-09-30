@@ -122,13 +122,16 @@ final class MixRenderer {
                 if c.songTime >= c.duration { c.finished = true }
                 if c.finished { c.unload() }
             }
-            // The listener's song changes halfway through the transition into the next one.
-            if current < last, chains[current + 1].active,
-               chains[current + 1].songTime >= chains[current + 1].item.entering.map({ ($0.start + $0.end) / 2 }) ?? 0 {
-                current += 1
+            // The listener's song changes halfway through the transition into the next one. An edited transition can
+            // cut a song off before its own entrance gets that far: it finishes the moment it starts, its song time
+            // freezes short of the midpoint, and stepping one song at a time left both indices stuck on the song
+            // before it for the rest of the mix. So the listener's song is the latest to have reached its midpoint,
+            // skipping any that never did, and the deck moves past a song once it has finished.
+            for i in 1..<chains.count where chains[i].active {
+                if chains[i].songTime >= chains[i].item.entering.map({ ($0.start + $0.end) / 2 }) ?? 0 { current = max(current, i) }
             }
-            if deck < last, chains[deck + 1].active,
-               chains[deck + 1].songTime >= chains[deck + 1].item.entering?.end ?? 0 {
+            while deck < last, chains[deck + 1].active,
+                  chains[deck + 1].finished || chains[deck + 1].songTime >= chains[deck + 1].item.entering?.end ?? 0 {
                 deck += 1
             }
             if stopAt == nil, chains[last].active {
@@ -175,12 +178,16 @@ private final class Slot {
             let buffers = UnsafeMutableAudioBufferListPointer(abl)
             var produced = 0
             if let chain, chain.active, !chain.finished, let audio = chain.audio {
-                let start = Int(chain.position)
-                produced = max(0, min(Int(frameCount), Int(audio.frameLength) - start))
+                // An edited transition can bring a song in before its start: silence until song time 0.
+                let start = Int(chain.position.rounded(.down))
+                let lead = min(Int(frameCount), max(0, -start))
+                let copied = max(0, min(Int(frameCount) - lead, Int(audio.frameLength) - max(start, 0)))
+                produced = lead + copied
                 for (c, buf) in buffers.enumerated() {
                     let dst = buf.mData!.assumingMemoryBound(to: Float.self)
                     let src = audio.floatChannelData![min(c, Int(audio.format.channelCount) - 1)]
-                    for i in 0..<produced { dst[i] = src[start + i] }
+                    for i in 0..<lead { dst[i] = 0 }
+                    for i in 0..<copied { dst[lead + i] = src[max(start, 0) + i] }
                     for i in produced..<Int(frameCount) { dst[i] = 0 }
                 }
                 chain.position += Double(produced)

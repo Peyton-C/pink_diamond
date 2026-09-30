@@ -42,7 +42,11 @@ final class Library: ObservableObject {
     @Published private(set) var summaries: [UUID: SongSummary] = [:]
     /// Full analyses, loaded only for songs in playlists: the deck views, planner and renderer are the only users.
     @Published private(set) var analyses: [UUID: SongAnalysis] = [:]
+    /// Plans with the user's edits applied, which is what everything plays and draws.
     @Published private(set) var plans: [String: PlanState] = [:]
+    /// The user's changes to transitions, by plan key.
+    @Published private(set) var edits: [String: TransitionEdit] = [:]
+    private var basePlans: [String: PlanState] = [:]   // Apple's plans, by plan key and variant
     @Published private(set) var artwork: [UUID: NSImage] = [:]
     private var albumArtwork: [String: NSImage] = [:]   // updated alongside `artwork`, whose publish redraws
     private var playable: [UUID: URL] = [:]
@@ -59,6 +63,7 @@ final class Library: ObservableObject {
 
     private var storeURL: URL { AppPaths.support.appendingPathComponent("library.json") }
     private var summaryURL: URL { AppPaths.cacheDir("analysis").appendingPathComponent("summaries.json") }
+    private var editsURL: URL { AppPaths.support.appendingPathComponent("edits.json") }
 
     /// Launch fills in the library in order of what's on screen and needed: the summary index (one small file) for
     /// every row at once, then full analyses of playlist songs, off the main thread, then cover art and missing tags.
@@ -67,6 +72,9 @@ final class Library: ObservableObject {
         load()
         if let data = try? Data(contentsOf: summaryURL), let index = try? JSONDecoder().decode([String: SongSummary].self, from: data) {
             summaryIndex = index
+        }
+        if let data = try? Data(contentsOf: editsURL), let saved = try? JSONDecoder().decode([String: TransitionEdit].self, from: data) {
+            edits = saved
         }
         var known: [UUID: SongSummary] = [:], pending: [Song] = []
         for song in songs {
@@ -359,34 +367,123 @@ final class Library: ObservableObject {
 
     // MARK: Plans
 
+    /// A transition's key: the two songs as planned, genres included, since genres change the plan. Edits are keyed
+    /// the same way, so an edit belongs to the plan it was made on and comes back if the genres are set back.
     private func planKey(_ a: Song, _ b: Song) -> String { "\(a.id)|\(a.genre.rawValue)>\(b.id)|\(b.genre.rawValue)" }
+
+    private nonisolated func baseKey(_ key: String, _ variant: PlanVariant?) -> String { variant.map { key + "#" + $0.key } ?? key }
 
     private func invalidatePlans(involving id: UUID) {
         plans = plans.filter { !$0.key.contains(id.uuidString) }
+        basePlans = basePlans.filter { !$0.key.contains(id.uuidString) }
     }
 
-    /// The plan for a → b: cached, or started in the background (published when ready).
+    /// The plan for a → b with the user's edits applied: cached, or started in the background (published when ready).
+    /// Everything that plays or draws a transition gets it from here, so edits reach the deck views, playback and export.
     func plan(from a: UUID, to b: UUID) -> PlanState? {
-        guard let sa = song(a), let sb = song(b), let aa = analyses[a], let ab = analyses[b] else { return nil }
+        guard let sa = song(a), let sb = song(b) else { return nil }
         let key = planKey(sa, sb)
         if let existing = plans[key] { return existing }
-        guard !pendingPlans.contains(key) else { return .planning }
-        pendingPlans.insert(key)   // not @Published: this is called while SwiftUI renders
-        let (ga, gb) = (sa.genre, sb.genre)
+        let edit = edits[key] ?? TransitionEdit()
+        guard let base = basePlan(from: a, to: b, variant: edit.variant) else { return nil }
+        guard case .ready(let plan) = base else { return base }
+        let state = PlanState.ready(edit.isEmpty ? plan : plan.applying(edit))
+        // Called while SwiftUI renders, where publishing isn't allowed; the next call finds it cached.
+        Task { @MainActor in if self.plans[key] == nil { self.plans[key] = state } }
+        return state
+    }
+
+    /// Apple's plan for a → b before any edits, as `variant` if given: cached, or started in the background.
+    func basePlan(from a: UUID, to b: UUID, variant: PlanVariant? = nil) -> PlanState? {
+        guard let sa = song(a), let sb = song(b), let aa = analyses[a], let ab = analyses[b] else { return nil }
+        let key = planKey(sa, sb), base = baseKey(key, variant)
+        if let existing = basePlans[base] { return existing }
+        guard !pendingPlans.contains(base) else { return .planning }
+        pendingPlans.insert(base)   // not @Published: this is called while SwiftUI renders
+        let (ga, gb) = (variant?.fromGenre ?? sa.genre, variant?.toGenre ?? sb.genre)
+        let criteria = variant?.criteriaPatch
         Task.detached {
-            let state: PlanState
-            do {
-                let json = try SonicPlanner.shared.plan(from: try Analyzer.songJSON(aa, genre: ga), to: try Analyzer.songJSON(ab, genre: gb))
-                state = .ready(try TransitionPlan(json: json))
-            } catch {
-                state = .failed(String(describing: error))
-            }
+            let state = Self.makePlan(aa, ga, ab, gb, criteria: criteria)
             await MainActor.run {
-                self.pendingPlans.remove(key)
-                self.plans[key] = state
+                self.pendingPlans.remove(base)
+                self.basePlans[base] = state
+                self.plans[key] = nil   // recomputed with the edit on the next request
             }
         }
         return .planning
+    }
+
+    private nonisolated static func makePlan(_ a: SongAnalysis, _ ga: Genre, _ b: SongAnalysis, _ gb: Genre,
+                                             criteria: [String: Any]?) -> PlanState {
+        do {
+            let json = try SonicPlanner.shared.plan(from: try Analyzer.songJSON(a, genre: ga), to: try Analyzer.songJSON(b, genre: gb),
+                                                    criteria: criteria)
+            return .ready(try TransitionPlan(json: json))
+        } catch {
+            return .failed(String(describing: error))
+        }
+    }
+
+    // MARK: Edits
+
+    func edit(from a: UUID, to b: UUID) -> TransitionEdit {
+        guard let sa = song(a), let sb = song(b) else { return TransitionEdit() }
+        return edits[planKey(sa, sb)] ?? TransitionEdit()
+    }
+
+    /// Replaces a transition's edit. With an undo manager the change is undoable (and redoable) and saved; without
+    /// one it's a step of a drag still under way, applied but not saved.
+    func setEdit(_ edit: TransitionEdit, from a: UUID, to b: UUID, undo: UndoManager? = nil, previous: TransitionEdit? = nil) {
+        guard let sa = song(a), let sb = song(b) else { return }
+        let key = planKey(sa, sb)
+        let old = previous ?? edits[key] ?? TransitionEdit()
+        if (edits[key] ?? TransitionEdit()) != edit {
+            edits[key] = edit.isEmpty ? nil : edit
+            plans[key] = nil
+        }
+        guard let undo else { return }
+        saveEdits()
+        guard old != edit else { return }
+        undo.registerUndo(withTarget: self) { library in
+            MainActor.assumeIsolated { library.setEdit(old, from: a, to: b, undo: undo, previous: edit) }
+        }
+        undo.setActionName("Edit Transition")
+    }
+
+    private func saveEdits() {
+        try? JSONEncoder().encode(edits).write(to: editsURL, options: .atomic)
+    }
+
+    struct Alternative: Identifiable {
+        let variant: PlanVariant?
+        let plan: TransitionPlan
+        var id: String { variant?.key ?? "" }
+    }
+
+    /// The different plans Apple's planner makes for a → b: as planned, with both songs taken as each genre in turn,
+    /// and under lower complexity ceilings. Plans that come out the same are listed once. About a second of planning.
+    func alternatives(from a: UUID, to b: UUID) async -> [Alternative] {
+        guard let sa = song(a), let sb = song(b), let aa = analyses[a], let ab = analyses[b] else { return [] }
+        let key = planKey(sa, sb)
+        var variants: [PlanVariant?] = [nil]
+        variants += Genre.allCases.filter { $0 != sa.genre || $0 != sb.genre }.map { PlanVariant(fromGenre: $0, toGenre: $0) }
+        variants += PlanVariant.Complexity.allCases.map { PlanVariant(fromGenre: sa.genre, toGenre: sb.genre, complexity: $0) }
+        let cached = basePlans
+        let results = await Task.detached { () -> [(PlanVariant?, PlanState)] in
+            variants.map { v in
+                if let known = cached[self.baseKey(key, v)] { return (v, known) }
+                return (v, Self.makePlan(aa, v?.fromGenre ?? sa.genre, ab, v?.toGenre ?? sb.genre, criteria: v?.criteriaPatch))
+            }
+        }.value
+        var seen = Set<String>(), list: [Alternative] = []
+        for (v, state) in results {
+            basePlans[baseKey(key, v)] = state
+            guard case .ready(let plan) = state else { continue }
+            let signature = String(format: "%@%d|%.1f|%.1f|%.1f", plan.algorithm, plan.styleID ?? -1, plan.outgoing.start,
+                                   plan.incoming.start, plan.duration)
+            if seen.insert(signature).inserted { list.append(Alternative(variant: v, plan: plan)) }
+        }
+        return list
     }
 
     /// Renderer items for playing `ids` in order. Every song must be analyzed and every transition planned or

@@ -79,7 +79,8 @@ struct PlaylistView: View {
                             .contextMenu { Button("Play from Here") { play(from: index) } }
                         if index + 1 < playlist.songIDs.count {
                             let ref = TransitionRef(from: id, to: playlist.songIDs[index + 1])
-                            TransitionRow(ref: ref, state: library.plan(from: ref.from, to: ref.to), selected: (liveRef ?? selected) == ref)
+                            TransitionRow(ref: ref, state: library.plan(from: ref.from, to: ref.to), selected: (liveRef ?? selected) == ref,
+                                          edited: !library.edit(from: ref.from, to: ref.to).isEmpty)
                                 .onTapGesture { selected = ref }
                         }
                     }
@@ -186,12 +187,14 @@ struct TransitionRow: View {
     let ref: TransitionRef
     let state: PlanState?
     let selected: Bool
+    var edited = false
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "arrow.turn.down.right").foregroundStyle(.secondary).padding(.leading, 30)
             switch state {
             case .ready(let plan):
                 StyleChip(plan: plan)
+                if edited { Image(systemName: "slider.horizontal.3").foregroundStyle(Theme.accent).help("Edited") }
                 Text(String(format: "%.1f s", plan.duration)).monospacedDigit().foregroundStyle(.secondary)
                 Text(plan.effectSummary.filter { $0 != "tempo" && $0 != "volume" }.joined(separator: " · "))
                     .foregroundStyle(.secondary).lineLimit(1)

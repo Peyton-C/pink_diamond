@@ -35,10 +35,10 @@ struct GraphWire { let box: String; let index: UInt32; let defaultValue: Double 
 
 /// One song's half of a transition.
 struct TransitionSide {
-    let start: Double                    // song time where the transition starts
-    let end: Double                      // song time where it ends
-    let automations: [String: Automation]
-    let wiring: [String: GraphWire]
+    var start: Double                    // song time where the transition starts
+    var end: Double                      // song time where it ends
+    var automations: [String: Automation]
+    var wiring: [String: GraphWire]
 
     func rate(at s: Double) -> Double { automations["ts_rate"]?.value(at: s) ?? 1 }
 
@@ -70,11 +70,10 @@ struct TransitionSide {
 struct TransitionPlan {
     let algorithm: String
     let styleID: Int?
-    let outgoing: TransitionSide
-    let incoming: TransitionSide
-    let duration: Double          // transition length on the playback clock
-    let pivot: Double             // seconds into the transition where the handoff happens
-    let json: Data
+    var outgoing: TransitionSide
+    var incoming: TransitionSide
+    var duration: Double          // transition length on the playback clock
+    var pivot: Double             // seconds into the transition where the handoff happens
 
     var styleName: String {
         let words = algorithm.replacingOccurrences(of: "([a-z])([A-Z])", with: "$1 $2", options: .regularExpression)
@@ -93,7 +92,6 @@ struct TransitionPlan {
     }
 
     init(json: Data) throws {
-        self.json = json
         guard let plan = try JSONSerialization.jsonObject(with: json) as? [String: Any],
               let summary = plan["summary"] as? [String: Any],
               let schedule = plan["schedule"] as? [String: Any],
@@ -181,4 +179,45 @@ enum EffectCatalog {
     ]
 
     static func name(_ id: String) -> String { names[id] ?? id }
+
+    /// Value ranges for parameters a plan may not automate, so an added lane can be drawn and edited. Plans carry
+    /// their own ranges for the ones they do; these are the same values (AURemixFX's parameter list and the plans).
+    static let ranges: [String: ClosedRange<Double>] = [
+        "bypa": 0...1, "out_gain": 0...1, "ts_rate": 0.03125...32,
+        "HP1f": 10...22050, "LP1f": 10...22050, "HP2f": 10...22050, "LP2f": 10...22050,
+        "Ga1g": 0...1, "Ga2g": 0...1, "Ga3g": 0...1, "Ga4g": 0...1,
+        "DLdw": 0...100, "DLdt": 0.0001...2.01, "DLfb": -99.9...99.9, "DLlf": 10...22050,
+        "RXxt": 20...300, "RXaf": 20...20000, "RXbf": 20...20000, "RXat": 0...2, "RXbt": 0...2,
+        "RXpr": 0...7, "RXvt": 1...200, "RXdr": 0...23, "RXgr": 0...15, "RXfr": 0...15, "RXsr": 0...15, "RXsm": 0...0.5, "RXtr": 3...15,
+    ]
+
+    static func range(_ a: Automation) -> ClosedRange<Double> { a.range ?? ranges[a.id] ?? 0...1 }
+
+    /// Cutoff frequencies, drawn and edited on a log scale.
+    static func isCutoff(_ id: String) -> Bool { ["HP1f", "LP1f", "HP2f", "LP2f", "RXaf", "RXbf", "Fcf1", "DLlf"].contains(id) }
+
+    /// On/off switches (RemixFX's effect enables), drawn as blocks.
+    static func isToggle(_ id: String) -> Bool { id.hasPrefix("RX") && id.hasSuffix("e") || id == "RXls" }
+
+    /// Parameters that only take whole values: switches, and note-length or filter-type indices.
+    static func isStepped(_ id: String) -> Bool { isToggle(id) || ["RXpr", "RXdr", "RXgr", "RXfr", "RXsr", "RXtr", "RXat", "RXbt"].contains(id) }
+
+    /// A value as a lane height, 0...1.
+    static func normalize(_ a: Automation, _ v: Double) -> Double {
+        if isCutoff(a.id) { return min(max((log10(max(v, 20)) - log10(20)) / 3, 0), 1) }   // 20 Hz…20 kHz
+        if a.id == "ts_rate" { return min(max((v - 0.75) / 0.5, 0), 1) }                     // 0.75×…1.25×
+        let r = range(a)
+        return r.upperBound > r.lowerBound ? min(max((v - r.lowerBound) / (r.upperBound - r.lowerBound), 0), 1) : 0
+    }
+
+    /// A lane height back to a value; the inverse of `normalize`.
+    static func denormalize(_ a: Automation, _ n: Double) -> Double {
+        let n = min(max(n, 0), 1)
+        let r = range(a)
+        let v: Double
+        if isCutoff(a.id) { v = pow(10, log10(20) + n * 3) } else if a.id == "ts_rate" { v = 0.75 + n * 0.5 } else {
+            v = r.lowerBound + n * (r.upperBound - r.lowerBound)
+        }
+        return min(max(isStepped(a.id) ? v.rounded() : v, r.lowerBound), r.upperBound)
+    }
 }
