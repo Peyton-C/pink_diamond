@@ -49,21 +49,29 @@ struct SideTimeline {
     func audible(at t: Double) -> Bool { isOutgoing ? t <= duration : t >= 0 }
 }
 
+/// The deck view, which is also the mix editor: drag a song to move its side of the transition by bars, edit or add
+/// effect automation, or pick another of the plans Apple's planner makes for the pair. Edits go to the library, so
+/// playback and export use them too.
 struct TransitionView: View {
     @EnvironmentObject var library: Library
     @EnvironmentObject var mixPlayer: MixPlayer
+    @Environment(\.undoManager) private var undo
     let ref: TransitionRef
     let plan: TransitionPlan
     @StateObject private var player = PreviewPlayer()
+    @State private var dragStart: TransitionEdit?   // the edit before the drag under way, for undo
+    @State private var showingStyles = false
     static let margin = 8.0
 
     private var from: Song? { library.song(ref.from) }
     private var to: Song? { library.song(ref.to) }
+    private var edit: TransitionEdit { library.edit(from: ref.from, to: ref.to) }
 
     var body: some View {
         let out = SideTimeline(side: plan.outgoing, isOutgoing: true, duration: plan.duration)
         let inc = SideTimeline(side: plan.incoming, isOutgoing: false, duration: plan.duration)
         let playhead = player.playhead
+        let base = basePlan
         VStack(alignment: .leading, spacing: 10) {
             header
             GeometryReader { geo in
@@ -74,14 +82,22 @@ struct TransitionView: View {
                             .frame(height: 18)
                         // Each song's effects sit on its outer side, the outgoing song's above it and the incoming
                         // song's below, so the two waveforms stay together in the middle.
-                        EffectLanes(plan: plan, timeline: out, color: Theme.outgoing, range: range, playhead: playhead)
+                        EffectLanes(plan: plan, timeline: out, color: Theme.outgoing, range: range, playhead: playhead,
+                                    pinned: pinned(base?.outgoing, edit.outgoing), presets: presets(plan.outgoing),
+                                    onChange: { setLane(true, $0, $1, ended: $2) }, onAdd: { addPreset($0, outgoing: true) },
+                                    onRemove: { removeLane($0, outgoing: true) }, onReset: resetLane(true, base?.outgoing))
                         DeckLane(title: from?.title ?? "outgoing", color: Theme.outgoing, timeline: out,
-                                 analysis: library.analyses[ref.from], range: range, plan: plan, playhead: playhead)
+                                 analysis: library.analyses[ref.from], range: range, plan: plan, playhead: playhead,
+                                 onDrag: { move(true, by: $0, ended: $1) })
                             .frame(height: 92)
                         DeckLane(title: to?.title ?? "incoming", color: Theme.incoming, timeline: inc,
-                                 analysis: library.analyses[ref.to], range: range, plan: plan, playhead: playhead)
+                                 analysis: library.analyses[ref.to], range: range, plan: plan, playhead: playhead,
+                                 onDrag: { move(false, by: $0, ended: $1) })
                             .frame(height: 92)
-                        EffectLanes(plan: plan, timeline: inc, color: Theme.incoming, range: range, playhead: playhead)
+                        EffectLanes(plan: plan, timeline: inc, color: Theme.incoming, range: range, playhead: playhead,
+                                    pinned: pinned(base?.incoming, edit.incoming), presets: presets(plan.incoming),
+                                    onChange: { setLane(false, $0, $1, ended: $2) }, onAdd: { addPreset($0, outgoing: false) },
+                                    onRemove: { removeLane($0, outgoing: false) }, onReset: resetLane(false, base?.incoming))
                     }
                     .frame(width: geo.size.width)
                 }
@@ -91,6 +107,7 @@ struct TransitionView: View {
         .background(Theme.panel)
         .onDisappear { player.stop() }
         .onChange(of: ref) { player.stop() }
+        .onChange(of: edit) { player.stop() }   // the preview no longer matches
     }
 
     private var header: some View {
@@ -104,6 +121,7 @@ struct TransitionView: View {
                 .font(.system(size: 15, weight: .bold))
                 HStack(spacing: 10) {
                     StyleChip(plan: plan)
+                    if edit.hasChanges { Text("edited").foregroundStyle(Theme.accent) }
                     Text(String(format: "%.1f s", plan.duration))
                     Text("out \(Theme.time(plan.outgoing.start)) → \(Theme.time(plan.outgoing.end))").foregroundStyle(Theme.outgoing)
                     Text("in \(Theme.time(plan.incoming.start)) → \(Theme.time(plan.incoming.end))").foregroundStyle(Theme.incoming)
@@ -115,6 +133,17 @@ struct TransitionView: View {
                 .font(.system(size: 11)).monospacedDigit()
             }
             Spacer()
+            Button { showingStyles = true } label: { Label("Styles", systemImage: "diamond") }
+                .help("Other plans Apple's planner makes for these two songs")
+                .popover(isPresented: $showingStyles, arrowEdge: .bottom) {
+                    StylePicker(ref: ref, current: edit.variant) { variant in
+                        showingStyles = false
+                        apply(TransitionEdit(variant: variant), ended: true)
+                    }
+                }
+            Button("Reset") { apply(TransitionEdit(), ended: true) }
+                .help("Back to Apple's plan")
+                .disabled(edit.isEmpty)
             Button {
                 player.isPlaying ? player.stop() : preview()
             } label: {
@@ -135,6 +164,153 @@ struct TransitionView: View {
         let items = [MixRenderer.Item(audio: a, beats: aa.beats, entering: nil, leaving: plan.outgoing),
                      MixRenderer.Item(audio: b, beats: ab.beats, entering: plan.incoming, leaving: nil)]
         player.renderAndPlay(items, startTime: plan.outgoing.start - Self.margin, tail: Self.margin, offset: -Self.margin)
+    }
+
+    // MARK: Editing
+
+    private var basePlan: TransitionPlan? {
+        if case .ready(let p) = library.basePlan(from: ref.from, to: ref.to, variant: edit.variant) { return p }
+        return nil
+    }
+
+    /// Lanes that stay on screen even when flat: the plan's own moving ones and the effects the user added, so a lane
+    /// doesn't vanish mid-drag when its points line up.
+    private func pinned(_ base: TransitionSide?, _ lanes: [String: [TransitionEdit.Point]]) -> Set<String> {
+        let own = (base?.automations.values.filter(\.moves).map(\.id) ?? []).filter { $0 != "bypa" }
+        return Set(own).union(lanes.keys.filter { id in EffectPreset.all.contains { $0.id == id } })
+    }
+
+    private func presets(_ side: TransitionSide) -> [EffectPreset] {
+        EffectPreset.all.filter { p in p.requires.allSatisfy { side.wiring[$0] != nil } && side.automations[p.id]?.moves != true }
+    }
+
+    /// Applies `new`. A drag applies every step and commits (saves, with one undo step) when it ends.
+    private func apply(_ new: TransitionEdit, ended: Bool) {
+        if ended {
+            library.setEdit(new, from: ref.from, to: ref.to, undo: undo, previous: dragStart)
+            dragStart = nil
+        } else {
+            if dragStart == nil { dragStart = edit }
+            library.setEdit(new, from: ref.from, to: ref.to)
+        }
+    }
+
+    /// Moves one side of the transition by a drag of `dt` seconds on the timeline, snapped to that song's bars (beats
+    /// with ⌥), keeping whatever offset from the grid the planner chose.
+    private func move(_ outgoing: Bool, by dt: Double, ended: Bool) {
+        let before = dragStart ?? edit
+        let side = outgoing ? plan.outgoing : plan.incoming
+        let baseStart = side.start - edit.shift(outgoing)
+        let length = side.end - side.start
+        let analysis = library.analyses[outgoing ? ref.from : ref.to]
+        let duration = analysis?.duration ?? .infinity
+        let target = baseStart + before.shift(outgoing) - dt
+        var start = target
+        if let analysis {
+            let bars = analysis.bars.isEmpty ? analysis.beats : analysis.bars
+            let grid = NSEvent.modifierFlags.contains(.option) || bars.isEmpty ? analysis.beats : bars
+            if let anchor = grid.min(by: { abs($0 - baseStart) < abs($1 - baseStart) }) {
+                let offset = baseStart - anchor
+                let valid = grid.map { $0 + offset }.filter { $0 >= 0 && $0 + length <= duration }
+                start = valid.min(by: { abs($0 - target) < abs($1 - target) }) ?? baseStart
+            }
+        }
+        start = min(max(start, 0), max(0, duration - length))
+        var new = before
+        new.setShift(outgoing, start - baseStart)
+        apply(new, ended: ended)
+    }
+
+    private func setLane(_ outgoing: Bool, _ id: String, _ points: [TransitionEdit.Point], ended: Bool) {
+        var new = dragStart ?? edit
+        new.setLane(outgoing, id, points)
+        apply(new, ended: ended)
+    }
+
+    private func addPreset(_ preset: EffectPreset, outgoing: Bool) {
+        let side = outgoing ? plan.outgoing : plan.incoming
+        let bpm = Double(library.analyses[outgoing ? ref.from : ref.to]?.bpm ?? 120)
+        var new = edit
+        for (id, points) in preset.lanes(length: side.end - side.start, outgoing: outgoing, bpm: bpm, side: side) {
+            new.setLane(outgoing, id, points)
+        }
+        apply(new, ended: true)
+    }
+
+    /// Takes an effect out of the transition: one the user added disappears with its settings; one from the plan is
+    /// held at its neutral value.
+    private func removeLane(_ id: String, outgoing: Bool) {
+        let base = outgoing ? basePlan?.outgoing : basePlan?.incoming
+        let side = outgoing ? plan.outgoing : plan.incoming
+        var new = edit
+        for code in EffectPreset.group(of: id) {
+            if code == id, base?.automations[code] != nil {
+                let v = side.neutralValue(code)
+                new.setLane(outgoing, code, [.init(offset: 0, value: v, curve: "linear"),
+                                             .init(offset: side.end - side.start, value: v, curve: "linear")])
+            } else {
+                new.setLane(outgoing, code, nil)
+            }
+        }
+        // Effects added over a plan that bypasses them switched the bypass off; switch it back once none are left.
+        let lanes = new.lanes(outgoing)
+        if lanes.keys.allSatisfy({ $0 == "bypa" || base?.automations[$0] != nil }) { new.setLane(outgoing, "bypa", nil) }
+        apply(new, ended: true)
+    }
+
+    /// Puts one of the plan's lanes back as Apple planned it, for lanes the plan has.
+    private func resetLane(_ outgoing: Bool, _ base: TransitionSide?) -> (String) -> Void {
+        { id in
+            guard base?.automations[id] != nil else { return }
+            var new = edit
+            new.setLane(outgoing, id, nil)
+            apply(new, ended: true)
+        }
+    }
+}
+
+/// The plans Apple's planner makes for a pair as other genres or with lower complexity, to pick from.
+struct StylePicker: View {
+    @EnvironmentObject var library: Library
+    let ref: TransitionRef
+    let current: PlanVariant?
+    let choose: (PlanVariant?) -> Void
+    @State private var alternatives: [Library.Alternative]?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Styles").font(.headline)
+            if let alternatives {
+                ForEach(alternatives) { alt in
+                    Button { choose(alt.variant) } label: { row(alt) }.buttonStyle(.plain)
+                }
+            } else {
+                HStack { ProgressView().controlSize(.small); Text("Planning…").foregroundStyle(.secondary) }
+            }
+            Text("Choosing a style starts over from its plan.").font(.system(size: 10)).foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .frame(width: 400)
+        .task { alternatives = await library.alternatives(from: ref.from, to: ref.to) }
+    }
+
+    private func row(_ alt: Library.Alternative) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark").opacity(alt.variant == current ? 1 : 0).foregroundStyle(Theme.accent)
+            StyleChip(plan: alt.plan)
+            Text(String(format: "%.1f s", alt.plan.duration)).monospacedDigit()
+            Text("in at \(Theme.time(alt.plan.incoming.start))").foregroundStyle(.secondary).monospacedDigit()
+            Spacer()
+            Text(label(alt.variant)).foregroundStyle(.secondary)
+        }
+        .font(.system(size: 11))
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
+    }
+
+    private func label(_ v: PlanVariant?) -> String {
+        guard let v else { return "as planned" }
+        return v.complexity?.label ?? "as \(v.fromGenre.rawValue)"
     }
 }
 
@@ -172,6 +348,7 @@ struct DeckLane: View {
     let range: ClosedRange<Double>
     let plan: TransitionPlan
     let playhead: Double?
+    var onDrag: ((Double, Bool) -> Void)?   // seconds dragged on the timeline, and whether the drag ended
 
     var body: some View {
         HStack(spacing: 0) {
@@ -182,9 +359,17 @@ struct DeckLane: View {
                 }
             }
             .frame(width: 104, alignment: .leading).padding(.trailing, 6)
-            Canvas { ctx, size in draw(&ctx, size) }
-                .background(Theme.lane, in: RoundedRectangle(cornerRadius: 6))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+            GeometryReader { geo in
+                let seconds = { (dx: Double) in dx / geo.size.width * (range.upperBound - range.lowerBound) }
+                Canvas { ctx, size in draw(&ctx, size) }
+                    .background(Theme.lane, in: RoundedRectangle(cornerRadius: 6))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .pointerStyle(onDrag == nil ? .default : .grabIdle)
+                    .gesture(DragGesture(minimumDistance: 2)
+                        .onChanged { onDrag?(seconds($0.translation.width), false) }
+                        .onEnded { onDrag?(seconds($0.translation.width), true) })
+                    .help("Drag to move this song's side of the transition by bars, ⌥ for beats")
+            }
         }
     }
 
@@ -234,29 +419,31 @@ struct DeckLane: View {
     }
 }
 
+/// One song's automation lanes. Points can be dragged, double-clicking adds a point (or removes the one under the
+/// pointer), and each lane's menu sets its curve or removes it. The tempo lane is shown but not editable: it sets the
+/// beat match and the transition's length.
 struct EffectLanes: View {
     let plan: TransitionPlan
     let timeline: SideTimeline
     let color: Color
     let range: ClosedRange<Double>
     let playhead: Double?
+    var pinned: Set<String> = []
+    var presets: [EffectPreset] = []
+    var onChange: ((String, [TransitionEdit.Point], Bool) -> Void)?
+    var onAdd: ((EffectPreset) -> Void)?
+    var onRemove: ((String) -> Void)?
+    var onReset: ((String) -> Void)?
+    @State private var dragging: (lane: String, index: Int)?
+    private static let height = 30.0
+    private static let handle = 3.5
 
-    private struct Lane: Identifiable {
-        let id: String
-        let name: String
-        let automation: Automation
-        let timeline: SideTimeline
-        let color: Color
-    }
+    private var side: TransitionSide { timeline.side }
 
-    private var lanes: [Lane] {
-        timeline.side.automations.values.filter { $0.moves && $0.id != "bypa" }
+    private var lanes: [Automation] {
+        side.automations.values.filter { ($0.moves || pinned.contains($0.id)) && $0.id != "bypa" }
             .sorted { Self.order($0.id) < Self.order($1.id) }
-            .map { Lane(id: $0.id, name: EffectCatalog.name($0.id), automation: $0, timeline: timeline, color: color) }
     }
-
-    /// On/off effects draw as blocks rather than curves.
-    static func isToggle(_ id: String) -> Bool { id.hasPrefix("RX") && id.hasSuffix("e") }
 
     static func order(_ id: String) -> String {
         let rank = ["ts_rate": "0", "out_gain": "1"][id] ?? (EffectCatalog.family(of: id) == "filters" ? "2" : "3")
@@ -265,41 +452,128 @@ struct EffectLanes: View {
 
     var body: some View {
         VStack(spacing: 3) {
-            ForEach(lanes) { lane in
+            if timeline.isOutgoing { addMenu }
+            ForEach(lanes, id: \.id) { lane in
                 HStack(spacing: 0) {
-                    Text(lane.name).font(.system(size: 10)).foregroundStyle(lane.color.opacity(0.9))
-                        .frame(width: 104, alignment: .leading).padding(.trailing, 6).lineLimit(1)
-                    Canvas { ctx, size in draw(lane, &ctx, size) }
-                        .background(Theme.lane.opacity(0.7), in: RoundedRectangle(cornerRadius: 4))
+                    Menu {
+                        laneMenu(lane)
+                    } label: {
+                        Text(EffectCatalog.name(lane.id)).font(.system(size: 10)).foregroundStyle(color.opacity(0.9)).lineLimit(1)
+                    }
+                    .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+                    .frame(width: 104, alignment: .leading).padding(.trailing, 6)
+                    .disabled(lane.id == "ts_rate" || onChange == nil)
+                    GeometryReader { geo in
+                        Canvas { ctx, size in draw(lane, &ctx, size) }
+                            .background(Theme.lane.opacity(0.7), in: RoundedRectangle(cornerRadius: 4))
+                            .gesture(dragGesture(lane, geo.size), including: lane.id == "ts_rate" ? .none : .all)
+                            .onTapGesture(count: 2, coordinateSpace: .local) { doubleClick(lane, at: $0, geo.size) }
+                    }
                 }
-                .frame(height: 20)
+                .frame(height: Self.height)
             }
+            if !timeline.isOutgoing { addMenu }
         }
     }
 
-    static func normalize(_ a: Automation, _ v: Double) -> Double {
-        let id = a.id
-        if id.hasSuffix("f") && (id.hasPrefix("RX") || id.hasPrefix("HP") || id.hasPrefix("LP")) || id == "Fcf1" {
-            return (log10(max(v, 20)) - log10(20)) / (log10(20000) - log10(20))   // cutoff: log scale
+    @ViewBuilder private var addMenu: some View {
+        if let onAdd, !presets.isEmpty {
+            HStack(spacing: 0) {
+                Menu {
+                    ForEach(presets) { p in Button(p.name) { onAdd(p) } }
+                } label: {
+                    Label("Add effect", systemImage: "plus").font(.system(size: 10)).foregroundStyle(color.opacity(0.8))
+                }
+                .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+                Spacer()
+            }
+            .frame(height: 16)
         }
-        if id == "ts_rate" { return min(max((v - 0.75) / 0.5, 0), 1) }        // 0.75×…1.25×
-        let values = a.points.map(\.value)
-        let lo = min(values.min() ?? 0, a.range?.lowerBound ?? 0), hi = max(values.max() ?? 1, 1)
-        return hi > lo ? (v - lo) / (hi - lo) : 0
     }
 
-    private func draw(_ lane: Lane, _ ctx: inout GraphicsContext, _ size: CGSize) {
+    @ViewBuilder private func laneMenu(_ lane: Automation) -> some View {
+        if !EffectCatalog.isStepped(lane.id) {
+            ForEach([("Linear", "linear"), ("Ease In", "easedIn"), ("Ease Out", "easedOut")], id: \.1) { name, curve in
+                Button(name) { onChange?(lane.id, points(lane).map { .init(offset: $0.offset, value: $0.value, curve: curve) }, true) }
+            }
+            Divider()
+        }
+        Button("Reset to Plan") { onReset?(lane.id) }
+        if lane.id != "out_gain" { Button("Remove", role: .destructive) { onRemove?(lane.id) } }
+    }
+
+    private func points(_ lane: Automation) -> [TransitionEdit.Point] { side.editPoints(lane.id) }
+
+    private func location(_ p: Automation.Point, _ lane: Automation, _ size: CGSize) -> CGPoint {
+        let h = Double(size.height)
+        return CGPoint(x: xPosition(timeline.transitionTime(at: p.time), range, size.width),
+                       y: h - 2 - EffectCatalog.normalize(lane, p.value) * (h - 4))
+    }
+
+    private func hit(_ lane: Automation, _ at: CGPoint, _ size: CGSize) -> Int? {
+        let near = lane.points.indices.map { ($0, hypot(location(lane.points[$0], lane, size).x - at.x, location(lane.points[$0], lane, size).y - at.y)) }
+            .filter { $0.1 < 8 }
+        return near.min { $0.1 < $1.1 }?.0
+    }
+
+    /// A position in the lane as an edit point: song time from the side's start, and value.
+    private func point(at loc: CGPoint, _ lane: Automation, _ size: CGSize) -> (offset: Double, value: Double) {
+        let t = min(max(range.lowerBound + loc.x / size.width * (range.upperBound - range.lowerBound), 0), plan.duration)
+        let s = timeline.songTime(at: t) ?? side.end
+        let h = Double(size.height)
+        return (min(max(s, side.start), side.end) - side.start, EffectCatalog.denormalize(lane, (h - 2 - loc.y) / (h - 4)))
+    }
+
+    private func dragGesture(_ lane: Automation, _ size: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { g in
+                guard let onChange else { return }
+                if dragging == nil {
+                    guard let i = hit(lane, g.startLocation, size) else { return }
+                    dragging = (lane.id, i)
+                }
+                guard let d = dragging, d.lane == lane.id else { return }
+                var pts = points(lane)
+                let p = point(at: g.location, lane, size)
+                let lo = d.index > 0 ? pts[d.index - 1].offset : 0
+                let hi = d.index + 1 < pts.count ? pts[d.index + 1].offset : side.end - side.start
+                pts[d.index].offset = min(max(p.offset, lo), hi)
+                pts[d.index].value = p.value
+                onChange(lane.id, pts, false)
+            }
+            .onEnded { _ in
+                if let d = dragging, d.lane == lane.id { onChange?(lane.id, points(lane), true) }
+                dragging = nil
+            }
+    }
+
+    private func doubleClick(_ lane: Automation, at loc: CGPoint, _ size: CGSize) {
+        guard let onChange, lane.id != "ts_rate" else { return }
+        var pts = points(lane)
+        if let i = hit(lane, loc, size) {
+            guard pts.count > 2 else { return }
+            pts.remove(at: i)
+        } else {
+            let p = point(at: loc, lane, size)
+            let i = pts.firstIndex { $0.offset > p.offset } ?? pts.count
+            let curve = i > 0 ? pts[i - 1].curve : pts.first?.curve ?? "linear"
+            pts.insert(.init(offset: p.offset, value: p.value, curve: curve), at: i)
+        }
+        onChange(lane.id, pts, true)
+    }
+
+    private func draw(_ lane: Automation, _ ctx: inout GraphicsContext, _ size: CGSize) {
         let width = Double(size.width), h = Double(size.height)
         let x = { (t: Double) in xPosition(t, range, width) }
         ctx.fill(Path(CGRect(x: x(0), y: 0, width: x(plan.duration) - x(0), height: h)), with: .color(Theme.accent.opacity(0.05)))
-        let isToggle = Self.isToggle(lane.automation.id)
+        let isToggle = EffectCatalog.isToggle(lane.id)
         var path = Path()
         var fill = Path()
         var started = false
         for col in stride(from: max(0, x(0)), through: min(width, x(plan.duration)), by: 1) {
             let t = range.lowerBound + col / width * (range.upperBound - range.lowerBound)
-            guard let s = lane.timeline.songTime(at: t), let v = lane.automation.value(at: s) else { continue }
-            let n = Self.normalize(lane.automation, v)
+            guard let s = timeline.songTime(at: t), let v = lane.value(at: s) else { continue }
+            let n = EffectCatalog.normalize(lane, v)
             if isToggle {
                 if n > 0.5 { fill.addRect(CGRect(x: col, y: 3, width: 1, height: h - 6)) }
             } else {
@@ -308,9 +582,16 @@ struct EffectLanes: View {
             }
         }
         if isToggle {
-            ctx.fill(fill, with: .color(lane.color.opacity(0.55)))
+            ctx.fill(fill, with: .color(color.opacity(0.55)))
         } else {
-            ctx.stroke(path, with: .color(lane.color), lineWidth: 1.5)
+            ctx.stroke(path, with: .color(color), lineWidth: 1.5)
+        }
+        if onChange != nil, lane.id != "ts_rate" {
+            let r = Self.handle
+            for p in lane.points {
+                let c = location(p, lane, size)
+                ctx.fill(Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r)), with: .color(.white.opacity(0.9)))
+            }
         }
         if let playhead, range.contains(playhead) {
             ctx.fill(Path(CGRect(x: x(playhead), y: 0, width: 1.5, height: h)), with: .color(.white.opacity(0.8)))

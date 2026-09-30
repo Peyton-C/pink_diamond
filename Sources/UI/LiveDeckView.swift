@@ -252,13 +252,13 @@ struct LiveLanes: View {
     private func draw(_ lane: Lane, _ ctx: inout GraphicsContext, _ size: CGSize) {
         guard let clock = deck?.clock else { return }
         let width = Double(size.width), h = Double(size.height)
-        let toggle = EffectLanes.isToggle(lane.automation.id)
+        let toggle = EffectCatalog.isToggle(lane.automation.id)
         var path = Path(), fill = Path(), started = false
         let x0 = max(0, liveX(clock.time(at: lane.side.start), width)), x1 = min(width, liveX(clock.time(at: lane.side.end), width))
         for col in stride(from: x0, through: x1, by: 1) {
             let s = clock.songTime(at: col / width * 2 * LiveDeckView.span - LiveDeckView.span)
             guard let v = lane.automation.value(at: s) else { continue }
-            let n = EffectLanes.normalize(lane.automation, v)
+            let n = EffectCatalog.normalize(lane.automation, v)
             if toggle {
                 if n > 0.5 { fill.addRect(CGRect(x: col, y: 3, width: 1, height: h - 6)) }
             } else {

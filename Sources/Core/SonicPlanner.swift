@@ -45,14 +45,25 @@ final class SonicPlanner {
         return unsafeBitCast(accessor(0), to: Any.Type.self)
     }
 
-    /// Plans a transition between two Song JSON objects (Apple's TransitionPlanner.Song schema).
-    /// Returns the Transition as JSON data. Serialized: the planner is only ever used from one thread.
-    func plan(from: Data, to: Data) throws -> Data {
+    /// Plans a transition between two Song JSON objects (Apple's TransitionPlanner.Song schema), under Apple's default
+    /// `Criteria` with `criteria`'s top-level fields replaced. Returns the Transition as JSON data. Serialized: the
+    /// planner is only ever used from one thread.
+    func plan(from: Data, to: Data, criteria patch: [String: Any]? = nil) throws -> Data {
         try queue.sync {
             let songType = try type("17TransitionPlannerV4SongV")
             let a = Box(try decodeOpaque(songType, from: from))
             let b = Box(try decodeOpaque(songType, from: to))
-            let criteria = Box(try copyGlobal("17TransitionPlannerV8CriteriaV7defaultAEvau", type: try type("17TransitionPlannerV8CriteriaV")))
+            let criteriaType = try type("17TransitionPlannerV8CriteriaV")
+            var criteriaValue = try copyGlobal("17TransitionPlannerV8CriteriaV7defaultAEvau", type: criteriaType)
+            if let patch {
+                // Criteria is opaque too, so it's patched as JSON through its own Codable conformance.
+                guard var fields = try JSONSerialization.jsonObject(with: encodeOpaque(criteriaValue)) as? [String: Any] else {
+                    throw PlannerError("unexpected Criteria encoding")
+                }
+                fields.merge(patch) { $1 }
+                criteriaValue = try decodeOpaque(criteriaType, from: JSONSerialization.data(withJSONObject: fields))
+            }
+            let criteria = Box(criteriaValue)
             let planner = try plannerInstance()
             let transitionType = try type("10TransitionV"), failureType = try type("17TransitionPlannerV13FailureReasonO")
 
