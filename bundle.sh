@@ -5,8 +5,8 @@
 set -e
 cd "${0:A:h}"
 APP_NAME="pink diamond"
-BUNDLE_ID="dev.peyton.pinkdiamond"
-VERSION="0.1.0"
+BUNDLE_ID="io.github.peyton-c.pinkdiamond"
+VERSION="1.0.0"
 export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
 TARGET=arm64-apple-macos27.0
 
