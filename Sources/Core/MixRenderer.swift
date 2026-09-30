@@ -175,12 +175,16 @@ private final class Slot {
             let buffers = UnsafeMutableAudioBufferListPointer(abl)
             var produced = 0
             if let chain, chain.active, !chain.finished, let audio = chain.audio {
-                let start = Int(chain.position)
-                produced = max(0, min(Int(frameCount), Int(audio.frameLength) - start))
+                // An edited transition can bring a song in before its start: silence until song time 0.
+                let start = Int(chain.position.rounded(.down))
+                let lead = min(Int(frameCount), max(0, -start))
+                let copied = max(0, min(Int(frameCount) - lead, Int(audio.frameLength) - max(start, 0)))
+                produced = lead + copied
                 for (c, buf) in buffers.enumerated() {
                     let dst = buf.mData!.assumingMemoryBound(to: Float.self)
                     let src = audio.floatChannelData![min(c, Int(audio.format.channelCount) - 1)]
-                    for i in 0..<produced { dst[i] = src[start + i] }
+                    for i in 0..<lead { dst[i] = 0 }
+                    for i in 0..<copied { dst[lead + i] = src[max(start, 0) + i] }
                     for i in produced..<Int(frameCount) { dst[i] = 0 }
                 }
                 chain.position += Double(produced)

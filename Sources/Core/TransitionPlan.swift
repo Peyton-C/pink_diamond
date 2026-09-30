@@ -72,8 +72,8 @@ struct TransitionPlan {
     let styleID: Int?
     var outgoing: TransitionSide
     var incoming: TransitionSide
-    let duration: Double          // transition length on the playback clock
-    let pivot: Double             // seconds into the transition where the handoff happens
+    var duration: Double          // transition length on the playback clock
+    var pivot: Double             // seconds into the transition where the handoff happens
 
     var styleName: String {
         let words = algorithm.replacingOccurrences(of: "([a-z])([A-Z])", with: "$1 $2", options: .regularExpression)

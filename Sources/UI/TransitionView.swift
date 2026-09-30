@@ -78,7 +78,8 @@ struct TransitionView: View {
                 let range = -Self.margin...(plan.duration + Self.margin)
                 ScrollView(.vertical) {
                     VStack(spacing: 6) {
-                        TimeRuler(range: range, duration: plan.duration, pivot: plan.pivot)
+                        TimeRuler(range: range, duration: plan.duration, pivot: plan.pivot,
+                                  onLength: { resize(by: $0, ended: $1) })
                             .frame(height: 18)
                         // Each song's effects sit on its outer side, the outgoing song's above it and the incoming
                         // song's below, so the two waveforms stay together in the middle.
@@ -122,6 +123,7 @@ struct TransitionView: View {
                 HStack(spacing: 10) {
                     StyleChip(plan: plan)
                     if edit.hasChanges { Text("edited").foregroundStyle(Theme.accent) }
+                    lengthControl
                     Text(String(format: "%.1f s", plan.duration))
                     Text("out \(Theme.time(plan.outgoing.start)) → \(Theme.time(plan.outgoing.end))").foregroundStyle(Theme.outgoing)
                     Text("in \(Theme.time(plan.incoming.start)) → \(Theme.time(plan.incoming.end))").foregroundStyle(Theme.incoming)
@@ -201,23 +203,84 @@ struct TransitionView: View {
         let before = dragStart ?? edit
         let side = outgoing ? plan.outgoing : plan.incoming
         let baseStart = side.start - edit.shift(outgoing)
-        let length = side.end - side.start
         let analysis = library.analyses[outgoing ? ref.from : ref.to]
-        let duration = analysis?.duration ?? .infinity
         let target = baseStart + before.shift(outgoing) - dt
         var start = target
         if let analysis {
             let bars = analysis.bars.isEmpty ? analysis.beats : analysis.bars
-            let grid = NSEvent.modifierFlags.contains(.option) || bars.isEmpty ? analysis.beats : bars
+            let grid = Self.extended(NSEvent.modifierFlags.contains(.option) || bars.isEmpty ? analysis.beats : bars)
             if let anchor = grid.min(by: { abs($0 - baseStart) < abs($1 - baseStart) }) {
                 let offset = baseStart - anchor
-                let valid = grid.map { $0 + offset }.filter { $0 >= 0 && $0 + length <= duration }
-                start = valid.min(by: { abs($0 - target) < abs($1 - target) }) ?? baseStart
+                start = grid.map { $0 + offset }.min(by: { abs($0 - target) < abs($1 - target) }) ?? target
             }
         }
-        start = min(max(start, 0), max(0, duration - length))
+        // No limits: a side may start before its song does (silence until it starts) or run past its end.
         var new = before
         new.setShift(outgoing, start - baseStart)
+        apply(new, ended: ended)
+    }
+
+    /// A beat or bar grid continued 64 steps past both ends of the song at its edge spacing, so a side can be moved
+    /// out beyond the song and still land on the grid.
+    private static func extended(_ grid: [Double]) -> [Double] {
+        guard grid.count > 1 else { return grid }
+        let head = grid[1] - grid[0], tail = grid[grid.count - 1] - grid[grid.count - 2]
+        return (1...64).reversed().map { grid[0] - Double($0) * head } + grid + (1...64).map { grid[grid.count - 1] + Double($0) * tail }
+    }
+
+    // MARK: Length
+
+    /// The outgoing song's bar length around the transition, in song seconds: what the length is counted in.
+    private var barLength: Double {
+        guard let a = library.analyses[ref.from] else { return 2 }
+        let s = plan.outgoing
+        let bars = a.bars.filter { $0 >= s.start - 8 && $0 <= s.end + 8 }
+        let d = zip(bars.dropFirst(), bars).map { $0 - $1 }.sorted()
+        return d.isEmpty ? 240 / Double(max(a.bpm, 1)) : d[d.count / 2]
+    }
+
+    /// The transition's length in the outgoing song's bars.
+    private var bars: Double { (plan.outgoing.end - plan.outgoing.start) / barLength }
+
+    /// Lengths the control snaps to: phrase lengths (1, 2, then every 4 bars), or every bar with ⇧.
+    private static func lengths(perBar: Bool) -> [Double] {
+        perBar ? (1...512).map(Double.init) : [1, 2] + stride(from: 4.0, through: 512, by: 4)
+    }
+
+    private var lengthControl: some View {
+        HStack(spacing: 2) {
+            Button { step(-1) } label: { Image(systemName: "minus") }
+            Text(abs(bars - bars.rounded()) < 0.05 ? "\(Int(bars.rounded())) bars" : String(format: "%.1f bars", bars))
+                .frame(minWidth: 52)
+            Button { step(1) } label: { Image(systemName: "plus") }
+        }
+        .buttonStyle(.borderless)
+        .help("Transition length in bars: phrase lengths, or one bar at a time with ⇧. Drag the handle at the end of the ruler too.")
+    }
+
+    private func step(_ direction: Int) {
+        let options = Self.lengths(perBar: NSEvent.modifierFlags.contains(.shift))
+        let next = direction > 0 ? options.first { $0 > bars + 0.05 } : options.last { $0 < bars - 0.05 }
+        guard let next else { return }
+        setLength(bars: next, from: edit, ended: true)
+    }
+
+    /// Drags the transition's end by `dt` seconds on the timeline, snapped as the length control does.
+    private func resize(by dt: Double, ended: Bool) {
+        let before = dragStart ?? edit
+        let startBars = bars / edit.lengthScale * before.lengthScale
+        let startDuration = plan.duration / edit.lengthScale * before.lengthScale
+        let target = startBars * max(startDuration + dt, 0) / startDuration
+        let options = Self.lengths(perBar: NSEvent.modifierFlags.contains(.shift))
+        let snapped = options.min { abs($0 - target) < abs($1 - target) } ?? 1
+        setLength(bars: snapped, from: before, ended: ended)
+    }
+
+    private func setLength(bars target: Double, from before: TransitionEdit, ended: Bool) {
+        let planBars = bars / edit.lengthScale
+        guard planBars > 0 else { return }
+        var new = before
+        new.setLengthScale(target / planBars)
         apply(new, ended: ended)
     }
 
@@ -324,7 +387,30 @@ struct TimeRuler: View {
     let range: ClosedRange<Double>
     let duration: Double
     let pivot: Double
+    var onLength: ((Double, Bool) -> Void)?   // seconds the end handle was dragged, and whether the drag ended
+    @State private var secondsPerPoint: Double?   // fixed for a drag, since the timeline rescales as the length changes
+
     var body: some View {
+        GeometryReader { geo in
+            canvas
+                .gesture(DragGesture(minimumDistance: 1)
+                    .onChanged { g in
+                        if secondsPerPoint == nil {
+                            let end = xPosition(duration, range, geo.size.width)
+                            guard abs(g.startLocation.x - end) < 10 else { return }
+                            secondsPerPoint = (range.upperBound - range.lowerBound) / geo.size.width
+                        }
+                        if let k = secondsPerPoint { onLength?(g.translation.width * k, false) }
+                    }
+                    .onEnded { g in
+                        if let k = secondsPerPoint { onLength?(g.translation.width * k, true) }
+                        secondsPerPoint = nil
+                    })
+        }
+        .padding(.leading, 110)
+    }
+
+    private var canvas: some View {
         Canvas { ctx, size in
             let x = { (t: Double) in xPosition(t, range, size.width) }
             ctx.fill(Path(CGRect(x: x(0), y: 0, width: x(duration) - x(0), height: size.height)), with: .color(Theme.accent.opacity(0.18)))
@@ -335,8 +421,12 @@ struct TimeRuler: View {
                 t += 2
             }
             ctx.draw(Text("◆").font(.system(size: 10)).foregroundColor(Theme.accent), at: CGPoint(x: x(pivot), y: size.height / 2))
+            if onLength != nil {   // the end handle
+                ctx.fill(Path(roundedRect: CGRect(x: x(duration) - 3, y: 1, width: 6, height: size.height - 2), cornerRadius: 2),
+                         with: .color(Theme.accent))
+            }
         }
-        .padding(.leading, 110)
+        .help("Drag the handle at the end to change the length: phrase lengths, or one bar at a time with ⇧")
     }
 }
 

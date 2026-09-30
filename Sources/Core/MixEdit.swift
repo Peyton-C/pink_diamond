@@ -39,10 +39,27 @@ struct TransitionEdit: Codable, Equatable {
     var incomingShift = 0.0
     var outgoing: [String: [Point]] = [:]   // automations replaced or added, by graph parameter code
     var incoming: [String: [Point]] = [:]
+    /// The transition's length relative to the plan's. Both sides stretch by the same factor, tempo curve included, so
+    /// they still cover the same number of beats and take the same time to play: each side's length on the playback
+    /// clock is its song-time span × ln(r1/r0)/(r1 − r0), which scales with the span when the rates stay put.
+    var lengthScale = 1.0
+
+    init(variant: PlanVariant? = nil) { self.variant = variant }
+
+    // Written by hand so edits saved before a field existed still load.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        variant = try c.decodeIfPresent(PlanVariant.self, forKey: .variant)
+        outgoingShift = try c.decodeIfPresent(Double.self, forKey: .outgoingShift) ?? 0
+        incomingShift = try c.decodeIfPresent(Double.self, forKey: .incomingShift) ?? 0
+        outgoing = try c.decodeIfPresent([String: [Point]].self, forKey: .outgoing) ?? [:]
+        incoming = try c.decodeIfPresent([String: [Point]].self, forKey: .incoming) ?? [:]
+        lengthScale = try c.decodeIfPresent(Double.self, forKey: .lengthScale) ?? 1
+    }
 
     var isEmpty: Bool { self == TransitionEdit() }
     /// Whether anything but the variant changed.
-    var hasChanges: Bool { outgoingShift != 0 || incomingShift != 0 || !outgoing.isEmpty || !incoming.isEmpty }
+    var hasChanges: Bool { self != TransitionEdit(variant: variant) }
 
     func shift(_ outgoingSide: Bool) -> Double { outgoingSide ? outgoingShift : incomingShift }
     func lanes(_ outgoingSide: Bool) -> [String: [Point]] { outgoingSide ? outgoing : incoming }
@@ -54,21 +71,31 @@ struct TransitionEdit: Codable, Equatable {
     mutating func setLane(_ outgoingSide: Bool, _ id: String, _ points: [Point]?) {
         if outgoingSide { outgoing[id] = points } else { incoming[id] = points }
     }
+
+    /// Sets the length, stretching the user's own automation points with the rest of the transition.
+    mutating func setLengthScale(_ scale: Double) {
+        let k = scale / lengthScale
+        let stretch = { (lanes: [String: [Point]]) in lanes.mapValues { $0.map { Point(offset: $0.offset * k, value: $0.value, curve: $0.curve) } } }
+        outgoing = stretch(outgoing)
+        incoming = stretch(incoming)
+        lengthScale = scale
+    }
 }
 
 extension TransitionSide {
-    /// This side moved by `shift` song seconds, with `lanes` replacing or adding automations. The tempo curve moves
-    /// with it, so the transition keeps its length and a whole-bar move keeps the downbeats together.
-    func applying(shift: Double, lanes: [String: [TransitionEdit.Point]]) -> TransitionSide {
+    /// This side moved by `shift` song seconds and stretched by `scale` from its start, with `lanes` replacing or adding
+    /// automations. The tempo curve moves and stretches with it, so a whole-bar move keeps the downbeats together.
+    func applying(shift: Double, scale: Double = 1, lanes: [String: [TransitionEdit.Point]]) -> TransitionSide {
         let start = self.start + shift
+        let time = { (t: Double) in start + (t - self.start) * scale }
         var autos = automations.mapValues { a in
-            Automation(id: a.id, points: a.points.map { .init(time: $0.time + shift, value: $0.value, curve: $0.curve) }, range: a.range)
+            Automation(id: a.id, points: a.points.map { .init(time: time($0.time), value: $0.value, curve: $0.curve) }, range: a.range)
         }
         for (id, points) in lanes {
             autos[id] = Automation(id: id, points: points.map { .init(time: start + $0.offset, value: $0.value, curve: $0.curve) },
                                    range: automations[id]?.range ?? EffectCatalog.ranges[id])
         }
-        return TransitionSide(start: start, end: end + shift, automations: autos, wiring: wiring)
+        return TransitionSide(start: start, end: time(end), automations: autos, wiring: wiring)
     }
 
     /// An automation's points as edit points, relative to this side's start.
@@ -85,8 +112,10 @@ extension TransitionSide {
 extension TransitionPlan {
     func applying(_ edit: TransitionEdit) -> TransitionPlan {
         var plan = self
-        plan.outgoing = outgoing.applying(shift: edit.outgoingShift, lanes: edit.outgoing)
-        plan.incoming = incoming.applying(shift: edit.incomingShift, lanes: edit.incoming)
+        plan.outgoing = outgoing.applying(shift: edit.outgoingShift, scale: edit.lengthScale, lanes: edit.outgoing)
+        plan.incoming = incoming.applying(shift: edit.incomingShift, scale: edit.lengthScale, lanes: edit.incoming)
+        plan.duration = duration * edit.lengthScale
+        plan.pivot = pivot * edit.lengthScale
         return plan
     }
 }

@@ -18,7 +18,7 @@ Needs macOS 27 and Xcode 27.
 - **Playlists**: right-click songs in the Library → Add to Playlist, or drop files onto a playlist; drag to reorder. Between every two songs, the ◆ row shows the planned transition. Click it to open the deck view.
 - **Playback**: Play in a playlist's toolbar plays it through with every transition, and double-clicking a song plays from there. The bar at the bottom seeks within the song, and the media keys and Control Centre work too.
 - **Deck view**: both songs's RGB waveforms on the transition's timeline (coloured by low/mid/high), with beat grid, bars, sections (◆), the transition window and handoff point, and a lane for each automated effect. **Preview** (space) renders and plays it with a moving playhead.
-- **Editing**: the deck view is also a mix editor. Drag a song to move its side of the transition by bars (⌥ for beats), drag automation points, double-click a lane to add or remove a point, and click a lane's name to change its curve or remove it. **Add effect** puts a filter sweep, reverb, echo, repeater, gater or flanger on either side. **Styles** lists the other plans Apple's planner makes for the pair, as other genres or with lower complexity. Edits are saved per transition and used for playback and export; ⌘Z undoes, **Reset** goes back to Apple's plan. An edit belongs to the genres it was made with, so changing a song's genre starts from a fresh plan.
+- **Editing**: the deck view is also a mix editor. Drag a song to move its side of the transition by bars (⌥ for beats), even past the song's start or end. Set the length in bars with the control in the header or the handle at the end of the ruler, in phrase lengths or one bar at a time with ⇧; both songs stretch together and stay beat-matched. Drag automation points, double-click a lane to add or remove a point, and click a lane's name to change its curve or remove it. **Add effect** puts a filter sweep, reverb, echo, repeater, gater or flanger on either side. **Styles** lists the other plans Apple's planner makes for the pair, as other genres or with lower complexity. Edits are saved per transition and used for playback and export; ⌘Z undoes, **Reset** goes back to Apple's plan. An edit belongs to the genres it was made with, so changing a song's genre starts from a fresh plan.
 
 ## How it works
 | Path | What |
@@ -27,7 +27,7 @@ Needs macOS 27 and Xcode 27.
 | `Sources/Core/Analyzer.swift` | MusicUnderstanding → Apple Music's AutoMix analysis format (incl. structure-based video cues, which the planner needs for genre styles) |
 | `Sources/Core/SonicPlanner.swift`, `Trampoline.s` | macOS 27's `TransitionPlanner` from the private `_SonicKit_MusicKit`, called in-process |
 | `Sources/Core/TransitionPlan.swift` | The plan: automation curves over song time, the plan's DSP-graph wiring, song time ↔ transition time |
-| `Sources/Core/MixEdit.swift` | Transition edits applied over the plan: moved sides, replaced or added automation, planner variants |
+| `Sources/Core/MixEdit.swift` | Transition edits applied over the plan: moved and stretched sides, replaced or added automation, planner variants |
 | `Sources/Core/MixRenderer.swift` | Offline AVAudioEngine rebuilding the plan's DSP graph per song, including Apple's private AURemixFX |
 | `Sources/Core/MixPlayer.swift` | Playlist playback: runs the renderer ahead of a realtime engine |
 | `Sources/UI/` | SwiftUI: library, playlists, deck view |
