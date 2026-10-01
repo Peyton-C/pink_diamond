@@ -486,6 +486,19 @@ final class Library: ObservableObject {
         return list
     }
 
+    /// Waits for every transition of playing `ids` in order to be planned or to fail. A shuffled order pairs songs
+    /// the playlist doesn't, so nothing has asked for those plans yet and `mixItems` would refuse it.
+    func planTransitions(_ ids: [UUID]) async {
+        while true {
+            var pending = false
+            for (a, b) in zip(ids, ids.dropFirst()) {   // every pair, each pass: asking is what starts a plan
+                if case .planning = plan(from: a, to: b) { pending = true }
+            }
+            guard pending else { return }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
     /// Renderer items for playing `ids` in order. Every song must be analyzed and every transition planned or
     /// failed; a failed transition becomes a straight cut to the next song rather than blocking the whole mix.
     func mixItems(_ ids: [UUID]) throws -> [MixRenderer.Item] {

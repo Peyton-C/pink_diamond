@@ -38,11 +38,17 @@ struct PlaylistView: View {
             ToolbarItem {
                 let current = player.queue?.context == playlistID
                 let playing = current && !player.isPaused
-                Button { current ? player.togglePause() : play(from: 0) } label: {
+                Button { current ? player.togglePause() : play(from: nil) } label: {
                     Label(playing ? "Pause" : "Play", systemImage: playing ? "pause.fill" : "play.fill")
                 }
                 .help(current ? (playing ? "Pause" : "Resume") : "Play the whole playlist with its transitions")
                     .disabled(playlist?.songIDs.isEmpty ?? true)
+            }
+            ToolbarItem {
+                Toggle(isOn: Binding(get: { player.shuffle }, set: { on in attempt { try await player.setShuffle(on) } })) {
+                    Label("Shuffle", systemImage: "shuffle")
+                }
+                .help("Play playlists in a random order")
             }
         }
         .overlay(alignment: .bottom) {
@@ -56,8 +62,19 @@ struct PlaylistView: View {
         } message: { Text(failure?.message ?? "") }
     }
 
-    private func play(from index: Int) {
-        do { try player.play(playlistID, from: index) } catch { failure = ("Can't play", String(describing: error)) }
+    private func play(from index: Int?) {
+        attempt { try await player.start(playlistID, from: index) }
+    }
+
+    private func attempt(_ action: @escaping @MainActor () async throws -> Void) {
+        Task { do { try await action() } catch { failure = ("Can't play", String(describing: error)) } }
+    }
+
+    /// Whether the row at `index` is the song playing. A shuffled queue's positions aren't the playlist's, so it
+    /// goes by song.
+    private func isPlaying(_ index: Int, _ id: UUID) -> Bool {
+        guard let queue = player.queue, queue.context == playlistID else { return false }
+        return queue.shuffled == nil ? player.currentPosition == index : player.currentSongID == id
     }
 
     /// While this playlist plays, the transition coming up or under way.
@@ -72,7 +89,7 @@ struct PlaylistView: View {
                 ForEach(Array(playlist.songIDs.enumerated()), id: \.offset) { index, id in
                     VStack(alignment: .leading, spacing: 4) {
                         SongRow(song: library.song(id), artwork: library.cover(id), summary: library.summaries[id], index: index + 1,
-                                playing: player.queue?.context == playlistID && player.currentPosition == index)
+                                playing: isPlaying(index, id))
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(Rectangle())
                             .onTapGesture(count: 2) { play(from: index) }

@@ -7,10 +7,13 @@ import MediaPlayer
 /// sounds exactly like Export Mix. Registers with macOS's media controls (media keys, Control Centre).
 @MainActor
 final class MixPlayer: ObservableObject {
-    /// What is playing: the playlist, and a snapshot of its songs from `startIndex` on.
-    struct Queue { let context: UUID; let ids: [UUID]; let startIndex: Int }
+    /// What is playing: the playlist, and a snapshot of its songs from `startIndex` on. `shuffled` is the whole
+    /// order being played when it isn't the playlist's own, which `startIndex` then counts into.
+    struct Queue { let context: UUID; let ids: [UUID]; let startIndex: Int; var shuffled: [UUID]? = nil }
 
     @Published private(set) var queue: Queue?
+    /// Whether playlists play in a random order. Kept across launches.
+    @Published private(set) var shuffle = UserDefaults.standard.bool(forKey: "shuffle")
     @Published private(set) var isPaused = false
     @Published private(set) var position: MixRenderer.Position?
     /// Song time at which the current song took over; transitions enter songs partway through.
@@ -26,7 +29,7 @@ final class MixPlayer: ObservableObject {
     var index: Int { position?.index ?? 0 }
     var songTime: Double { position?.songTime ?? 0 }
     var currentSongID: UUID? { queue.map { $0.ids[min(index, $0.ids.count - 1)] } }
-    /// Position of the current song in the playlist.
+    /// Position of the current song in the order being played: the playlist, or the shuffled order.
     var currentPosition: Int? { queue.map { $0.startIndex + index } }
 
     /// The transition coming up or under way, with the song times of both its songs.
@@ -47,8 +50,43 @@ final class MixPlayer: ObservableObject {
 
     /// Plays `playlist` from the song at `index`, starting `time` seconds into it.
     func play(_ playlist: UUID, from index: Int, at time: Double = 0, paused: Bool = false) throws {
-        guard let ids = library.playlists.first(where: { $0.id == playlist })?.songIDs, ids.indices.contains(index) else { return }
-        let queue = Queue(context: playlist, ids: Array(ids[index...]), startIndex: index)
+        guard let ids = library.playlists.first(where: { $0.id == playlist })?.songIDs else { return }
+        try play(ids, in: playlist, shuffled: false, from: index, at: time, paused: paused)
+    }
+
+    /// Starts `playlist` from the song at `index`, or from the top. With shuffle on that song comes first and the
+    /// rest follow in a random order, and from the top means from any song.
+    func start(_ playlist: UUID, from index: Int? = nil) async throws {
+        guard shuffle, var rest = library.playlists.first(where: { $0.id == playlist })?.songIDs else {
+            return try play(playlist, from: index ?? 0)
+        }
+        let first = index.flatMap { rest.indices.contains($0) ? rest.remove(at: $0) : nil }
+        let order = (first.map { [$0] } ?? []) + rest.shuffled()
+        await library.planTransitions(order)
+        try play(order, in: playlist, shuffled: true, from: 0)
+    }
+
+    /// Turns shuffle on or off. A playlist that is playing carries on from the current song: into the rest of it in
+    /// a random order, or into the songs after it in the playlist. That restarts the renderer, as a seek does.
+    func setShuffle(_ on: Bool) async throws {
+        shuffle = on
+        UserDefaults.standard.set(on, forKey: "shuffle")
+        guard let queue, (queue.shuffled != nil) != on, let id = currentSongID,
+              var rest = library.playlists.first(where: { $0.id == queue.context })?.songIDs,
+              let at = rest.firstIndex(of: id) else { return }
+        guard on else { return try play(queue.context, from: at, at: songTime, paused: isPaused) }
+        rest.remove(at: at)
+        let order = [id] + rest.shuffled()
+        await library.planTransitions(order)
+        // Planning took a moment: only carry on if the same song is still playing and shuffle is still wanted.
+        guard shuffle, self.queue?.context == queue.context, currentSongID == id else { return }
+        try play(order, in: queue.context, shuffled: true, from: 0, at: songTime, paused: isPaused)
+    }
+
+    private func play(_ order: [UUID], in playlist: UUID, shuffled: Bool, from index: Int, at time: Double = 0,
+                      paused: Bool = false) throws {
+        guard order.indices.contains(index) else { return }
+        let queue = Queue(context: playlist, ids: Array(order[index...]), startIndex: index, shuffled: shuffled ? order : nil)
         let items = try library.mixItems(queue.ids)
         stop()
         do { try engine.start() } catch { throw PlannerError("couldn't start audio output: \(error)") }
@@ -81,13 +119,22 @@ final class MixPlayer: ObservableObject {
     func skip(_ step: Int) throws {
         guard let queue, let position = currentPosition else { return }
         let target = step < 0 && songTime - enteredAt > 3 ? position : position + step
-        try play(queue.context, from: max(0, target), paused: isPaused)
+        try replay(queue, from: max(0, target))
     }
 
     /// Jumps to `time` in the current song.
     func seek(to time: Double) throws {
         guard let queue, let position = currentPosition else { return }
-        try play(queue.context, from: position, at: max(0, time), paused: isPaused)
+        try replay(queue, from: position, at: max(0, time))
+    }
+
+    /// Restarts `queue` at `index` of its order: the shuffled one, or else the playlist as it is now.
+    private func replay(_ queue: Queue, from index: Int, at time: Double = 0) throws {
+        if let order = queue.shuffled {
+            try play(order, in: queue.context, shuffled: true, from: index, at: time, paused: isPaused)
+        } else {
+            try play(queue.context, from: index, at: time, paused: isPaused)
+        }
     }
 
     func togglePause() {
