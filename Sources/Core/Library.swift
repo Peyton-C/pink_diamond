@@ -48,6 +48,10 @@ final class Library: ObservableObject {
     @Published private(set) var edits: [String: TransitionEdit] = [:]
     private var basePlans: [String: PlanState] = [:]   // Apple's plans, by plan key and variant
     @Published private(set) var artwork: [UUID: NSImage] = [:]
+    /// Whether songs play at the same loudness. On unless turned off, and kept across launches.
+    @Published var soundCheck = UserDefaults.standard.object(forKey: "soundCheck") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(soundCheck, forKey: "soundCheck") }
+    }
     private var albumArtwork: [String: NSImage] = [:]   // updated alongside `artwork`, whose publish redraws
     private var playable: [UUID: URL] = [:]
     private var pendingPlans: Set<String> = []
@@ -272,7 +276,12 @@ final class Library: ObservableObject {
 
     private nonisolated static func readAnalysis(_ url: URL) async -> SongAnalysis? {
         await Task.detached(priority: .userInitiated) {
-            (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(SongAnalysis.self, from: $0) }
+            guard var a = (try? Data(contentsOf: url)).flatMap({ try? JSONDecoder().decode(SongAnalysis.self, from: $0) }) else {
+                return nil
+            }
+            // Analyses cached before Sound Check hold their loudness only in the Apple-format JSON.
+            if a.loudness == nil { a.loudness = Loudness(audioAnalysis: a.audioAnalysisJSON) }
+            return a
         }.value
     }
 
@@ -355,6 +364,9 @@ final class Library: ObservableObject {
     }
 
     func playableURL(_ id: UUID) -> URL? { playable[id] }
+
+    /// The gain Sound Check plays a song at: 1 when it is off, or the song's loudness isn't known.
+    func gain(_ id: UUID) -> Float { soundCheck ? analyses[id]?.loudness?.gain ?? 1 : 1 }
 
     // MARK: Genre changes
 
@@ -516,7 +528,7 @@ final class Library: ObservableObject {
             let audio = playableURL(id)!, a = analyses[id]!
             let entering = i > 0 ? try side(ids[i - 1], id)?.incoming : nil
             let leaving = i + 1 < ids.count ? try side(id, ids[i + 1])?.outgoing : nil
-            return MixRenderer.Item(audio: audio, beats: a.beats, entering: entering, leaving: leaving)
+            return MixRenderer.Item(audio: audio, beats: a.beats, entering: entering, leaving: leaving, gain: gain(id))
         }
     }
 }

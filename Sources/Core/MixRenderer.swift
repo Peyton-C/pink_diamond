@@ -12,6 +12,7 @@ final class MixRenderer {
         let beats: [Double]
         let entering: TransitionSide?  // this song's side of the transition into it
         let leaving: TransitionSide?   // this song's side of the transition out of it
+        var gain: Float = 1            // Sound Check: applied to the decoded audio, ahead of the graph
     }
 
     private static let registerSonic: Void = {
@@ -183,11 +184,15 @@ private final class Slot {
                 let lead = min(Int(frameCount), max(0, -start))
                 let copied = max(0, min(Int(frameCount) - lead, Int(audio.frameLength) - max(start, 0)))
                 produced = lead + copied
+                // Sound Check scales the song here rather than on a graph node: every gain in the graph belongs to
+                // the plan's automation, and scaling ahead of the effects keeps their sends in proportion. A gain of
+                // 1 leaves the samples bit-identical.
+                let gain = chain.item.gain
                 for (c, buf) in buffers.enumerated() {
                     let dst = buf.mData!.assumingMemoryBound(to: Float.self)
                     let src = audio.floatChannelData![min(c, Int(audio.format.channelCount) - 1)]
                     for i in 0..<lead { dst[i] = 0 }
-                    for i in 0..<copied { dst[lead + i] = src[max(start, 0) + i] }
+                    for i in 0..<copied { dst[lead + i] = src[max(start, 0) + i] * gain }
                     for i in produced..<Int(frameCount) { dst[i] = 0 }
                 }
                 chain.position += Double(produced)

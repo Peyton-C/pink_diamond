@@ -22,6 +22,9 @@ enum SelfTest {
                 print("\(url.lastPathComponent): stem=\(AudioSource.isStem(url)) playable=\(p.lastPathComponent) " +
                       "\(a.bpm) BPM, \(a.key), \(String(format: "%.1f", a.duration)) s, \(a.beats.count) beats, " +
                       "\(a.sections.count) sections, waveform \(a.waveform.peak.count) pts (\(String(format: "%.1f", Date().timeIntervalSince(t0))) s)")
+                if let l = a.loudness {
+                    print(String(format: "  loudness %.1f LUFS, peak %.2f, Sound Check %+.1f dB", l.integrated, l.peak, 20 * log10(Double(l.gain))))
+                }
                 analyses.append(a); playable.append(p)
             }
             let json = try SonicPlanner.shared.plan(from: try Analyzer.songJSON(analyses[0], genre: ga),
@@ -31,8 +34,10 @@ enum SelfTest {
                   "out \(plan.outgoing.start)→\(plan.outgoing.end), in \(plan.incoming.start)→\(plan.incoming.end), " +
                   "effects: \(plan.effectSummary.joined(separator: ", "))")
             let items = [
-                MixRenderer.Item(audio: playable[0], beats: analyses[0].beats, entering: nil, leaving: plan.outgoing),
-                MixRenderer.Item(audio: playable[1], beats: analyses[1].beats, entering: plan.incoming, leaving: nil),
+                MixRenderer.Item(audio: playable[0], beats: analyses[0].beats, entering: nil, leaving: plan.outgoing,
+                                 gain: analyses[0].loudness?.gain ?? 1),
+                MixRenderer.Item(audio: playable[1], beats: analyses[1].beats, entering: plan.incoming, leaving: nil,
+                                 gain: analyses[1].loudness?.gain ?? 1),
             ]
             let seconds = try MixRenderer.render(items, startTime: plan.outgoing.start - 15, tail: 15, to: out)
             print("rendered \(String(format: "%.1f", seconds)) s to \(out.path)")

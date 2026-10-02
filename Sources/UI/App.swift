@@ -62,14 +62,22 @@ struct PinkDiamondApp: App {
         .commands {
             CommandGroup(replacing: .importExport) { ExportMixCommand() }
         }
-        Settings { SettingsView() }
+        Settings { SettingsView().environmentObject(library).environmentObject(player) }
     }
 }
 
 struct SettingsView: View {
     @AppStorage(KeyNotation.storageKey) private var notation = KeyNotation.lancelot
+    @EnvironmentObject var library: Library
+    @EnvironmentObject var player: MixPlayer
     var body: some View {
         Form {
+            Toggle("Sound Check", isOn: Binding(get: { library.soundCheck }, set: { on in
+                library.soundCheck = on
+                // The renderer runs ahead of playback with the gains it started with: restart it where it is.
+                try? player.seek(to: player.songTime)
+            }))
+            .help("Play every song at the same loudness")
             Picker("Key names", selection: $notation) {
                 ForEach(KeyNotation.allCases) { n in
                     HStack { KeyBadge(key: "A minor", notation: n); Text(n.label) }.tag(n)
