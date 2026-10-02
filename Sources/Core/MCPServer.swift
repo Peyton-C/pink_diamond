@@ -135,7 +135,8 @@ final class MCPServer {
                   "unique": bool("One version of each song: songs whose artist and title match apart from a bracketed tag at the end, such as (Official), are listed once"),
                   "limit": integer("Most songs to return. Defaults to 50"), "offset": integer("Songs to skip, to page through a long list")]),
             tool("get_song", "A song's analysis: bars and vocal ranges in song seconds, its loudness, and its sections, each with its length in bars, how loud it is against the whole song, and how much of it has vocals. Sections have no names: Apple's analysis finds where they start, not which is a chorus.",
-                 ["song": string("Song id"), "beats": bool("Include every beat time")], required: ["song"]),
+                 ["song": string("Song id"), "beats": bool("Include every beat time"),
+                  "bars": bool("Include every bar time. Defaults to true; turn it off when scanning many songs")], required: ["song"]),
             tool("set_genre", "Set the genre of one song, several, or all. Genres decide which transition styles Apple's planner can pick, and an edit belongs to the genres it was made with.",
                  ["song": string("Song id"), "songs": ids("Song ids"), "all": bool("Every song added"), "genre": genre], required: ["genre"]),
             tool("get_transition", "The planned transition between two songs with any edits applied: style, length, where each song's side starts and ends in song seconds, the handoff point, the automation lanes, and checks made on the plan without rendering: how far apart the two songs' beats and bars land, whether the keys go together, and how long both have vocals at once (whatever their volume).",
@@ -147,6 +148,7 @@ final class MCPServer {
             tool("edit_transition", "Change a transition. Only the fields given change; the rest of the edit is kept. Returns the transition as get_transition does.",
                  ["from": from, "to": to, "variant": variant, "detail": detail("summary"),
                   "style": string("Use the plan with this style name, from list_variants. Only styles the planner makes for this pair can be chosen"),
+                  "blank": bool("Start from a blank beat-matched transition: both songs at full volume for the whole window with the plan's tempo match kept, every other lane held at rest, and any lanes set before dropped. The outgoing song stops when the window ends. Draw your own lanes over it, in the same call or later"),
                   "outgoing_start": number("Song seconds where the outgoing song's side starts. Use a bar time from get_song to stay on the grid"),
                   "incoming_start": number("Song seconds where the incoming song's side starts"),
                   "length_bars": number("The transition's length in the outgoing song's bars. Both songs stretch together and stay beat-matched"),
@@ -157,7 +159,7 @@ final class MCPServer {
                   "outgoing_lanes": lanes("outgoing"), "incoming_lanes": lanes("incoming"), "add_effects": effects],
                  required: ["from", "to"]),
             tool("reset_transition", "Drop every edit to a transition and go back to Apple's plan.", ["from": from, "to": to], required: ["from", "to"]),
-            tool("render_transition", "Render one transition to a WAV, with some of each song either side of it. Returns the level of the result second by second and its peak, in dB below full scale.",
+            tool("render_transition", "Render one transition to a WAV, with some of each song either side of it. Returns the level of the result second by second and its peak, in dB below full scale, and how many samples sit at full scale. The renderer ends in a limiter, so two songs at full volume are held under full scale rather than clipped, at the cost of pumping when it works hard.",
                  ["from": from, "to": to, "out": out, "margin": number("Seconds of each song around the transition. Defaults to 15"), "sound_check": soundCheck], required: ["from", "to"]),
             tool("plan_set", "The timeline of playing songs in order, without rendering: where each transition starts in the mix, which part of each song plays and for how long, and the total length.",
                  ["songs": ids("Song ids in playing order")], required: ["songs"]),
@@ -174,7 +176,7 @@ final class MCPServer {
         case "list_songs":
             return list(args)
         case "get_song":
-            return songDetail(try entry(args["song"]), beats: args["beats"] as? Bool ?? false)
+            return songDetail(try entry(args["song"]), beats: args["beats"] as? Bool ?? false, bars: args["bars"] as? Bool ?? true)
         case "set_genre":
             guard let genre = (args["genre"] as? String).flatMap(Genre.init(rawValue:)) else {
                 throw PlannerError("genre must be one of: \(Genre.allCases.map(\.rawValue).joined(separator: ", "))")
@@ -313,11 +315,11 @@ final class MCPServer {
         return ["total": matches.count, "songs": matches.dropFirst(offset).prefix(limit).map(summary)]
     }
 
-    private func songDetail(_ s: Entry, beats: Bool) -> [String: Any] {
+    private func songDetail(_ s: Entry, beats: Bool, bars: Bool) -> [String: Any] {
         var detail = summary(s)
         let a = s.analysis
         detail["path"] = s.path
-        detail["bars"] = a.bars.map(r)
+        if bars { detail["bars"] = a.bars.map(r) } else { detail["bar_count"] = a.bars.count }
         detail["vocals"] = a.vocals.map { [r($0.lowerBound), r($0.upperBound)] }
         detail["beat_count"] = a.beats.count
         if beats { detail["beats"] = a.beats.map(r) }
@@ -450,18 +452,35 @@ final class MCPServer {
     private func checks(_ a: Entry, _ b: Entry, _ plan: TransitionPlan) -> [String: Any] {
         var json: [String: Any] = [:]
         let (out, inc) = (plan.outgoing, plan.incoming)
+        /// A song's beats or bars that fall inside the transition, on the mix clock. A side can end before the
+        /// transition does, and the song plays on at its own tempo, so times past the side's end count too.
         func onClock(_ times: [Double], _ side: TransitionSide) -> [Double] {
-            times.filter { $0 >= side.start - 0.01 && $0 <= side.end + 0.01 }.map { side.transitionTime(at: $0) }
+            times.filter { $0 >= side.start - 0.01 && $0 <= side.end + plan.duration }.map { side.transitionTime(at: $0) }
+                .filter { $0 <= plan.duration + 0.01 }
         }
-        /// How far each of `x` lands from the nearest of `y`, on the mix clock: the mean and the worst, in ms.
-        func apart(_ x: [Double], _ y: [Double]) -> (mean: Double, worst: Double)? {
-            guard !x.isEmpty, !y.isEmpty else { return nil }
+        /// How far the two grids are apart on the mix clock: the mean and the worst, in ms. Measured from the
+        /// sparser grid to the nearest point of the denser, so a song at half or double time reads as aligned when
+        /// every one of its beats lands on a beat of the other (Womanizer → 7 rings, 139 into 70 BPM: bars that
+        /// line up two to one read 765 ms apart when measured from the faster song).
+        func apart(_ a: [Double], _ b: [Double]) -> (mean: Double, worst: Double)? {
+            guard !a.isEmpty, !b.isEmpty else { return nil }
+            let (x, y) = a.count <= b.count ? (a, b) : (b, a)
             let gaps = x.map { t in y.map { abs($0 - t) }.min()! * 1000 }
             return (gaps.reduce(0, +) / Double(gaps.count), gaps.max()!)
         }
-        if let beats = apart(onClock(a.analysis.beats, out), onClock(b.analysis.beats, inc)) {
+        let (beatsOut, beatsIn) = (onClock(a.analysis.beats, out), onClock(b.analysis.beats, inc))
+        if let beats = apart(beatsOut, beatsIn) {
             json["beats_apart_ms"] = r(beats.mean)
             json["beats_apart_worst_ms"] = r(beats.worst)
+            // From the spacing, not the counts: a song that starts late or ends inside the window has fewer beats
+            // in it at the same tempo.
+            func spacing(_ t: [Double]) -> Double? {
+                let d = zip(t.dropFirst(), t).map { $0 - $1 }.sorted()
+                return d.isEmpty ? nil : d[d.count / 2]
+            }
+            if let o = spacing(beatsOut), let i = spacing(beatsIn), o > 0, i / o > 1.5 || i / o < 0.67 {
+                json["beats_out_per_beat_in"] = r((i / o * 2).rounded() / 2)
+            }
         }
         if let bars = apart(onClock(a.analysis.bars, out), onClock(b.analysis.bars, inc)) { json["bars_apart_ms"] = r(bars.mean) }
 
@@ -579,6 +598,19 @@ final class MCPServer {
         if let seconds = number(args["incoming_shift_seconds"]) { edit.incomingShift = seconds }
         if let start = number(args["outgoing_start"]) { edit.outgoingShift = start - base.outgoing.start }
         if let start = number(args["incoming_start"]) { edit.incomingShift = start - base.incoming.start }
+        if args["blank"] as? Bool == true {
+            (edit.outgoing, edit.incoming) = ([:], [:])
+            for outgoing in [true, false] {
+                let side = outgoing ? base.outgoing : base.incoming
+                let length = (side.end - side.start) * edit.lengthScale
+                // The bypass stays as planned: it is off across the window, which lanes drawn later need, and with
+                // everything at rest the effects pass the song through.
+                for auto in side.automations.values where auto.moves && auto.id != "ts_rate" && auto.id != "bypa" {
+                    let v = side.neutralValue(auto.id)
+                    edit.setLane(outgoing, auto.id, [.init(offset: 0, value: v, curve: "linear"), .init(offset: length, value: v, curve: "linear")])
+                }
+            }
+        }
         let placed = base.applying(edit)   // where the sides are now, for points given on the mix clock
         for outgoing in [true, false] {
             let name = outgoing ? "outgoing_lanes" : "incoming_lanes"
@@ -652,32 +684,37 @@ final class MCPServer {
         let seconds = try MixRenderer.render(items, startTime: start, tail: margin, to: url)
         var json: [String: Any] = ["path": url.path, "seconds": r(seconds), "transition_starts_at": r(plan.outgoing.start - start),
                                    "transition_duration": r(plan.duration)]
-        json.merge(levels(url)) { a, _ in a }
+        json.merge(levels(url, perSecond: true)) { a, _ in a }
         return json
     }
 
-    /// The render's level each second (RMS over both channels) and its peak, in dB below full scale. Not loudness as
-    /// LUFS measures it, but enough to see a dip, a jump or a hole across a transition.
-    private func levels(_ url: URL) -> [String: Any] {
-        guard let file = try? AVAudioFile(forReading: url),
-              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)),
-              (try? file.read(into: buffer)) != nil, let data = buffer.floatChannelData else { return [:] }
-        let channels = Int(buffer.format.channelCount), frames = Int(buffer.frameLength), second = Int(buffer.format.sampleRate)
+    /// The render's peak and how many samples sit at full scale, and its level each second (RMS over both channels),
+    /// all in dB below full scale. Not loudness as LUFS measures it, but enough to see a dip, a jump or a hole across
+    /// a transition, and whether two songs at full volume are being held down by the renderer's limiter. Read a
+    /// second at a time: a 30-minute set is over 600 MB as one buffer.
+    private func levels(_ url: URL, perSecond: Bool) -> [String: Any] {
+        guard let file = try? AVAudioFile(forReading: url) else { return [:] }
+        let format = file.processingFormat, second = AVAudioFrameCount(format.sampleRate)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: second) else { return [:] }
         let db = { (x: Double) in x > 0 ? max(20 * log10(x), -100) : -100 }
-        var seconds: [NSNumber] = [], peak = 0.0
-        for start in stride(from: 0, to: frames, by: second) {
-            let end = min(start + second, frames)
+        var seconds: [NSNumber] = [], peak = 0.0, full = 0
+        while file.framePosition < file.length, (try? file.read(into: buffer, frameCount: second)) != nil,
+              buffer.frameLength > 0, let data = buffer.floatChannelData {
             var sum = 0.0
-            for c in 0..<channels {
-                for i in start..<end {
-                    let x = Double(data[c][i])
+            for c in 0..<Int(format.channelCount) {
+                for i in 0..<Int(buffer.frameLength) {
+                    let x = abs(Double(data[c][i]))
                     sum += x * x
-                    peak = max(peak, abs(x))
+                    peak = max(peak, x)
+                    if x >= 0.999 { full += 1 }
                 }
             }
-            seconds.append(NSDecimalNumber(string: String(format: "%.1f", db((sum / Double((end - start) * channels)).squareRoot()))))
+            let rms = (sum / Double(Int(buffer.frameLength) * Int(format.channelCount))).squareRoot()
+            seconds.append(NSDecimalNumber(string: String(format: "%.1f", db(rms))))
         }
-        return ["level_db_per_second": seconds, "peak_db": r(db(peak))]
+        var json: [String: Any] = ["peak_db": r(db(peak)), "samples_at_full_scale": full]
+        if perSecond { json["level_db_per_second"] = seconds }
+        return json
     }
 
     /// Playing `list` in order: the plans between the songs (nil where planning failed, which plays as a straight
@@ -725,6 +762,7 @@ final class MCPServer {
         let url = outputURL(out)
         json["seconds"] = r(try MixRenderer.render(items, startTime: 0, tail: nil, to: url))
         json["path"] = url.path
+        json.merge(levels(url, perSecond: false)) { a, _ in a }
         return json
     }
 

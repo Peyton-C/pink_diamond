@@ -131,7 +131,15 @@ struct TransitionPlan {
                 autos[id] = Automation(id: id, points: pts, range: vr.flatMap { $0.count == 2 ? $0[0]...$0[1] : nil })
             }
             let r = summary[key] as? [Double] ?? [0, 0]
-            return TransitionSide(start: r[0], end: r[1], automations: autos, wiring: wiring)
+            // The planner can bring a song in partway through the transition, when it has too little intro to cover
+            // all of it: `playbackTransitionTimeRange` then starts later than the transition does. A side starts with
+            // the transition here, so the delay becomes song time ahead of the planned start, which plays as silence
+            // when it falls before the song begins. Starting the song with the transition instead ended its side
+            // early and left the rest of the window unmixed (Party Rock Anthem → Fergalicious as Electronic: the
+            // incoming side is 9.3 s of a 14.8 s transition, and starts 5.55 s in).
+            let delay = (s["playbackTransitionTimeRange"] as? [Double])?.first ?? 0
+            let lead = delay > 0.01 ? delay * (autos["ts_rate"]?.points.first?.value ?? 1) : 0
+            return TransitionSide(start: r[0] - lead, end: r[1], automations: autos, wiring: wiring)
         }
         outgoing = side("outgoing", "outgoingSongTimeRange")
         incoming = side("incoming", "incomingSongTimeRange")
