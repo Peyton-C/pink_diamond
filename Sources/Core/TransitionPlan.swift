@@ -176,6 +176,9 @@ enum EffectCatalog {
         "HP2f": "echo high-pass", "LP2f": "echo low-pass", "Fcf1": "EQ band",
         "DLdw": "echo mix", "DLdt": "echo time", "DLfb": "echo feedback", "DLlf": "echo tone",
         "RVdw": "echo reverb mix", "Ga1g": "input gain", "Ga2g": "echo send", "Ga3g": "dry level", "Ga4g": "echo return",
+        "Fcg1": "EQ band gain", "Fbw1": "EQ band width", "HP2r": "echo high-pass resonance", "LP2r": "echo low-pass resonance",
+        "RVga": "echo reverb gain", "RVmi": "echo reverb min delay", "RVma": "echo reverb max delay",
+        "RVlf": "echo reverb low decay", "RVhf": "echo reverb high decay", "RVrr": "echo reverb randomness",
     ]
 
     static func name(_ id: String) -> String { names[id] ?? id }
@@ -189,6 +192,9 @@ enum EffectCatalog {
         "DLdw": 0...100, "DLdt": 0.0001...2.01, "DLfb": -99.9...99.9, "DLlf": 10...22050,
         "RXxt": 20...300, "RXaf": 20...20000, "RXbf": 20...20000, "RXat": 0...2, "RXbt": 0...2,
         "RXpr": 0...7, "RXvt": 1...200, "RXdr": 0...23, "RXgr": 0...15, "RXfr": 0...15, "RXsr": 0...15, "RXsm": 0...0.5, "RXtr": 3...15,
+        // The stock filter, EQ and reverb units, from their parameter lists in AudioUnitParameters.h (dB, octaves, seconds).
+        "HP1r": -20...40, "LP1r": -20...40, "HP2r": -20...40, "LP2r": -20...40, "Fcf1": 10...22050, "Fcg1": -18...18, "Fbw1": 0.05...3,
+        "RVdw": 0...100, "RVga": -20...20, "RVmi": 0.0001...1, "RVma": 0.0001...1, "RVlf": 0.001...20, "RVhf": 0.001...20, "RVrr": 1...1000,
     ]
 
     static func range(_ a: Automation) -> ClosedRange<Double> { a.range ?? ranges[a.id] ?? 0...1 }
