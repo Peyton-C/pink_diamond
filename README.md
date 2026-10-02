@@ -13,6 +13,8 @@ Needs macOS 27 and Xcode 27.
 
 `pink diamond --selftest <from> <to> [out.wav] [from genre] [to genre]` runs the whole pipeline without the UI.
 
+`pink diamond --mcp` runs it as an MCP server, so an agent can plan, edit and render transitions. See [docs/mcp.md](docs/mcp.md).
+
 ## Use
 - **Library**: drop in audio files, Native Instruments `.stem.mp4` files, or whole folders. Each song is analyzed once (tempo, beats, bars, sections, key, loudness, vocals). Browse by Songs, Artists, Albums or Genres with the tabs in the toolbar; cover art comes from each file's tags. Keys show in Mixxx's key colours, in Lancelot (8A) or musical (Am) names, set in Settings.
 - **Playlists**: right-click songs in the Library → Add to Playlist, or drop files onto a playlist; drag to reorder. Between every two songs, the ◆ row shows the planned transition. Click it to open the deck view.
@@ -29,6 +31,7 @@ Needs macOS 27 and Xcode 27.
 | `Sources/Core/TransitionPlan.swift` | The plan: automation curves over song time, the plan's DSP-graph wiring, song time ↔ transition time |
 | `Sources/Core/MixEdit.swift` | Transition edits applied over the plan: moved and stretched sides, replaced or added automation, planner variants |
 | `Sources/Core/MixRenderer.swift` | Offline AVAudioEngine rebuilding the plan's DSP graph per song, including Apple's private AURemixFX |
+| `Sources/Core/MCPServer.swift` | The `--mcp` server: its own songs and edits over the same analysis, planner and renderer |
 | `Sources/Core/MixPlayer.swift` | Playlist playback: runs the renderer ahead of a realtime engine |
 | `Sources/UI/` | SwiftUI: library, playlists, deck view |
 

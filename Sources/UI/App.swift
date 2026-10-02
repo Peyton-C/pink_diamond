@@ -4,11 +4,11 @@ import SwiftUI
 struct Main {
     static func main() {
         let args = Array(CommandLine.arguments.dropFirst())
-        if args.first == "--selftest" {
+        if args.first == "--selftest" || args.first == "--mcp" {
             let done = DispatchSemaphore(value: 0)
             var status: Int32 = 0
             Task.detached {
-                status = await SelfTest.run(Array(args.dropFirst()))
+                status = args.first == "--mcp" ? await MCPServer().run() : await SelfTest.run(Array(args.dropFirst()))
                 done.signal()
             }
             done.wait()
