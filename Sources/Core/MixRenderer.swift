@@ -13,6 +13,12 @@ final class MixRenderer {
         let entering: TransitionSide?  // this song's side of the transition into it
         let leaving: TransitionSide?   // this song's side of the transition out of it
         var gain: Float = 1            // Sound Check: applied to the decoded audio, ahead of the graph
+        /// The sides' loops, in order. Like the sides, they are in the song's time as played: a loop pushes
+        /// everything after it later, the side that leaves the song included.
+        var loops: [SongLoop] = []
+        /// The song's four stems (drums, bass, other, vocals), played in place of `audio` and mixed by the sides'
+        /// `stem_` automations. Empty plays `audio`, which is all Apple's AutoMix has.
+        var stems: [URL] = []
     }
 
     private static let registerSonic: Void = {
@@ -182,8 +188,14 @@ private final class Slot {
                 // An edited transition can bring a song in before its start: silence until song time 0.
                 let start = Int(chain.position.rounded(.down))
                 let lead = min(Int(frameCount), max(0, -start))
-                let copied = max(0, min(Int(frameCount) - lead, Int(audio.frameLength) - max(start, 0)))
+                let copied = max(0, min(Int(frameCount) - lead, (chain.remixes ? chain.frames : Int(audio.frameLength)) - max(start, 0)))
                 produced = lead + copied
+                if chain.remixes {
+                    for buf in buffers { memset(buf.mData, 0, Int(buf.mDataByteSize)) }
+                    chain.fill(buffers, at: lead, count: copied, from: max(start, 0))
+                    chain.position += Double(produced)
+                    return noErr
+                }
                 // Sound Check scales the song here rather than on a graph node: every gain in the graph belongs to
                 // the plan's automation, and scaling ahead of the effects keeps their sends in proportion. A gain of
                 // 1 leaves the samples bit-identical.
@@ -260,31 +272,90 @@ private final class Chain {
     var active = false
     var finished = false
     var tempo = 120.0
-    private(set) var audio: AVAudioPCMBuffer?
+    private(set) var audio: AVAudioPCMBuffer?   // the song, or the first of its stems
+    private var stems: [AVAudioPCMBuffer] = []
+    private var stemGains = [Float](repeating: 1, count: 4), heardGains = [Float](repeating: 1, count: 4)
+    private let loops: [(start: Int, length: Int, repeats: Int)]   // in frames of the song as played
     private let slot: Slot
 
+    /// The song's time as played, which counts a loop's repeats. Everything the renderer times runs on it.
     var songTime: Double { position / sampleRate }
+    /// The song's length as played, in frames.
+    var frames: Int { Int(duration * sampleRate) }
+    /// Whether the song is read through `fill` rather than copied straight from the file.
+    var remixes: Bool { !loops.isEmpty || !item.stems.isEmpty }
 
     init(item: MixRenderer.Item, slot: Slot) throws {
         self.item = item
         self.slot = slot
         let file = try AVAudioFile(forReading: item.audio)
-        duration = Double(file.length) / file.processingFormat.sampleRate
+        loops = item.loops.map { (Int($0.start * sampleRate), max(1, Int($0.length * sampleRate)), $0.repeats) }
+        duration = Double(file.length) / file.processingFormat.sampleRate + item.loops.map(\.extra).reduce(0, +)
     }
 
     func load() throws {
         guard audio == nil, !finished else { return }
-        audio = try AudioSource.loadPCM(item.audio)
+        if item.stems.isEmpty {
+            audio = try AudioSource.loadPCM(item.audio)
+        } else {
+            stems = try item.stems.map(AudioSource.loadPCM)
+            audio = stems.first
+        }
         slot.claim(self)
     }
 
     /// Releases the decoded audio and the slot.
     func unload() {
         audio = nil
+        stems = []
         slot.release(self)
     }
 
-    func beatPosition(_ t: Double) -> Double {
+    /// Where frame `v` of the song as played is in the file, and, across the last few milliseconds before a loop
+    /// jumps back, the frame to blend towards and by how much: the audio leading up to the loop's start, so the jump
+    /// lands on what would have come next there instead of clicking.
+    private func frame(_ v: Int) -> (Int, blend: Int, weight: Float) {
+        let fade = 256
+        var offset = 0
+        for l in loops {
+            if v < l.start { break }
+            if v < l.start + l.length * (l.repeats + 1) {
+                let pass = (v - l.start) / l.length, within = (v - l.start) % l.length, left = l.length - within
+                let first = l.start - offset
+                if pass < l.repeats, left <= fade, first - left >= 0 { return (first + within, first - left, 1 - Float(left) / Float(fade)) }
+                return (first + within, 0, 0)
+            }
+            offset += l.length * l.repeats
+        }
+        return (v - offset, 0, 0)
+    }
+
+    /// Writes `count` frames of the song as played from frame `from`, following its loops and mixing its stems at
+    /// their current levels. Levels are set once a block, so they ramp across the frames written to keep a fast
+    /// fade from stepping.
+    func fill(_ buffers: UnsafeMutableAudioBufferListPointer, at lead: Int, count: Int, from: Int) {
+        guard count > 0 else { return }
+        let sources = stems.isEmpty ? [audio].compactMap { $0 } : stems
+        for (k, source) in sources.enumerated() {
+            let from0 = stems.isEmpty ? 1 : heardGains[k], to = stems.isEmpty ? 1 : stemGains[k]
+            let step = (to - from0) / Float(count), length = Int(source.frameLength)
+            for (c, buf) in buffers.enumerated() {
+                let dst = buf.mData!.assumingMemoryBound(to: Float.self)
+                let src = source.floatChannelData![min(c, Int(source.format.channelCount) - 1)]
+                for i in 0..<count {
+                    let (at, blend, weight) = frame(from + i)
+                    guard at < length else { break }
+                    let x = weight > 0 ? src[at] * (1 - weight) + src[blend] * weight : src[at]
+                    dst[lead + i] += x * (from0 + step * Float(i)) * item.gain
+                }
+            }
+        }
+        heardGains = stemGains
+    }
+
+    func beatPosition(_ played: Double) -> Double {
+        // The beat grid is the file's. Without loops the time is used as it is, not rounded to a frame.
+        let t = loops.isEmpty ? played : Double(frame(Int(played * sampleRate)).0) / sampleRate
         let beats = item.beats
         guard beats.count > 1 else { return t * tempo / 60 }
         var lo = 0, hi = beats.count - 1
@@ -305,7 +376,12 @@ private final class Chain {
         guard slot.chain === self, !finished else { return }
         let g = slot
         let s = songTime
-        guard let side = side(at: s) else {
+        // Stems play at full level wherever a side doesn't set them, and outside the sides.
+        let active = side(at: s)
+        for (k, lane) in TransitionEdit.stemLanes.enumerated() {
+            stemGains[k] = Float(active?.automations[lane]?.value(at: s) ?? 1)
+        }
+        guard let side = active else {
             g.stretch.rate = 1
             if !g.bypassed { g.bypassed = true; g.units.values.forEach { $0.bypass = true } }
             // Belt and braces: park the filters wide open in case a unit ignores bypass.

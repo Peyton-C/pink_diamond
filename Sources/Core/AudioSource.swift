@@ -48,6 +48,30 @@ enum AudioSource {
         let out = AppPaths.cacheDir("mixdowns").appendingPathComponent(fileKey(url) + ".m4a")
         if FileManager.default.fileExists(atPath: out.path) { return out }
         guard let mixdown = tracks.min(by: { $0.trackID < $1.trackID }) else { throw PlannerError("no audio track in \(url.lastPathComponent)") }
+        try await extract(mixdown, of: asset, to: out)
+        return out
+    }
+
+    static let stemNames = ["drums", "bass", "other", "vocals"]
+
+    /// The four stems of a stem file (drums, bass, other, vocals: tracks 1 to 4, in Native Instruments' order), each
+    /// extracted once into the cache the way the mixdown is. Taking them out the same way matters: decoded by the
+    /// same path they share the mixdown's encoder delay, so they sit on the beat grid its analysis found.
+    static func stemURLs(for url: URL) async throws -> [URL] {
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .audio).sorted { $0.trackID < $1.trackID }
+        guard tracks.count >= 5 else { throw PlannerError("\(url.lastPathComponent) has no stems") }
+        var urls: [URL] = []
+        for (i, track) in tracks[1...4].enumerated() {
+            let out = AppPaths.cacheDir("mixdowns").appendingPathComponent("\(fileKey(url)).\(stemNames[i]).m4a")
+            if !FileManager.default.fileExists(atPath: out.path) { try await extract(track, of: asset, to: out) }
+            urls.append(out)
+        }
+        return urls
+    }
+
+    /// One track of `asset` as an m4a of its own, by passthrough export (no re-encode).
+    private static func extract(_ mixdown: AVAssetTrack, of asset: AVURLAsset, to out: URL) async throws {
         let composition = AVMutableComposition()
         guard let track = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
             throw PlannerError("could not create composition track")
@@ -60,7 +84,6 @@ enum AudioSource {
         let tmp = out.deletingLastPathComponent().appendingPathComponent(UUID().uuidString + ".m4a")
         try await export.export(to: tmp, as: .m4a)
         try FileManager.default.moveItem(at: tmp, to: out)
-        return out
     }
 
     /// The file's cover art as a JPEG thumbnail, read from its tags once and cached at `cache` (an empty file there

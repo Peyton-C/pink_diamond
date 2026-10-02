@@ -23,6 +23,14 @@ struct PlanVariant: Codable, Hashable {
     }
 }
 
+/// A stretch of a song played more than once before it carries on.
+struct SongLoop: Codable, Equatable {
+    var start: Double            // song seconds; in a TransitionEdit, from the start of that song's side
+    var length: Double
+    var repeats: Int             // times it plays again after the first
+    var extra: Double { length * Double(repeats) }
+}
+
 /// What the user changed about a planned transition. Stored instead of an edited plan, so it's small, survives a
 /// cache wipe (the planner is deterministic) and reapplies after a replan.
 struct TransitionEdit: Codable, Equatable {
@@ -44,6 +52,20 @@ struct TransitionEdit: Codable, Equatable {
     /// clock is its song-time span × ln(r1/r0)/(r1 − r0), which scales with the span when the rates stay put.
     var lengthScale = 1.0
 
+    // Beyond what Apple's AutoMix does. The app's editor sets none of these; the MCP server does, unless it is run
+    // without extensions.
+    /// The incoming side's length relative to the plan's, when it isn't the outgoing side's. A transition whose tempo
+    /// match is drawn afresh needs it: the two sides then cover the same time on the playback clock, not the same
+    /// multiple of what Apple planned.
+    var incomingLengthScale: Double?
+    /// Song seconds the outgoing song plays on after its side would have ended, so an echo can ring out or a fade can
+    /// finish under the new song. Its automation carries on through the tail.
+    var outgoingTail = 0.0
+    var outgoingLoop: SongLoop?
+    var incomingLoop: SongLoop?
+    /// Automation lanes with these names set the level of a stem file's stems instead of a graph parameter.
+    static let stemLanes = AudioSource.stemNames.map { "stem_" + $0 }
+
     init(variant: PlanVariant? = nil) { self.variant = variant }
 
     // Written by hand so edits saved before a field existed still load.
@@ -55,6 +77,16 @@ struct TransitionEdit: Codable, Equatable {
         outgoing = try c.decodeIfPresent([String: [Point]].self, forKey: .outgoing) ?? [:]
         incoming = try c.decodeIfPresent([String: [Point]].self, forKey: .incoming) ?? [:]
         lengthScale = try c.decodeIfPresent(Double.self, forKey: .lengthScale) ?? 1
+        incomingLengthScale = try c.decodeIfPresent(Double.self, forKey: .incomingLengthScale)
+        outgoingTail = try c.decodeIfPresent(Double.self, forKey: .outgoingTail) ?? 0
+        outgoingLoop = try c.decodeIfPresent(SongLoop.self, forKey: .outgoingLoop)
+        incomingLoop = try c.decodeIfPresent(SongLoop.self, forKey: .incomingLoop)
+    }
+
+    /// Whether the edit uses anything Apple's AutoMix has no counterpart for.
+    var isExtended: Bool {
+        outgoingTail != 0 || outgoingLoop != nil || incomingLoop != nil
+            || Self.stemLanes.contains { outgoing[$0] != nil || incoming[$0] != nil }
     }
 
     var isEmpty: Bool { self == TransitionEdit() }
@@ -78,6 +110,7 @@ struct TransitionEdit: Codable, Equatable {
         let stretch = { (lanes: [String: [Point]]) in lanes.mapValues { $0.map { Point(offset: $0.offset * k, value: $0.value, curve: $0.curve) } } }
         outgoing = stretch(outgoing)
         incoming = stretch(incoming)
+        if let own = incomingLengthScale { incomingLengthScale = own * k }
         lengthScale = scale
     }
 }
@@ -85,17 +118,43 @@ struct TransitionEdit: Codable, Equatable {
 extension TransitionSide {
     /// This side moved by `shift` song seconds and stretched by `scale` from its start, with `lanes` replacing or adding
     /// automations. The tempo curve moves and stretches with it, so a whole-bar move keeps the downbeats together.
-    func applying(shift: Double, scale: Double = 1, lanes: [String: [TransitionEdit.Point]]) -> TransitionSide {
+    ///
+    /// With `loop`, that stretch of the song repeats, and the side's end and the plan's own points after it move later
+    /// by the repeats. `lanes` are not moved: their offsets already count the repeats, so a lane can be drawn across
+    /// them. With `tail`, the side runs on that much longer, and the plan's bypass stays off until the new end so
+    /// effects drawn into the tail are heard.
+    func applying(shift: Double, scale: Double = 1, lanes: [String: [TransitionEdit.Point]], loop: SongLoop? = nil,
+                  tail: Double = 0) -> TransitionSide {
         let start = self.start + shift
-        let time = { (t: Double) in start + (t - self.start) * scale }
+        let loop = loop.flatMap { $0.length > 0 && $0.repeats > 0 ? SongLoop(start: start + $0.start, length: $0.length, repeats: $0.repeats) : nil }
+        let pushFrom = loop.map { $0.start + $0.length } ?? .infinity, extra = loop?.extra ?? 0
+        let time = { (t: Double) -> Double in
+            let x = start + (t - self.start) * scale
+            return x >= pushFrom - 1e-6 ? x + extra : x
+        }
+        // A loop that runs up to the side's end, or past it, still plays out in full.
+        let end = max(time(self.end), loop.map { $0.start + $0.length + extra } ?? -.infinity)
         var autos = automations.mapValues { a in
-            Automation(id: a.id, points: a.points.map { .init(time: time($0.time), value: $0.value, curve: $0.curve) }, range: a.range)
+            Automation(id: a.id, points: a.points.map { p in
+                let held = a.id == "bypa" && tail > 0 && time(p.time) >= end - 1e-6
+                return .init(time: time(p.time) + (held ? tail : 0), value: p.value, curve: p.curve)
+            }, range: a.range)
         }
         for (id, points) in lanes {
             autos[id] = Automation(id: id, points: points.map { .init(time: start + $0.offset, value: $0.value, curve: $0.curve) },
                                    range: automations[id]?.range ?? EffectCatalog.ranges[id])
         }
-        return TransitionSide(start: start, end: time(end), automations: autos, wiring: wiring)
+        return TransitionSide(start: start, end: end + tail, automations: autos, wiring: wiring, loop: loop)
+    }
+
+    /// The same side `seconds` later, for a song whose earlier loop has pushed the rest of it back.
+    func retimed(by seconds: Double) -> TransitionSide {
+        guard seconds != 0 else { return self }
+        let autos = automations.mapValues { a in
+            Automation(id: a.id, points: a.points.map { .init(time: $0.time + seconds, value: $0.value, curve: $0.curve) }, range: a.range)
+        }
+        return TransitionSide(start: start + seconds, end: end + seconds, automations: autos, wiring: wiring,
+                              loop: loop.map { SongLoop(start: $0.start + seconds, length: $0.length, repeats: $0.repeats) })
     }
 
     /// An automation's points as edit points, relative to this side's start.
@@ -112,10 +171,17 @@ extension TransitionSide {
 extension TransitionPlan {
     func applying(_ edit: TransitionEdit) -> TransitionPlan {
         var plan = self
-        plan.outgoing = outgoing.applying(shift: edit.outgoingShift, scale: edit.lengthScale, lanes: edit.outgoing)
-        plan.incoming = incoming.applying(shift: edit.incomingShift, scale: edit.lengthScale, lanes: edit.incoming)
+        plan.outgoing = outgoing.applying(shift: edit.outgoingShift, scale: edit.lengthScale, lanes: edit.outgoing,
+                                          loop: edit.outgoingLoop, tail: edit.outgoingTail)
+        plan.incoming = incoming.applying(shift: edit.incomingShift, scale: edit.incomingLengthScale ?? edit.lengthScale,
+                                          lanes: edit.incoming, loop: edit.incomingLoop)
         plan.duration = duration * edit.lengthScale
-        plan.pivot = pivot * edit.lengthScale
+        // With its own length or a loop, the incoming side no longer lasts a multiple of the plan's time: the
+        // transition is over when that side is.
+        if edit.incomingLengthScale != nil || edit.incomingLoop != nil {
+            plan.duration = plan.incoming.transitionTime(at: plan.incoming.end)
+        }
+        plan.pivot = duration > 0 ? pivot * plan.duration / duration : pivot
         return plan
     }
 }

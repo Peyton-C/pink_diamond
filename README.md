@@ -29,7 +29,7 @@ Needs macOS 27 and Xcode 27.
 | `Sources/Core/Analyzer.swift` | MusicUnderstanding → Apple Music's AutoMix analysis format (incl. structure-based video cues, which the planner needs for genre styles) |
 | `Sources/Core/SonicPlanner.swift`, `Trampoline.s` | macOS 27's `TransitionPlanner` from the private `_SonicKit_MusicKit`, called in-process |
 | `Sources/Core/TransitionPlan.swift` | The plan: automation curves over song time, the plan's DSP-graph wiring, song time ↔ transition time |
-| `Sources/Core/MixEdit.swift` | Transition edits applied over the plan: moved and stretched sides, replaced or added automation, planner variants |
+| `Sources/Core/MixEdit.swift` | Transition edits applied over the plan: moved and stretched sides, replaced or added automation, planner variants, and the MCP server's loops, tails and stem levels |
 | `Sources/Core/MixRenderer.swift` | Offline AVAudioEngine rebuilding the plan's DSP graph per song, including Apple's private AURemixFX |
 | `Sources/Core/MCPServer.swift` | The `--mcp` server: its own songs and edits over the same analysis, planner and renderer |
 | `Sources/Core/MixPlayer.swift` | Playlist playback: runs the renderer ahead of a realtime engine |

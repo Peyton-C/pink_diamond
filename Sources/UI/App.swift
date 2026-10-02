@@ -8,7 +8,7 @@ struct Main {
             let done = DispatchSemaphore(value: 0)
             var status: Int32 = 0
             Task.detached {
-                status = args.first == "--mcp" ? await MCPServer().run() : await SelfTest.run(Array(args.dropFirst()))
+                status = args.first == "--mcp" ? await MCPServer(extensions: !args.contains("--automix-only")).run() : await SelfTest.run(Array(args.dropFirst()))
                 done.signal()
             }
             done.wait()

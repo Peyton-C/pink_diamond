@@ -39,6 +39,9 @@ struct TransitionSide {
     var end: Double                      // song time where it ends
     var automations: [String: Automation]
     var wiring: [String: GraphWire]
+    /// A stretch of the song this side plays more than once. The side's times count the repeats as if the song had
+    /// them, so its end and every automation point after the loop come that much later than in the file.
+    var loop: SongLoop? = nil
 
     func rate(at s: Double) -> Double { automations["ts_rate"]?.value(at: s) ?? 1 }
 
@@ -165,6 +168,7 @@ enum EffectCatalog {
         case id.hasPrefix("RXd"), id.hasPrefix("DL"), id == "Ga4g", id == "Ga3g", id == "Ga2g": return "echo"
         case id.hasPrefix("RXa"), id.hasPrefix("RXb"), id.hasPrefix("HP"), id.hasPrefix("LP"), id.hasPrefix("Fc"): return "filters"
         case id.hasPrefix("RV"): return "reverb"
+        case id.hasPrefix("stem_"): return "stems"
         default: return nil
         }
     }
@@ -187,6 +191,7 @@ enum EffectCatalog {
         "Fcg1": "EQ band gain", "Fbw1": "EQ band width", "HP2r": "echo high-pass resonance", "LP2r": "echo low-pass resonance",
         "RVga": "echo reverb gain", "RVmi": "echo reverb min delay", "RVma": "echo reverb max delay",
         "RVlf": "echo reverb low decay", "RVhf": "echo reverb high decay", "RVrr": "echo reverb randomness",
+        "stem_drums": "drums", "stem_bass": "bass", "stem_other": "other instruments", "stem_vocals": "vocals",
     ]
 
     static func name(_ id: String) -> String { names[id] ?? id }
@@ -202,6 +207,7 @@ enum EffectCatalog {
         "RXpr": 0...7, "RXvt": 1...200, "RXdr": 0...23, "RXgr": 0...15, "RXfr": 0...15, "RXsr": 0...15, "RXsm": 0...0.5, "RXtr": 3...15,
         // The stock filter, EQ and reverb units, from their parameter lists in AudioUnitParameters.h (dB, octaves, seconds).
         "HP1r": -20...40, "LP1r": -20...40, "HP2r": -20...40, "LP2r": -20...40, "Fcf1": 10...22050, "Fcg1": -18...18, "Fbw1": 0.05...3,
+        "stem_drums": 0...1, "stem_bass": 0...1, "stem_other": 0...1, "stem_vocals": 0...1,
         "RVdw": 0...100, "RVga": -20...20, "RVmi": 0.0001...1, "RVma": 0.0001...1, "RVlf": 0.001...20, "RVhf": 0.001...20, "RVrr": 1...1000,
     ]
 

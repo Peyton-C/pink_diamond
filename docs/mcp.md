@@ -8,6 +8,8 @@ Build pink diamond, then point an MCP client at the binary inside the app with `
 claude mcp add pink-diamond -- "/Applications/pink diamond.app/Contents/MacOS/pink diamond" --mcp
 ```
 
+Add `--automix-only` after `--mcp` to leave out everything Apple's AutoMix has no counterpart for: stem levels, loops, and outgoing tails with the moves that need one. An agent can then do what the app's editor can and no more.
+
 ## Session
 The server keeps its songs, genres and edits in memory and forgets them when it exits. It does not read or change the app's library, playlists or saved edits. It shares only the analysis cache, so a song either has analyzed is ready in both.
 
@@ -17,7 +19,7 @@ Add songs first with `add_songs`. Every other tool takes the song ids it returns
 | Tool | What |
 | --- | --- |
 | `add_songs` | Adds audio files, stem files or folders and analyzes them. A song's first analysis takes several seconds, so add a large uncached folder in parts if the client times out. Past 25 songs it returns a count, not the list |
-| `list_songs` | Songs added, filtered by words, BPM range, key or genre, a page at a time. `unique` lists each song once when it is there in several versions |
+| `list_songs` | Songs added, filtered by words, BPM range, key or genre, a page at a time. A stem file shows where its stems came from. `unique` lists each song once when it is there in several versions, as the one with the best stems |
 | `get_song` | A song's bars, vocal ranges, loudness and Sound Check gain, and its sections. Beats on request, and `bars: false` leaves the bar times out |
 | `set_genre` | Sets the genre of one song, several, or all. Every song starts as Pop |
 | `get_transition` | The transition between two songs with edits applied: style, length, each side's start and end, handoff point, automation lanes, and the checks below |
@@ -25,9 +27,9 @@ Add songs first with `add_songs`. Every other tool takes the song ids it returns
 | `list_parameters` | Every parameter a lane can automate: code, name, range, resting value, and what each value of a note-length or filter-type parameter selects |
 | `edit_transition` | Changes a transition. Only the fields given change |
 | `reset_transition` | Drops the edit and goes back to Apple's plan |
-| `plan_set` | The timeline of songs played in order, without rendering: where each transition starts, which part of each song plays, how long it plays alone, and the total length |
+| `plan_set` | The timeline of songs played in order, without rendering: where each transition starts, its technique and length, which part of each song plays, how long it plays alone, the total length, and any run of three or more transitions using the same technique |
 | `render_transition` | Renders one transition to a WAV with some of each song around it, and reports the result's level each second, its peak, and how many samples sit at full scale |
-| `render_set` | Renders songs in order with every transition to one WAV, with the same timeline as `plan_set` |
+| `render_set` | Renders songs in order with every transition to one WAV, with the same timeline as `plan_set` and the level each second around every transition |
 
 `get_transition` and `edit_transition` take `detail`: `summary` leaves the lanes out, `moving` has the lanes that change, `all` has every lane and the effects each side can take. Reading defaults to `moving` and editing to `summary`.
 
@@ -54,11 +56,14 @@ pink diamond works these out from the plan and the analyses, so they cost nothin
 | --- | --- |
 | `variant` | A plan from `list_variants`, or null for Apple's own. Other edits are kept and applied to the new plan |
 | `style` | The plan with this style name. Only styles the planner makes for the pair can be chosen, and the error lists them |
-| `length_bars` | The transition's length in the outgoing song's bars. Both songs stretch together and stay beat-matched, and lanes already set stretch with them |
 | `outgoing_shift_bars`, `incoming_shift_bars` | Moves a song's side along its bar grid, counted from where Apple planned it. Positive is later in the song |
 | `outgoing_shift_seconds`, `incoming_shift_seconds` | The same move in song seconds, for moves off the bar grid |
 | `outgoing_start`, `incoming_start` | Where a song's side starts, in song seconds. Use a bar time from `get_song` to stay on the grid |
-| `blank` | Starts from a blank beat-matched transition: both songs at full volume for the whole window with the plan's tempo match kept, every other lane at rest, and earlier lanes dropped. The outgoing song stops when the window ends |
+| `length_bars` | The transition's length in the outgoing song's bars, where its side is now. Both songs stretch together, and lanes already set stretch with them |
+| `blank` | Starts from a blank beat-matched transition, see below |
+| `outgoing_tail_bars` | Bars the outgoing song plays on after the window ends, with its lanes carrying on |
+| `outgoing_loop`, `incoming_loop` | Repeats a stretch of a song inside its side: `start` in song seconds, `bars` (0.25 is a beat), `repeats`. null removes it |
+| `exit`, `entry` | Builds the transition from a named move for each song, see below |
 | `outgoing_lanes`, `incoming_lanes` | Replaces or adds automation lanes by parameter code. null puts a lane back as planned |
 | `add_effects` | Adds a filter sweep, reverb, echo, repeater, gater or flanger across one side |
 
@@ -68,7 +73,38 @@ A lane is a list of points, each a position, a `value` and a `curve` (`linear`, 
 
 An edit belongs to the genres it was made with, as in the app. Changing a song's genre starts its transitions from a fresh plan, and setting the genre back brings the edit back.
 
+## Blank transitions
+`blank: true` clears the edit's lanes, loops and tail and leaves both songs at full volume for the whole window, with the effects on but at rest. pink diamond draws the tempo match itself from the two beat grids where the sides are now, running from the outgoing song's tempo to the incoming's across the window, and halves or doubles the incoming tempo first when that is closer. Start both sides on a bar so the downbeats meet. The outgoing song stops when the window ends unless it has a tail.
+
+## Moves
+`exit` and `entry` build a blank transition and draw one move on each song. Giving only one leaves the other as `cut` or `full`. Lanes drawn afterwards go over the moves.
+
+| Exit | What the outgoing song does |
+| --- | --- |
+| `cut` | Plays at full volume and stops when the window ends |
+| `fade` | Fades out across the window |
+| `filter_fade` | A low-pass closes across the window, then it stops |
+| `filter_rise` | A high-pass thins it out across the window, then it stops |
+| `echo_out` | Plays to the end of the window, then stops while its last beat echoes away over a 2-bar tail |
+
+| Entry | What the incoming song does |
+| --- | --- |
+| `full` | Plays at full volume from the start of the window |
+| `fade_in` | Fades in across the window |
+| `filter_in` | A high-pass opens across the window |
+| `drop_in` | Silent until the window ends, then in at full volume |
+
+A transition's `technique` is its moves, or the planner's style, or for one drawn by hand what moves in it. `plan_set` compares techniques to find repeats.
+
+## Tails and loops
+A tail lets the outgoing song play past the window, so a fade can finish or an echo can ring under the new song. Lane offsets past the window reach into the tail, and the song stops when the tail ends, so bring its volume down before then.
+
+A loop repeats a stretch of a song before it carries on, and makes that song's side longer by the repeats. Lane offsets on that song count the repeats, so a filter can keep closing while a bar goes round. Set a loop before drawing lanes over it. The stretch has to lie inside the side, and is measured in whole beats from the nearest beat.
+
+## Stems
+For a stem file, lanes named `stem_drums`, `stem_bass`, `stem_other` and `stem_vocals` set each stem's level from 0 to 1. A stem is at 1 wherever no lane sets it, so bring it back to 1 before the incoming side ends or it jumps back. A song with a stem lane plays as the sum of its stems for the whole song, which is close to the mixdown but not identical; every other song plays its mixdown.
+
 ## Limits
-The server has no playback, playlists or live mode. An agent hears nothing: rendering gives it a WAV file and timings.
+The server has no playback, playlists or live mode. Tails, loops and stems exist only here: the app's editor does not show or set them. An agent hears nothing: rendering gives it a WAV file and timings.
 
 One request runs at a time, and a render blocks until it finishes.
