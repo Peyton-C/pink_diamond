@@ -19,6 +19,8 @@ final class MixRenderer {
         /// The song's four stems (drums, bass, other, vocals), played in place of `audio` and mixed by the sides'
         /// `stem_` automations. Empty plays `audio`, which is all Apple's AutoMix has.
         var stems: [URL] = []
+        /// Semitones the whole song is shifted by, to bring its key to the next song's. 0 is all Apple's AutoMix has.
+        var pitch = 0.0
     }
 
     private static let registerSonic: Void = {
@@ -376,6 +378,7 @@ private final class Chain {
         guard slot.chain === self, !finished else { return }
         let g = slot
         let s = songTime
+        g.stretch.pitch = Float(item.pitch * 100)
         // Stems play at full level wherever a side doesn't set them, and outside the sides.
         let active = side(at: s)
         for (k, lane) in TransitionEdit.stemLanes.enumerated() {

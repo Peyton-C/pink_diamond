@@ -207,7 +207,7 @@ enum EffectCatalog {
         "RXpr": 0...7, "RXvt": 1...200, "RXdr": 0...23, "RXgr": 0...15, "RXfr": 0...15, "RXsr": 0...15, "RXsm": 0...0.5, "RXtr": 3...15,
         // The stock filter, EQ and reverb units, from their parameter lists in AudioUnitParameters.h (dB, octaves, seconds).
         "HP1r": -20...40, "LP1r": -20...40, "HP2r": -20...40, "LP2r": -20...40, "Fcf1": 10...22050, "Fcg1": -18...18, "Fbw1": 0.05...3,
-        "stem_drums": 0...1, "stem_bass": 0...1, "stem_other": 0...1, "stem_vocals": 0...1,
+        "stem_drums": 0...2, "stem_bass": 0...2, "stem_other": 0...2, "stem_vocals": 0...2,   // above 1 lifts a quiet stem
         "RVdw": 0...100, "RVga": -20...20, "RVmi": 0.0001...1, "RVma": 0.0001...1, "RVlf": 0.001...20, "RVhf": 0.001...20, "RVrr": 1...1000,
     ]
 

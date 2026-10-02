@@ -8,10 +8,12 @@ Build pink diamond, then point an MCP client at the binary inside the app with `
 claude mcp add pink-diamond -- "/Applications/pink diamond.app/Contents/MacOS/pink diamond" --mcp
 ```
 
-Add `--automix-only` after `--mcp` to leave out everything Apple's AutoMix has no counterpart for: stem levels, loops, and outgoing tails with the moves that need one. An agent can then do what the app's editor can and no more.
+Add `--automix-only` after `--mcp` to leave out everything Apple's AutoMix has no counterpart for: stem levels, loops, key shift, song gain, and outgoing tails with the moves that need one. An agent can then do what the app's editor can and no more.
+
+Add `--renders <folder>` to choose where named renders go. Without it they go to `~/Music/pink diamond`.
 
 ## Session
-The server keeps its songs, genres and edits in memory and forgets them when it exits. It does not read or change the app's library, playlists or saved edits. It shares only the analysis cache, so a song either has analyzed is ready in both.
+The server keeps its songs, genres and edits in memory and forgets them when it exits, unless they are saved as a set. It does not read or change the app's library, playlists or saved edits. It shares only the analysis cache, so a song either has analyzed is ready in both.
 
 Add songs first with `add_songs`. Every other tool takes the song ids it returns. An id stays the same for a file between sessions, as long as the file is not moved or changed.
 
@@ -20,7 +22,8 @@ Add songs first with `add_songs`. Every other tool takes the song ids it returns
 | --- | --- |
 | `add_songs` | Adds audio files, stem files or folders and analyzes them. A song's first analysis takes several seconds, so add a large uncached folder in parts if the client times out. Past 25 songs it returns a count, not the list |
 | `list_songs` | Songs added, filtered by words, BPM range, key or genre, a page at a time. A stem file shows where its stems came from. `unique` lists each song once when it is there in several versions, as the one with the best stems |
-| `get_song` | A song's bars, vocal ranges, loudness and Sound Check gain, and its sections. Beats on request, and `bars: false` leaves the bar times out |
+| `get_song` | A song's bars, vocal ranges, loudness and Sound Check gain, and its sections. Beats on request, and `bars: false` leaves the bar times out. `stems: true` adds each stem's level per section and bar by bar |
+| `set_song` | A song's key shift in semitones and its gain in dB, kept for the whole time it plays |
 | `set_genre` | Sets the genre of one song, several, or all. Every song starts as Pop |
 | `get_transition` | The transition between two songs with edits applied: style, length, each side's start and end, handoff point, automation lanes, and the checks below |
 | `list_variants` | The other plans the planner makes for the pair, as other genres or at lower complexity |
@@ -28,10 +31,13 @@ Add songs first with `add_songs`. Every other tool takes the song ids it returns
 | `edit_transition` | Changes a transition. Only the fields given change |
 | `reset_transition` | Drops the edit and goes back to Apple's plan |
 | `plan_set` | The timeline of songs played in order, without rendering: where each transition starts, its technique and length, which part of each song plays, how long it plays alone, the total length, and any run of three or more transitions using the same technique |
+| `save_set`, `load_set`, `list_sets` | Saves songs and the edited transitions between them to a file, and loads them back after a restart |
 | `render_transition` | Renders one transition to a WAV with some of each song around it, and reports the result's level each second, its peak, and how many samples sit at full scale |
 | `render_set` | Renders songs in order with every transition to one WAV, with the same timeline as `plan_set` and the level each second around every transition |
 
 `get_transition` and `edit_transition` take `detail`: `summary` leaves the lanes out, `moving` has the lanes that change, `all` has every lane and the effects each side can take. Reading defaults to `moving` and editing to `summary`.
+
+Renders take a `name`, which puts the WAV in the renders folder, or `out` for a full path. With neither it goes in the cache under a random name.
 
 Renders play every song at the same loudness, as the app does with Sound Check on. Pass `sound_check: false` to turn it off. The renderer ends in a limiter, so two songs at full volume are held just under full scale rather than clipped, and a peak near 0 dB means the limiter is working.
 
@@ -47,7 +53,9 @@ pink diamond works these out from the plan and the analyses, so they cost nothin
 | `bars_apart_ms` | The same for bars. Beats can line up while bars do not |
 | `beats_out_per_beat_in` | Present when one song runs at about half or double the other's tempo: 2 means two outgoing beats to each incoming one. The beat and bar checks allow for it |
 | `vocals_together_seconds` | How long both songs have vocals inside the transition. It ignores volume, so a vocal that is faded out still counts |
-| `keys` | Both keys with their Camelot numbers, and whether they are the same key, relative major and minor, a fifth apart, or a clash |
+| `keys` | Both keys as they play, key shift included, with their Camelot numbers, and whether they are the same key, relative major and minor, a fifth apart, or a clash |
+| `level` | The predicted loudness before, through and after the transition, and `sag_db`, how far it dips below the quieter of the two songs either side. It counts volume and stem levels, not filters or effects, so treat it as a warning and not a measurement |
+| `stems` | For two stem files: how long the mix has no drums, no bass, two basses or two vocals. A stem counts when it is playing in the song and its level in the mix is up |
 
 ## Editing
 `edit_transition` takes any of these, and applies them in this order.
@@ -74,7 +82,7 @@ A lane is a list of points, each a position, a `value` and a `curve` (`linear`, 
 An edit belongs to the genres it was made with, as in the app. Changing a song's genre starts its transitions from a fresh plan, and setting the genre back brings the edit back.
 
 ## Blank transitions
-`blank: true` clears the edit's lanes, loops and tail and leaves both songs at full volume for the whole window, with the effects on but at rest. pink diamond draws the tempo match itself, a bar or so at a time from the two beat grids where the sides are now, so it follows each song's real grid and not its listed BPM. It runs from the outgoing song's tempo to the incoming's across the window, and pairs two beats with one when one song is at about double the other's tempo. Start both sides on a bar so the downbeats meet. Moving a side, changing the length or setting a loop afterwards redraws the match, which replaces a tempo lane drawn by hand. The outgoing song stops when the window ends unless it has a tail.
+`blank: true` clears the edit's lanes, loops and tail and leaves both songs at full volume for the whole window, with the effects on but at rest. pink diamond draws the tempo match itself, a bar or so at a time from the two beat grids where the sides are now, so it follows each song's real grid and not its listed BPM. It runs from the outgoing song's tempo to the incoming's across the window, and pairs two beats with one when one song is at about double the other's tempo. Start both sides on a bar so the downbeats meet. Moving a side, changing the length or setting a loop afterwards redraws the match. A `ts_rate` lane you draw yourself is kept from then on and reported as `tempo_match: hand-drawn`; set it to null to hand the tempo back. The outgoing song stops when the window ends unless it has a tail.
 
 ## Moves
 `exit` and `entry` build a blank transition and draw one move on each song. Giving only one leaves the other as `cut` or `full`. Lanes drawn afterwards go over the moves.
@@ -96,6 +104,12 @@ An edit belongs to the genres it was made with, as in the app. Changing a song's
 
 A transition's `technique` is its moves, or the planner's style, or for one drawn by hand what moves in it. Stems are named by which are taken down on each song and in what order, such as `stems (out -bass -drums; in -vocals)`. `plan_set` compares techniques to find repeats.
 
+## Song settings
+`set_song` changes how a song plays for its whole length, in every transition and render. `key_shift` moves its key by up to 6 semitones either way without changing its tempo, and the key checks use the shifted key. A couple of semitones is clean, more starts to sound processed. `gain_db` adds up to 12 dB either way on top of Sound Check.
+
+## Saved sets
+`save_set` writes the songs you name, in order, with their genres and settings and every edited transition between any two of them, to `~/Library/Application Support/pink diamond/sets/`. `load_set` adds the songs again and puts the edits back, so a set can be fixed after a restart instead of rebuilt. A set saved with extensions loads without its extended transitions when the server runs with `--automix-only`.
+
 ## Tails and loops
 A tail lets the outgoing song play past the window, so a fade can finish or an echo can ring under the new song. Lane offsets past the window reach into the tail, and the song stops when the tail ends, so bring its volume down before then.
 
@@ -106,7 +120,7 @@ An outgoing loop makes the window longer by its repeats, for both songs. Lanes a
 An incoming loop leaves the window as it is and changes what fills it: the incoming song repeats the stretch and gets less far into itself by the end.
 
 ## Stems
-For a stem file, lanes named `stem_drums`, `stem_bass`, `stem_other` and `stem_vocals` set each stem's level from 0 to 1. A stem is at 1 wherever no lane sets it, so bring it back to 1 before the incoming side ends or it jumps back. A song with a stem lane plays as the sum of its stems for the whole song, which is close to the mixdown but not identical; every other song plays its mixdown.
+For a stem file, lanes named `stem_drums`, `stem_bass`, `stem_other` and `stem_vocals` set each stem's level from 0 to 2, where 1 is as recorded. A stem is at 1 wherever no lane sets it, so bring it back to 1 before the incoming side ends or it jumps back. A song with a stem lane plays as the sum of its stems for the whole song, which is close to the mixdown but not identical; every other song plays its mixdown.
 
 ## Limits
 The server has no playback, playlists or live mode. Tails, loops and stems exist only here: the app's editor does not show or set them. An agent hears nothing: rendering gives it a WAV file and timings.
