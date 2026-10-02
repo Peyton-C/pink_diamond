@@ -15,6 +15,7 @@ struct SongAnalysis: Codable {
     var audioAnalysisJSON: Data      // Apple `audio-analysis` resource
     var flexAnalysisJSON: Data       // Apple `flexml-analysis` resource
     var waveform: Waveform
+    var loudness: Loudness?          // nil in analyses cached before Sound Check; `Loudness(audioAnalysis:)` recovers it
 
     var summary: SongSummary { SongSummary(bpm: bpm, key: key, duration: duration) }
 }
@@ -25,6 +26,34 @@ struct SongSummary: Codable, Equatable {
     var bpm: Int
     var key: String
     var duration: Double
+}
+
+/// A song's level, which Sound Check turns into one gain for the whole song.
+struct Loudness: Codable {
+    var integrated: Double           // LUFS
+    var peak: Double                 // linear, 1 = full scale
+
+    /// Apple's Sound Check reference level.
+    static let target = -16.0
+
+    /// The gain that plays the song at the target loudness. A boost stops where the song's peak would reach full
+    /// scale, as ReplayGain's clipping prevention does: quiet, dynamic recordings stay a little under the target
+    /// rather than being pushed into the renderer's limiter for the whole song.
+    var gain: Float {
+        guard integrated.isFinite, integrated > -70 else { return 1 }   // silence, or loudness the analysis couldn't measure
+        let wanted = pow(10, (Loudness.target - integrated) / 20)
+        return Float(peak > 0 ? min(wanted, 1 / peak) : wanted)
+    }
+}
+
+extension Loudness {
+    /// The level stored in an Apple `audio-analysis` resource, for analyses cached without their own.
+    init?(audioAnalysis json: Data) {
+        guard let root = try? JSONSerialization.jsonObject(with: json) as? [String: Any],
+              let main = ((root["attributes"] as? [String: Any])?["loudness"] as? [String: Any])?["main"] as? [String: Double],
+              let value = main["value"], let peak = main["peak"] else { return nil }
+        self.init(integrated: value, peak: peak)
+    }
 }
 
 enum Genre: String, CaseIterable, Codable, Identifiable {
@@ -182,7 +211,8 @@ enum Analyzer {
             vocals: vocalRanges.map { $0.0...max($0.0, $0.1) },
             audioAnalysisJSON: (try? JSONSerialization.data(withJSONObject: audio)) ?? Data(),
             flexAnalysisJSON: (try? JSONSerialization.data(withJSONObject: flex)) ?? Data(),
-            waveform: waveform)
+            waveform: waveform,
+            loudness: r.loudness == nil ? nil : Loudness(integrated: integrated, peak: peakLinear))
     }
 
     /// A TransitionPlanner.Song JSON for this analysis with the given genre.

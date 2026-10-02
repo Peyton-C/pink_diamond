@@ -163,8 +163,8 @@ struct TransitionView: View {
         guard let a = library.playableURL(ref.from), let b = library.playableURL(ref.to),
               let aa = library.analyses[ref.from], let ab = library.analyses[ref.to] else { return }
         mixPlayer.pause()   // one thing plays at a time
-        let items = [MixRenderer.Item(audio: a, beats: aa.beats, entering: nil, leaving: plan.outgoing),
-                     MixRenderer.Item(audio: b, beats: ab.beats, entering: plan.incoming, leaving: nil)]
+        let items = [MixRenderer.Item(audio: a, beats: aa.beats, entering: nil, leaving: plan.outgoing, gain: library.gain(ref.from)),
+                     MixRenderer.Item(audio: b, beats: ab.beats, entering: plan.incoming, leaving: nil, gain: library.gain(ref.to))]
         player.renderAndPlay(items, startTime: plan.outgoing.start - Self.margin, tail: Self.margin, offset: -Self.margin)
     }
 
