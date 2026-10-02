@@ -74,7 +74,7 @@ A lane is a list of points, each a position, a `value` and a `curve` (`linear`, 
 An edit belongs to the genres it was made with, as in the app. Changing a song's genre starts its transitions from a fresh plan, and setting the genre back brings the edit back.
 
 ## Blank transitions
-`blank: true` clears the edit's lanes, loops and tail and leaves both songs at full volume for the whole window, with the effects on but at rest. pink diamond draws the tempo match itself from the two beat grids where the sides are now, running from the outgoing song's tempo to the incoming's across the window, and halves or doubles the incoming tempo first when that is closer. Start both sides on a bar so the downbeats meet. The outgoing song stops when the window ends unless it has a tail.
+`blank: true` clears the edit's lanes, loops and tail and leaves both songs at full volume for the whole window, with the effects on but at rest. pink diamond draws the tempo match itself, a bar or so at a time from the two beat grids where the sides are now, so it follows each song's real grid and not its listed BPM. It runs from the outgoing song's tempo to the incoming's across the window, and pairs two beats with one when one song is at about double the other's tempo. Start both sides on a bar so the downbeats meet. Moving a side, changing the length or setting a loop afterwards redraws the match, which replaces a tempo lane drawn by hand. The outgoing song stops when the window ends unless it has a tail.
 
 ## Moves
 `exit` and `entry` build a blank transition and draw one move on each song. Giving only one leaves the other as `cut` or `full`. Lanes drawn afterwards go over the moves.
@@ -94,12 +94,16 @@ An edit belongs to the genres it was made with, as in the app. Changing a song's
 | `filter_in` | A high-pass opens across the window |
 | `drop_in` | Silent until the window ends, then in at full volume |
 
-A transition's `technique` is its moves, or the planner's style, or for one drawn by hand what moves in it. `plan_set` compares techniques to find repeats.
+A transition's `technique` is its moves, or the planner's style, or for one drawn by hand what moves in it. Stems are named by which are taken down on each song and in what order, such as `stems (out -bass -drums; in -vocals)`. `plan_set` compares techniques to find repeats.
 
 ## Tails and loops
 A tail lets the outgoing song play past the window, so a fade can finish or an echo can ring under the new song. Lane offsets past the window reach into the tail, and the song stops when the tail ends, so bring its volume down before then.
 
-A loop repeats a stretch of a song before it carries on, and makes that song's side longer by the repeats. Lane offsets on that song count the repeats, so a filter can keep closing while a bar goes round. Set a loop before drawing lanes over it. The stretch has to lie inside the side, and is measured in whole beats from the nearest beat.
+A loop repeats a stretch of a song before it carries on. The stretch has to lie inside the side, and is measured in whole beats from the nearest beat. Setting a loop switches the transition to pink diamond's own tempo match, as a blank transition has.
+
+An outgoing loop makes the window longer by its repeats, for both songs. Lanes already drawn move with it: on both songs, everything from where the loop starts shifts later, so a fade's last drop or a drop-in at the end of the window is still at the end, and a filter drawn across the window closes across the repeats. Changing the repeats or removing the loop moves them back.
+
+An incoming loop leaves the window as it is and changes what fills it: the incoming song repeats the stretch and gets less far into itself by the end.
 
 ## Stems
 For a stem file, lanes named `stem_drums`, `stem_bass`, `stem_other` and `stem_vocals` set each stem's level from 0 to 1. A stem is at 1 wherever no lane sets it, so bring it back to 1 before the incoming side ends or it jumps back. A song with a stem lane plays as the sum of its stems for the whole song, which is close to the mixdown but not identical; every other song plays its mixdown.

@@ -24,6 +24,7 @@ final class MCPServer {
     private var basePlans: [String: TransitionPlan] = [:]   // Apple's plans, by plan key and variant
     private var edits: [String: TransitionEdit] = [:]       // by plan key
     private var moves: [String: String] = [:]               // the exit and entry moves a transition was built from, by plan key
+    private var matched: Set<String> = []                   // transitions whose tempo match is the server's, by plan key
     /// Whether the server offers what Apple's AutoMix has no counterpart for: stems, loops and outgoing tails. Off,
     /// an agent can do what the app's editor can and no more.
     private let extensions: Bool
@@ -242,6 +243,7 @@ final class MCPServer {
             let (a, b) = try pair(args)
             edits[planKey(a, b)] = nil
             moves[planKey(a, b)] = nil
+            matched.remove(planKey(a, b))
             return try describe(a, b, detail: "summary")
         case "render_transition":
             let (a, b) = try pair(args)
@@ -511,8 +513,19 @@ final class MCPServer {
         if let moves = moves[key] { return moves }
         guard edit.hasChanges, !(edit.outgoing.isEmpty && edit.incoming.isEmpty && !edit.isExtended) else { return plan.styleName }
         // Drawn by hand: named by what moves in it, so two different hand-drawn transitions don't read as a repeat.
-        let parts = plan.effectSummary.filter { $0 != "tempo" }.sorted() + (edit.outgoingLoop != nil || edit.incomingLoop != nil ? ["loop"] : [])
-        return "custom: " + parts.joined(separator: ", ")
+        // Stems are named by which are taken down on each song, in the order they go, since "stems" alone covers a
+        // vocal held over a new beat and a drum swap alike.
+        func stems(_ lanes: [String: [TransitionEdit.Point]]) -> String {
+            lanes.compactMap { id, points -> (String, Double)? in
+                guard TransitionEdit.stemLanes.contains(id), let low = points.first(where: { $0.value < 0.5 }) else { return nil }
+                return ("-" + id.dropFirst(5), low.offset)
+            }.sorted { ($0.1, $0.0) < ($1.1, $1.0) }.map(\.0).joined(separator: " ")
+        }
+        let taken = [("out", stems(edit.outgoing)), ("in", stems(edit.incoming))].filter { !$0.1.isEmpty }.map { "\($0.0) \($0.1)" }
+        let parts = plan.effectSummary.filter { $0 != "tempo" && $0 != "stems" }.sorted()
+            + (taken.isEmpty ? [] : ["stems (" + taken.joined(separator: "; ") + ")"])
+            + (edit.outgoingLoop != nil ? ["outgoing loop"] : []) + (edit.incomingLoop != nil ? ["incoming loop"] : [])
+        return "custom: " + (parts.isEmpty ? "blank" : parts.joined(separator: ", "))
     }
 
     // MARK: Checks
@@ -585,7 +598,7 @@ final class MCPServer {
             if t < l.start - 1e-6 { return [t] }
             if t < l.start + l.length - 1e-6 { return (0...l.repeats).map { t + Double($0) * l.length } }
             return [t + l.extra]
-        }
+        }.sorted()
     }
 
     /// A key's place on the Camelot wheel, where keys that mix sit next to each other: A minor is 8A, each fifth up is
@@ -651,36 +664,76 @@ final class MCPServer {
         [.init(offset: 0, value: v, curve: "linear"), .init(offset: length, value: v, curve: "linear")]
     }
 
-    /// Makes the edit a blank beat-matched transition where its sides are now: both songs at full volume, every lane
-    /// that moves held at rest, and a tempo match drawn from the two beat grids.
+    /// A song's beats as `side` plays them (a loop's come round again), continued a long way past both ends at the
+    /// edge spacing so a side that reaches outside the song still has a grid.
+    private func grid(_ s: Entry, _ side: TransitionSide) -> [Double] {
+        let beats = played(s.analysis.beats, side).sorted()
+        guard beats.count > 1 else { return (0..<2048).map { Double($0) * 60 / Double(max(s.analysis.bpm, 1)) } }
+        let head = beats[1] - beats[0], tail = beats[beats.count - 1] - beats[beats.count - 2]
+        return (1...512).reversed().map { beats[0] - Double($0) * head } + beats + (1...512).map { beats[beats.count - 1] + Double($0) * tail }
+    }
+
+    /// Where time `t` falls on a grid, in beats, and the time of a beat position; both read between beats.
+    private func beat(_ grid: [Double], at t: Double) -> Double {
+        let i = max(0, min(grid.count - 2, (grid.firstIndex { $0 > t } ?? grid.count) - 1))
+        return Double(i) + (t - grid[i]) / (grid[i + 1] - grid[i])
+    }
+
+    private func time(_ grid: [Double], at beat: Double) -> Double {
+        let i = max(0, min(grid.count - 2, Int(beat.rounded(.down))))
+        return grid[i] + (beat - Double(i)) * (grid[i + 1] - grid[i])
+    }
+
+    /// Draws the transition's tempo match from the two beat grids, where its sides are now, and gives the incoming
+    /// side the length that follows. Returns both sides' lengths in song seconds as played, without the tail.
     ///
-    /// The planner's own tempo lanes can't be kept. They are worked out for where it put the sides, so moving a side
-    /// to a part of the song at another tempo, or starting from a style that doesn't beat-match at all, leaves the
-    /// songs apart (Run It Up → Girl Like Me came out about 10% apart). Here both songs follow one tempo that runs
-    /// from the outgoing song's to the incoming's across the window, as Apple's beat-matched styles do, with the
-    /// incoming song's tempo halved or doubled first when that brings it closer. Each side's length follows from
-    /// that, so the incoming side gets its own.
+    /// The planner's own tempo lanes can't be kept once a side moves or loops. They are worked out for where it put
+    /// the sides, so a side moved to a part of the song at another tempo, or a style that doesn't beat-match at all,
+    /// leaves the songs apart (Run It Up → Girl Like Me came out about 10% apart).
+    ///
+    /// The match is made a bar or so at a time, straight from the beats: each step covers the same number of beats
+    /// of both songs, and lasts as long as the outgoing song's would at the start of the window and the incoming
+    /// song's at the end, so each song is at its own tempo where it plays alone. A single tempo for each song, from
+    /// its BPM or the beats around the window, isn't good enough: bad guy is listed at 132 BPM and its grid runs
+    /// near 135, which put it 130 ms out by the end of a window. The incoming song takes two beats to the outgoing
+    /// song's one, or one to its two, when that is the closer fit.
+    @discardableResult
+    private func matchTempo(_ edit: inout TransitionEdit, _ a: Entry, _ b: Entry, _ base: TransitionPlan) -> (out: Double, inc: Double) {
+        let out = base.outgoing.applying(shift: edit.outgoingShift, scale: edit.lengthScale, lanes: [:], loop: edit.outgoingLoop)
+        let start = base.incoming.start + edit.incomingShift
+        let looped = TransitionSide(start: start, end: start, automations: [:], wiring: [:], loop: edit.incomingLoop.map {
+            SongLoop(start: start + $0.start, length: $0.length, repeats: $0.repeats)
+        })
+        let from = grid(a, out), to = grid(b, looped)
+        let first = beat(from, at: out.start), beats = beat(from, at: out.end) - first, entry = beat(to, at: start)
+        let ratio = (time(from, at: first + 1) - out.start) / (time(to, at: entry + 1) - start)
+        let per = ratio > 1.42 ? 2.0 : ratio < 0.705 ? 0.5 : 1.0   // incoming beats to each outgoing beat
+        let steps = max(1, min(16, Int((beats / 4).rounded(.up)))), step = beats / Double(steps)
+        var rates: [[TransitionEdit.Point]] = [[], []]
+        for k in 0..<steps {
+            let o = (time(from, at: first + Double(k) * step), time(from, at: first + Double(k + 1) * step))
+            let i = (time(to, at: entry + per * Double(k) * step), time(to, at: entry + per * Double(k + 1) * step))
+            let along = (Double(k) + 0.5) / Double(steps)
+            let clock = (o.1 - o.0) * (1 - along) + (i.1 - i.0) * along
+            for (n, span, origin) in [(0, o, out.start), (1, i, start)] {
+                let rate = (span.1 - span.0) / clock
+                rates[n] += [.init(offset: span.0 - origin, value: rate, curve: "linear"), .init(offset: span.1 - origin, value: rate, curve: "linear")]
+            }
+        }
+        edit.setLane(true, "ts_rate", rates[0])
+        edit.setLane(false, "ts_rate", rates[1])
+        let inc = time(to, at: entry + per * beats) - start, baseIn = base.incoming.end - base.incoming.start
+        if baseIn > 0 { edit.incomingLengthScale = max(0.01, inc - (edit.incomingLoop?.extra ?? 0)) / baseIn }
+        return (out.end - out.start, inc)
+    }
+
+    /// Makes the edit a blank beat-matched transition where its sides are now: both songs at full volume, every lane
+    /// that moves held at rest, and the server's own tempo match.
     private func blank(_ edit: inout TransitionEdit, _ a: Entry, _ b: Entry, _ base: TransitionPlan) {
         (edit.outgoing, edit.incoming) = ([:], [:])
         (edit.incomingLengthScale, edit.outgoingTail, edit.outgoingLoop, edit.incomingLoop) = (nil, 0, nil, nil)
-        let placed = base.applying(edit)
-        let out = placed.outgoing.end - placed.outgoing.start
-        let from = 1 / beatLength(a, around: placed.outgoing.start + out / 2)
-        var to = 1 / beatLength(b, around: placed.incoming.start + out / 2)
-        while to / from > 1.42 { to /= 2 }
-        while to / from < 0.705 { to *= 2 }
-        let duration = out * 2 * from / (from + to), inc = duration * (from + to) / (2 * to)
-        let baseIn = base.incoming.end - base.incoming.start
-        if baseIn > 0 { edit.incomingLengthScale = inc / baseIn }
-        let steps = 8
+        let (out, inc) = matchTempo(&edit, a, b, base)
         for outgoing in [true, false] {
-            let own = outgoing ? from : to
-            edit.setLane(outgoing, "ts_rate", (0...steps).map { k in
-                let t = duration * Double(k) / Double(steps)
-                // Song time covered by clock time t at the shared tempo, and the rate that plays it at that tempo.
-                return .init(offset: (from * t + (to - from) * t * t / (2 * duration)) / own,
-                             value: (from + (to - from) * t / duration) / own, curve: "linear")
-            })
             let side = outgoing ? base.outgoing : base.incoming, length = outgoing ? out : inc
             for auto in side.automations.values where auto.moves && auto.id != "ts_rate" && auto.id != "bypa" {
                 edit.setLane(outgoing, auto.id, hold(side.neutralValue(auto.id), length))
@@ -689,6 +742,31 @@ final class MCPServer {
             // window for a tail.
             edit.setLane(outgoing, "bypa", hold(0, length))
         }
+    }
+
+    /// Moves a side's lanes to make room for `seconds` of song put in at offset `from`, or with a negative `seconds`
+    /// closes that much up again. The tempo lane is left alone: it is drawn afresh.
+    private func make(room seconds: Double, at from: Double, in lanes: inout [String: [TransitionEdit.Point]]) {
+        for (id, points) in lanes where id != "ts_rate" {
+            lanes[id] = points.map { p in
+                if seconds >= 0 { return p.offset >= from - 1e-6 ? .init(offset: p.offset + seconds, value: p.value, curve: p.curve) : p }
+                if p.offset >= from - seconds - 1e-6 { return .init(offset: p.offset + seconds, value: p.value, curve: p.curve) }
+                return p.offset > from ? .init(offset: from, value: p.value, curve: p.curve) : p
+            }
+        }
+    }
+
+    /// Puts an outgoing loop's repeats into the window, or with `remove` takes them out: the outgoing lanes from
+    /// the loop on move by the repeats, and so do the incoming lanes from the same moment on the mix clock. Room is
+    /// made where the loop starts, not where it ends, so what was drawn over the looped stretch goes with its last
+    /// time round: a fade's final drop or a drop-in at the end of the window is still at the end, and a filter
+    /// drawn across the window closes across the repeats too.
+    private func fit(_ loop: SongLoop, remove: Bool, _ edit: inout TransitionEdit, _ plan: TransitionPlan) {
+        let from = loop.start + 0.01, sign = remove ? -1.0 : 1.0
+        let clock = (plan.outgoing.transitionTime(at: plan.outgoing.start + from), plan.outgoing.transitionTime(at: plan.outgoing.start + from + loop.extra))
+        let inc = (plan.incoming.songTime(atTransitionTime: clock.0), plan.incoming.songTime(atTransitionTime: clock.1))
+        make(room: sign * loop.extra, at: from, in: &edit.outgoing)
+        make(room: sign * (inc.1 - inc.0), at: inc.0 - plan.incoming.start, in: &edit.incoming)
     }
 
     /// Draws an exit or entry move over a blank transition. Offsets are song seconds on that side; `length` is the
@@ -763,6 +841,7 @@ final class MCPServer {
         }
         let base = try basePlan(a, b, variant: edit.variant)
 
+        let was = (edit.outgoingShift, edit.incomingShift, edit.lengthScale)
         // Where the sides are, before how long they are: the length is counted in bars where the side now is.
         if let bars = number(args["outgoing_shift_bars"]) { edit.outgoingShift = shift(a, from: base.outgoing.start, bars: Int(bars)) }
         if let bars = number(args["incoming_shift_bars"]) { edit.incomingShift = shift(b, from: base.incoming.start, bars: Int(bars)) }
@@ -783,10 +862,13 @@ final class MCPServer {
         let exit = args["exit"] as? String, entry = args["entry"] as? String
         if let exit, !Self.exits.contains(where: { $0.0 == exit }) { throw PlannerError("exit must be one of: \(Self.exits.map(\.0).joined(separator: ", "))") }
         if let entry, !Self.entries.contains(where: { $0.0 == entry }) { throw PlannerError("entry must be one of: \(Self.entries.map(\.0).joined(separator: ", "))") }
-        var technique = moves[key]
+        var technique = moves[key], serverTempo = matched.contains(key)
         if args["blank"] as? Bool == true || exit != nil || entry != nil {
             blank(&edit, a, b, base)
             technique = nil
+            serverTempo = true
+        } else if matched.contains(key), was != (edit.outgoingShift, edit.incomingShift, edit.lengthScale) {
+            matchTempo(&edit, a, b, base)   // the sides moved or changed length: the match is for where they were
         }
 
         func refuse(_ what: String) -> PlannerError { PlannerError("\(what) is beyond Apple's AutoMix, and this server is running without extensions") }
@@ -801,10 +883,16 @@ final class MCPServer {
             let name = outgoing ? "outgoing_loop" : "incoming_loop"
             guard let value = args[name] else { continue }
             guard extensions else { throw refuse("a loop") }
-            if value is NSNull {
-                if outgoing { edit.outgoingLoop = nil } else { edit.incomingLoop = nil }
-                continue
+            // A loop needs the server's tempo match: the planner's is drawn for the song played straight through.
+            // An outgoing loop makes the window longer; the old one comes out first, at the window it was put into.
+            if value is NSNull, (outgoing ? edit.outgoingLoop : edit.incomingLoop) == nil { continue }
+            if let old = edit.outgoingLoop, outgoing {
+                fit(old, remove: true, &edit, base.applying(edit))
             }
+            if outgoing { edit.outgoingLoop = nil } else { edit.incomingLoop = nil }
+            matchTempo(&edit, a, b, base)
+            serverTempo = true
+            if value is NSNull { continue }
             guard let l = value as? [String: Any], let start = number(l["start"]), let bars = number(l["bars"]), let repeats = number(l["repeats"]),
                   bars > 0, repeats >= 1 else { throw PlannerError("\(name) needs start, bars above 0 and repeats of 1 or more, or null") }
             let song = outgoing ? a : b
@@ -822,6 +910,8 @@ final class MCPServer {
             }
             let loop = SongLoop(start: start - side.start, length: length, repeats: Int(repeats))
             if outgoing { edit.outgoingLoop = loop } else { edit.incomingLoop = loop }
+            matchTempo(&edit, a, b, base)
+            if outgoing { fit(loop, remove: false, &edit, base.applying(edit)) }
         }
 
         if exit != nil || entry != nil {
@@ -898,6 +988,7 @@ final class MCPServer {
         }
         edits[key] = edit.isEmpty ? nil : edit
         moves[key] = technique
+        if serverTempo { matched.insert(key) }
     }
 
     // MARK: Rendering
