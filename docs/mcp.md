@@ -24,7 +24,7 @@ Add songs first with `add_songs`. Every other tool takes the song ids it returns
 | `list_songs` | Songs added, filtered by words, BPM range, key or genre, a page at a time. A stem file shows where its stems came from. `unique` lists each song once when it is there in several versions, as the one with the best stems |
 | `get_song` | A song's bars, vocal ranges, loudness and Sound Check gain, and its sections. Beats on request, and `bars: false` leaves the bar times out. `stems: true` adds each stem's level per section and bar by bar |
 | `set_song` | A song's key shift in semitones and its gain in dB, kept for the whole time it plays |
-| `set_genre` | Sets the genre of one song, several, or all. Every song starts as Pop |
+| `set_genre` | Sets the genre of one song, several, or all. A song starts with the genre its genre tag names when that is one of Apple's twelve, and as Pop otherwise |
 | `get_transition` | The transition between two songs with edits applied: style, length, each side's start and end, handoff point, automation lanes, and the checks below |
 | `list_variants` | The other plans the planner makes for the pair, as other genres or at lower complexity |
 | `list_parameters` | Every parameter a lane can automate: code, name, range, resting value, and what each value of a note-length or filter-type parameter selects |

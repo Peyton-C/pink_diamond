@@ -167,7 +167,7 @@ final class MCPServer {
             editing["incoming_loop"] = loop("incoming")
         }
         return [
-            tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. The first analysis of a song takes a few seconds; later ones come from the cache. Returns the songs added with their ids, or only how many when there are more than 25: find those with list_songs.",
+            tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. A song's genre comes from its genre tag when that names one of the genres set_genre takes, and is Pop otherwise. The first analysis of a song takes a few seconds; later ones come from the cache. Returns the songs added with their ids, or only how many when there are more than 25: find those with list_songs.",
                  ["paths": ids("Absolute paths")], required: ["paths"]),
             tool("list_songs", "Songs added this session: id, title, artist, genre, BPM, key and length, and for a stem file where its stems came from: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them.",
                  ["query": string("Words that must all appear in the title, artist or path"),
@@ -374,11 +374,14 @@ final class MCPServer {
                 var name = url.deletingPathExtension().lastPathComponent
                 if AudioSource.isStem(url), name.lowercased().hasSuffix(".stem") { name = String(name.dropLast(5)) }
                 var song = Entry(id: String(key.prefix(8)), path: url.path, title: name, artist: "", playable: playable, analysis: analysis)
-                for item in (try? await AVURLAsset(url: url).load(.commonMetadata)) ?? [] {
+                let asset = AVURLAsset(url: url)
+                for item in (try? await asset.load(.commonMetadata)) ?? [] {
                     guard let value = try? await item.load(.stringValue), !value.isEmpty else { continue }
                     if item.commonKey == .commonKeyTitle { song.title = value }
                     if item.commonKey == .commonKeyArtist { song.artist = value }
                 }
+                // As the app's library: only on adding, so a genre set since with set_genre or load_set is kept.
+                if let tagged = await Genre.tagged(in: asset) { song.genre = tagged }
                 songs.append(song)
                 added.append(summary(song))
             } catch {

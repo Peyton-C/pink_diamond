@@ -79,6 +79,19 @@ enum Genre: String, CaseIterable, Codable, Identifiable {
         self = genre
     }
 
+    /// The genre the file's genre tag names, for the app's library and the MCP server alike. The tag has no common key
+    /// (©gen in "1999 [NbMWnSxGd4w].m4a" is absent from commonMetadata), so it is looked up by each container's own
+    /// identifier.
+    static func tagged(in asset: AVAsset) async -> Genre? {
+        guard let all = try? await asset.load(.metadata) else { return nil }
+        let identifiers: [AVMetadataIdentifier] = [.iTunesMetadataUserGenre, .id3MetadataContentType, .quickTimeMetadataGenre, .commonIdentifierType]
+        for item in all {
+            guard let identifier = item.identifier, identifiers.contains(identifier) else { continue }
+            if let tag = try? await item.load(.stringValue) { return Genre(tag: tag) }
+        }
+        return nil
+    }
+
     /// Normalized tag → genre: Apple's own names, then the common spellings that aren't Apple's.
     private static let tagNames: [String: Genre] = {
         var names: [String: Genre] = [

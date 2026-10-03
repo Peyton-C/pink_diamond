@@ -185,25 +185,18 @@ final class Library: ObservableObject {
         guard let song = song(id) else { return }
         let asset = AVURLAsset(url: song.url)
         guard let items = try? await asset.load(.commonMetadata) else { return }
-        var title: String?, artist: String?, album: String?, genreTag: String?
+        var title: String?, artist: String?, album: String?
         for item in items {
             if item.commonKey == .commonKeyTitle { title = try? await item.load(.stringValue) }
             if item.commonKey == .commonKeyArtist { artist = try? await item.load(.stringValue) }
             if item.commonKey == .commonKeyAlbumName { album = try? await item.load(.stringValue) }
         }
-        // The genre tag has no common key (©gen in "1999 [NbMWnSxGd4w].m4a" is absent from commonMetadata), so it is
-        // looked up by each container's own identifier.
-        if genre, let all = try? await asset.load(.metadata) {
-            let identifiers: [AVMetadataIdentifier] = [.iTunesMetadataUserGenre, .id3MetadataContentType, .quickTimeMetadataGenre, .commonIdentifierType]
-            for item in all where genreTag == nil {
-                if let identifier = item.identifier, identifiers.contains(identifier) { genreTag = try? await item.load(.stringValue) }
-            }
-        }
+        let tagged = genre ? await Genre.tagged(in: asset) : nil
         guard let i = songs.firstIndex(where: { $0.id == id }) else { return }
         if let title, !title.isEmpty { songs[i].title = title }
         if let artist { songs[i].artist = artist }
         songs[i].album = album ?? ""
-        if genre, let tagged = genreTag.flatMap(Genre.init(tag:)) { songs[i].genre = tagged }
+        if let tagged { songs[i].genre = tagged }
     }
 
     private nonisolated static func artwork(_ song: Song) async -> NSImage? {
