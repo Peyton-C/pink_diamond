@@ -167,7 +167,7 @@ final class MCPServer {
             editing["incoming_loop"] = loop("incoming")
         }
         return [
-            tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. A song's genre comes from its genre tag when that names one of the genres set_genre takes, and is Pop otherwise. The first analysis of a song takes a few seconds, with several songs analyzed at once; later ones come from the cache. Returns the songs added with their ids, or only how many when there are more than 25: find those with list_songs.",
+            tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. A song's genre comes from its genre tag when that names one of the genres set_genre takes, and is Pop otherwise. The first analysis of a song takes a few seconds; later ones come from the cache, which the app shares, so a library analyzed once is added again in a couple of seconds. Returns the songs added with their ids, or only how many when there are more than 25: find those with list_songs.",
                  ["paths": ids("Absolute paths")], required: ["paths"]),
             tool("list_songs", "Songs added this session: id, title, artist, genre, BPM, key and length, and for a stem file where its stems came from: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them.",
                  ["query": string("Words that must all appear in the title, artist or path"),
@@ -350,27 +350,31 @@ final class MCPServer {
                 failed.append(["path": path, "error": "not an audio file pink diamond reads"])
             }
         }
-        // Side by side, as the app's library analyzes: `Analyzer.workerLimit` songs at a time. A path given twice is
-        // loaded once.
+        // Two passes, as the app's library does it: cached analyses are read 8 at a time, which is only decoding
+        // JSON, then what is left is analyzed `Analyzer.workerLimit` at a time. A path given twice is loaded once.
         var loading: Set<String> = []
         let fresh = files.filter { url in !songs.contains { $0.path == url.path } && loading.insert(url.path).inserted }
-        var loaded: [String: Result<Entry, Error>] = [:]
-        await withTaskGroup(of: (String, Result<Entry, Error>).self) { group in
-            var next = 0
-            func addTask() {
-                guard next < fresh.count else { return }
-                let url = fresh[next]
-                next += 1
-                group.addTask {
-                    do { return (url.path, .success(try await Self.load(url))) } catch { return (url.path, .failure(error)) }
+        var loaded: [String: Result<Entry?, Error>] = [:]
+        func load(_ urls: [URL], atOnce limit: Int, analyze: Bool) async {
+            await withTaskGroup(of: (String, Result<Entry?, Error>).self) { group in
+                var next = 0
+                func addTask() {
+                    guard next < urls.count else { return }
+                    let url = urls[next]
+                    next += 1
+                    group.addTask {
+                        do { return (url.path, .success(try await Self.load(url, analyze: analyze))) } catch { return (url.path, .failure(error)) }
+                    }
+                }
+                for _ in 0..<limit { addTask() }
+                for await (path, result) in group {
+                    loaded[path] = result
+                    addTask()
                 }
             }
-            for _ in 0..<Analyzer.workerLimit { addTask() }
-            for await (path, result) in group {
-                loaded[path] = result
-                addTask()
-            }
         }
+        await load(fresh, atOnce: 8, analyze: false)
+        await load(fresh.filter { if case .success(nil) = loaded[$0.path] { return true } else { return false } }, atOnce: Analyzer.workerLimit, analyze: true)
         // Added in the order the files were given, not the order they finished in, so list_songs and the answer
         // read the same from one run to the next.
         var added: [[String: Any]] = []
@@ -380,12 +384,12 @@ final class MCPServer {
                 continue
             }
             switch loaded[url.path] {
-            case .success(let song):
+            case .success(let song?):
                 songs.append(song)
                 added.append(summary(song))
             case .failure(let error):
                 failed.append(["path": url.path, "error": String(describing: error)])
-            case nil:
+            default:
                 break
             }
         }
@@ -394,9 +398,10 @@ final class MCPServer {
         return ["added": added.count, "songs": added, "failed": failed]
     }
 
-    /// One file as a song: its mixdown, its analysis from the cache or made now, and its tags. Static and touching
-    /// none of the server's state, so `add` can run several at once.
-    private static func load(_ url: URL) async throws -> Entry {
+    /// One file as a song: its mixdown, its analysis from the cache or made now, and its tags. Nil when the analysis
+    /// isn't cached and `analyze` is off. Static and touching none of the server's state, so `add` can run several
+    /// at once.
+    private static func load(_ url: URL, analyze: Bool) async throws -> Entry? {
         let key = fileKey(url)
         let playable = try await AudioSource.playableURL(for: url)
         // The app's analysis cache, by the same key and under the same catalog ID, so a song analyzed by
@@ -408,6 +413,7 @@ final class MCPServer {
             // As `Library.readAnalysis`: analyses cached before Sound Check hold their loudness only in the Apple-format JSON.
             if analysis.loudness == nil { analysis.loudness = Loudness(audioAnalysis: analysis.audioAnalysisJSON) }
         } else {
+            guard analyze else { return nil }
             analysis = try await Analyzer.analyze(playable: playable, id: "99" + String(key.prefix(8)))
             try? JSONEncoder().encode(analysis).write(to: cache)
         }

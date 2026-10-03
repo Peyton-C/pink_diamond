@@ -112,10 +112,11 @@ enum Analyzer {
                                  "f": "F", "fSharp": "F#", "gFlat": "F#", "g": "G", "gSharp": "Ab", "aFlat": "Ab", "a": "A",
                                  "aSharp": "Bb", "bFlat": "Bb", "b": "B"]
 
-    /// Songs analyzed at once, by the app's library and the MCP server alike. One analysis holds a single core at 100%
-    /// and leaves the GPU and Neural Engine idle, so songs run side by side: half the cores, which leaves the rest for
-    /// the UI and playback, and at most 8, since each song in flight holds its whole decoded audio (100 to 200 MB).
-    static let workerLimit = min(8, max(2, ProcessInfo.processInfo.activeProcessorCount / 2))
+    /// Songs analyzed at once, by the app's library and the MCP server alike. Two, because analyses share something
+    /// under MusicUnderstanding that more of them only contend for: 14 uncached songs on a 14-core M4 Pro took 48 s
+    /// one at a time, 31 s at two, and 28 s at three and at seven, while the CPU spent went from 70 s to 94, 156 and
+    /// 183 s. Seven at once held 12 cores for the wall time of two.
+    static let workerLimit = 2
 
     static func analyze(playable url: URL, id: String) async throws -> SongAnalysis {
         let asset = AVURLAsset(url: url)
