@@ -76,14 +76,20 @@ final class MCPServer {
         case "tools/list":
             result = ["tools": tools]
         case "tools/call":
-            let name = params["name"] as? String ?? ""
+            let name = params["name"] as? String ?? "", started = Date()
+            var text: String, failed = false
             do {
                 let value = try await call(name, params["arguments"] as? [String: Any] ?? [:])
                 let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
-                result = ["content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]], "isError": false]
+                text = String(decoding: data, as: UTF8.self)
             } catch {
-                result = ["content": [["type": "text", "text": String(describing: error)]], "isError": true]
+                (text, failed) = (String(describing: error), true)
             }
+            result = ["content": [["type": "text", "text": text]], "isError": failed]
+            // A reply stays in the agent's context and is read again on every later call, so what a session costs
+            // is which tools it called and how much each sent back. Clients log that a call happened and no more
+            // (Claude desktop's log has the time and the request id), so the server says it on stderr, which they keep.
+            FileHandle.standardError.write(Data("call \(name): \(text.utf8.count) bytes\(failed ? ", failed" : ""), \(Int(Date().timeIntervalSince(started) * 1000)) ms\n".utf8))
         default:
             return ["jsonrpc": "2.0", "id": id, "error": ["code": -32601, "message": "unknown method \(method)"]]
         }
@@ -94,6 +100,9 @@ final class MCPServer {
 
     private static let curves = ["linear", "easedIn", "easedOut", "easedInOut"]
 
+    /// Every session pays for these descriptions before it makes a call, so they say what a field is and leave the
+    /// how to docs/mcp.md. A genre is spelled out once, in set_genre, and the incoming song's fields point at the
+    /// outgoing song's; the server checks what it is given either way.
     private static func tools(extensions: Bool) -> [[String: Any]] {
         func tool(_ name: String, _ description: String, _ properties: [String: Any] = [:], required: [String] = []) -> [String: Any] {
             ["name": name, "description": description,
@@ -103,27 +112,26 @@ final class MCPServer {
         let number = { (d: String) -> [String: Any] in ["type": "number", "description": d] }
         let integer = { (d: String) -> [String: Any] in ["type": "integer", "description": d] }
         let genre: [String: Any] = ["type": "string", "enum": Genre.allCases.map(\.rawValue)]
-        let from = string("Song id of the outgoing song"), to = string("Song id of the incoming song")
+        let from = string("Outgoing song id"), to = string("Incoming song id")
         let variant: [String: Any] = [
             "type": ["object", "null"],
-            "description": "Plan as if the songs had these genres, or under a lower complexity ceiling. Use an entry from list_variants. null goes back to Apple's own plan",
-            "properties": ["from_genre": genre, "to_genre": genre,
+            "description": "An entry from list_variants: the plan as if the songs had these genres, or under a lower complexity ceiling. null goes back to Apple's own plan",
+            "properties": ["from_genre": ["type": "string"], "to_genre": ["type": "string"],
                            "complexity": ["type": "string", "enum": PlanVariant.Complexity.allCases.map(\.rawValue)] as [String: Any]],
         ]
-        let lanes = { (side: String) -> [String: Any] in
-            ["type": "object",
-             "description": "Automation lanes to replace or add on the \(side) song, by parameter code. Each is a list of points. Place a point with `at`, seconds since the transition started on the mix clock, which is the same for both songs, or with `offset`, song seconds from the start of that song's side. null puts a lane back as planned. Set these in the same call as length_bars or after it, since changing the length stretches them",
-             "additionalProperties": [
+        let lanes: [String: Any] = [
+            "type": "object",
+            "description": "Automation lanes to set on the outgoing song, by parameter code from list_parameters. Each is a list of points, placed with `at` (seconds into the transition on the mix clock, the same for both songs) or `offset` (song seconds from the start of the side). null puts a lane back as planned. Changing the length stretches lanes already set",
+            "additionalProperties": [
                 "type": ["array", "null"],
                 "items": ["type": "object",
                           "properties": ["at": ["type": "number"], "offset": ["type": "number"], "value": ["type": "number"],
                                          "curve": ["type": "string", "enum": curves] as [String: Any]],
                           "required": ["value"]] as [String: Any],
-             ] as [String: Any]]
-        }
+            ] as [String: Any]]
         let effects: [String: Any] = [
             "type": "array",
-            "description": "Effects to add as a sweep across one side: in on the outgoing song, out on the incoming. get_transition lists the ones each side can take",
+            "description": "Effects to add as a sweep across one side. get_transition with detail all lists the ones each side can take",
             "items": ["type": "object",
                       "properties": ["side": ["type": "string", "enum": ["outgoing", "incoming"]] as [String: Any],
                                      "effect": ["type": "string", "enum": EffectPreset.all.map(\.id)] as [String: Any]],
@@ -133,94 +141,96 @@ final class MCPServer {
         let ids = { (d: String) -> [String: Any] in ["type": "array", "items": ["type": "string"], "description": d] }
         let detail = { (standard: String) -> [String: Any] in
             ["type": "string", "enum": ["summary", "moving", "all"],
-             "description": "How much to return: summary leaves the lanes out, moving has the lanes that change, all has every lane and the effects each side can take. Defaults to \(standard)"]
+             "description": "summary leaves the lanes out, moving has the lanes that change, all has every lane and the effects each side can take. A point shown without a curve is linear. Defaults to \(standard)"]
         }
-        let soundCheck = bool("Play every song at the same loudness, as the app does with Sound Check on. Defaults to true")
-        let loop = { (song: String) -> [String: Any] in
-            ["type": ["object", "null"],
-             "description": "Repeat a stretch of the \(song) song inside its side of the transition, then carry on. The side gets longer by the repeats, and lane offsets on that song count them, so a filter can keep moving across the repeats. Set it before the lanes, or in the same call. null removes it",
-             "properties": ["start": number("Song seconds where the stretch starts. Use a bar or beat time"),
-                            "bars": number("Its length in bars; 0.25 is one beat"),
-                            "repeats": integer("Times it plays again after the first")],
-             "required": ["start", "bars", "repeats"]]
-        }
+        let soundCheck = bool("Play every song at the same loudness. Defaults to true")
+        let moves = { (list: [(String, String)]) in list.map { "\($0.0) (\($0.1))" }.joined(separator: "; ") }
+        let leaving = exits.filter { extensions || $0.tail == 0 }.map { ($0.0, $0.1) }
         var editing: [String: Any] = ["from": from, "to": to, "variant": variant, "detail": detail("summary"),
-                  "style": string("Use the plan with this style name, from list_variants. Only styles the planner makes for this pair can be chosen"),
-                  "blank": bool("Start from a blank beat-matched transition: both songs at full volume for the whole window, tempo-matched afresh from their beat grids where the sides are now, every other lane held at rest, and any lanes set before dropped. The outgoing song stops when the window ends. Start both sides on a bar so the downbeats meet. Draw your own lanes over it, in the same call or later"),
-                  "exit": ["type": "string", "enum": exits.filter { extensions || $0.tail == 0 }.map(\.0),
-                           "description": "How the outgoing song leaves, built on a blank transition: " + exits.filter { extensions || $0.tail == 0 }.map { "\($0.0) (\($0.1))" }.joined(separator: "; ")] as [String: Any],
+                  "style": string("Use the plan with this style name, from list_variants"),
+                  "blank": bool("Start from a blank beat-matched transition: both songs at full volume for the whole window, every lane at rest, and lanes set before dropped. Start both sides on a bar so the downbeats meet"),
+                  "exit": ["type": "string", "enum": leaving.map(\.0),
+                           "description": "How the outgoing song leaves, built on a blank transition: " + moves(leaving)] as [String: Any],
                   "entry": ["type": "string", "enum": entries.map(\.0),
-                            "description": "How the incoming song arrives, built on a blank transition: " + entries.map { "\($0.0) (\($0.1))" }.joined(separator: "; ")] as [String: Any],
-                  "outgoing_start": number("Song seconds where the outgoing song's side starts. Use a bar time from get_song to stay on the grid"),
-                  "incoming_start": number("Song seconds where the incoming song's side starts"),
-                  "length_bars": number("The transition's length in the outgoing song's bars, where its side is now. Both songs stretch together and stay beat-matched"),
+                            "description": "How the incoming song arrives, built on a blank transition: " + moves(entries)] as [String: Any],
+                  "outgoing_start": number("Song seconds where the outgoing song's side starts. Use a bar time from get_song"),
+                  "incoming_start": number("The same for the incoming song"),
+                  "length_bars": number("The transition's length in the outgoing song's bars. Both songs stretch together and stay beat-matched"),
                   "outgoing_shift_bars": integer("Bars to move the outgoing song's side from where Apple planned it. Positive is later in the song"),
-                  "incoming_shift_bars": integer("Bars to move the incoming song's side from where Apple planned it. Positive is later in the song"),
-                  "outgoing_shift_seconds": number("The same move in song seconds, for moves off the bar grid"),
-                  "incoming_shift_seconds": number("The same move in song seconds, for moves off the bar grid"),
-                  "outgoing_lanes": lanes("outgoing"), "incoming_lanes": lanes("incoming"), "add_effects": effects]
+                  "incoming_shift_bars": integer("The same for the incoming song"),
+                  "outgoing_shift_seconds": number("The same move in song seconds, off the bar grid"),
+                  "incoming_shift_seconds": number("The same for the incoming song"),
+                  "outgoing_lanes": lanes,
+                  "incoming_lanes": ["type": "object", "description": "The same as outgoing_lanes, for the incoming song"] as [String: Any],
+                  "add_effects": effects]
         let out = string("Where to write the WAV, as a full path")
-        let named = string("A name for the WAV, which goes in the renders folder (~/Music/pink diamond unless the server was started with another). Without a name or a path it goes in the cache under a random name")
+        let named = string("A name for the WAV, which goes in the renders folder. Without a name or a path it goes in the cache")
         if extensions {
-            editing["outgoing_tail_bars"] = number("Bars the outgoing song plays on after the window ends, with its lanes carrying on, so an echo can ring out or a fade can finish under the new song. Lane offsets past the window reach into it. 0 removes it")
-            editing["outgoing_loop"] = loop("outgoing")
-            editing["incoming_loop"] = loop("incoming")
+            editing["outgoing_tail_bars"] = number("Bars the outgoing song plays on after the window ends, with its lanes carrying on, so an echo can ring out. 0 removes it")
+            editing["outgoing_loop"] = [
+                "type": ["object", "null"],
+                "description": "Repeat a stretch of the outgoing song inside its side, then carry on. The side gets longer by the repeats, and lane offsets count them. null removes it",
+                "properties": ["start": number("Song seconds where the stretch starts, on a bar or beat"),
+                               "bars": number("Its length in bars; 0.25 is one beat"),
+                               "repeats": integer("Times it plays again after the first")],
+                "required": ["start", "bars", "repeats"]] as [String: Any]
+            editing["incoming_loop"] = ["type": ["object", "null"], "description": "The same as outgoing_loop, for the incoming song"] as [String: Any]
         }
         return [
-            tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. A song's genre comes from its genre tag when that names one of the genres set_genre takes, and is Pop otherwise. The first analysis of a song takes a few seconds; later ones come from the cache, which the app shares, so a library analyzed once is added again in a couple of seconds. Returns the songs added with their ids, or only how many when there are more than 25: find those with list_songs.",
+            tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. The first analysis of a song takes a few seconds; later ones come from the cache. Returns the songs added with their ids, or only how many when there are more than 25: find those with list_songs.",
                  ["paths": ids("Absolute paths")], required: ["paths"]),
-            tool("list_songs", "Songs added this session: id, title, artist, genre, BPM, key and length, and for a stem file where its stems came from: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them.",
+            tool("list_songs", "Search the songs added this session: id, title, artist, BPM, key, length in seconds, genre when it is not Pop, and for a stem file where its stems came from when the title doesn't end with it: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them, so filter rather than page through everything.",
                  ["query": string("Words that must all appear in the title, artist or path"),
                   "bpm_min": number("Lowest BPM"), "bpm_max": number("Highest BPM"),
-                  "key": string("A key as list_songs shows it, such as G minor"), "genre": genre,
-                  "unique": bool("One version of each song: songs whose artist and title match apart from a bracketed tag at the end, such as (Official), are listed once, as the version with the best stems"),
-                  "limit": integer("Most songs to return. Defaults to 50"), "offset": integer("Songs to skip, to page through a long list")]),
-            tool("get_song", "A song's analysis: bars and vocal ranges in song seconds, its loudness, and its sections, each with its length in bars, how loud it is against the whole song, and how much of it has vocals. Sections have no names: Apple's analysis finds where they start, not which is a chorus.",
-                 ["song": string("Song id"), "beats": bool("Include every beat time"),
+                  "key": string("A key as list_songs shows it, such as G minor"), "genre": string("A genre set_genre takes"),
+                  "unique": bool("List a song that is there in several versions once, as the version with the best stems. Defaults to true"),
+                  "limit": integer("Most songs to return. Defaults to 50, and 100 at most"), "offset": integer("Songs to skip, to page through a long list")]),
+            tool("get_song", "A song's analysis: bars and vocal ranges in song seconds, its loudness, and its sections, each with its length in bars, how loud it is against the whole song, and how much of it has vocals. Sections have no names.",
+                 ["song": string("Song id"), "songs": ids("Song ids, to get several in one call as a list"), "beats": bool("Include every beat time"),
                   "bars": bool("Include every bar time. Defaults to true; turn it off when scanning many songs"),
-                  "stems": bool("For a stem file, include how loud each stem is: per section in dB, and bar by bar as a row of digits, one per bar, where 0 is silent, each step up is 6 dB and 9 is -6 dB or louder. The first time takes a few seconds")], required: ["song"]),
+                  "stems": bool("For a stem file, include how loud each stem is: per section in dB, and bar by bar as a row of digits, where 0 is silent, each step up is 6 dB and 9 is -6 dB or louder")]),
             tool("set_genre", "Set the genre of one song, several, or all. Genres decide which transition styles Apple's planner can pick, and an edit belongs to the genres it was made with.",
                  ["song": string("Song id"), "songs": ids("Song ids"), "all": bool("Every song added"), "genre": genre], required: ["genre"]),
-            tool("get_transition", "The planned transition between two songs with any edits applied: style, length, where each song's side starts and ends in song seconds, the handoff point, the automation lanes, and checks made on the plan without rendering: how far apart the two songs' beats and bars land, whether the keys go together, how long both have vocals at once (whatever their volume), the predicted level in LUFS before, through and after the transition with any sag below the quieter of the songs either side (volume and stem levels count, filters and effects don't), and for two stem files how long the mix has no drums, no bass, two basses or two vocals.",
+            tool("get_transition", "The planned transition between two songs with any edits applied: style, length, where each side starts and ends in song seconds, the handoff point, the automation lanes, and checks made without rendering: how far apart the beats and bars land, whether the keys go together, how long both songs have vocals at once, the predicted level in LUFS with any sag, and for two stem files how long the mix has no drums, no bass, two basses or two vocals.",
                  ["from": from, "to": to, "detail": detail("moving")], required: ["from", "to"]),
-            tool("list_variants", "The other plans Apple's planner makes for the pair: as other genres, or with lower complexity. Takes about a second.",
+            tool("list_variants", "The other plans Apple's planner makes for the pair: as other genres, or with lower complexity.",
                  ["from": from, "to": to], required: ["from", "to"]),
-            tool("list_parameters", "Every parameter of the transition's effect graph that a lane can automate: code, name, range, the value it rests at, and what each value means for the ones that pick a note length or filter type.",
+            tool("list_parameters", "Every parameter of the transition's effect graph that a lane can automate: code, name, range, the value it rests at, and what each value of a stepped one means.",
                  ["from": from, "to": to], required: ["from", "to"]),
-            tool("edit_transition", "Change a transition. Only the fields given change; the rest of the edit is kept. Returns the transition as get_transition does." + (extensions ? " For songs that are stem files, lanes named stem_drums, stem_bass, stem_other and stem_vocals set each stem's level from 0 to 2, where 1 is as recorded and above it lifts a quiet stem; a stem is at 1 wherever no lane sets it, so bring it back to 1 before the incoming side ends." : ""),
+            tool("edit_transition", "Change a transition. Only the fields given change; the rest of the edit is kept. Returns the transition as get_transition does." + (extensions ? " For stem files, lanes named stem_drums, stem_bass, stem_other and stem_vocals set each stem's level from 0 to 2, where 1 is as recorded; bring a stem back to 1 before the incoming side ends." : ""),
                  editing, required: ["from", "to"]),
             tool("reset_transition", "Drop every edit to a transition and go back to Apple's plan.", ["from": from, "to": to], required: ["from", "to"]),
-            tool("render_transition", "Render one transition to a WAV, with some of each song either side of it. Returns the level of the result second by second and its peak, in dB below full scale, and how many samples sit at full scale. The renderer ends in a limiter, so two songs at full volume are held under full scale rather than clipped, at the cost of pumping when it works hard.",
+            tool("render_transition", "Render one transition to a WAV, with some of each song either side of it. Returns the level of the result second by second and its peak, in dB below full scale, and how many samples sit at full scale. The renderer ends in a limiter, which pumps when it works hard.",
                  ["from": from, "to": to, "name": named, "out": out, "margin": number("Seconds of each song around the transition. Defaults to 15"), "sound_check": soundCheck], required: ["from", "to"]),
-            tool("plan_set", "The timeline of playing songs in order, without rendering: where each transition starts in the mix, its technique and length, its predicted level (see get_transition), which part of each song plays and for how long, the total length, and any run of three or more transitions in a row that use the same technique.",
+            tool("plan_set", "The timeline of playing songs in order, without rendering: where each transition starts in the mix, its technique and length, the checks get_transition makes, which part of each song plays, the total length, and any run of three or more transitions in a row that use the same technique.",
                  ["songs": ids("Song ids in playing order")], required: ["songs"]),
-            tool("render_set", "Render songs in order, with every transition, to one WAV. Returns the same timeline as plan_set, with the level each second from 4 seconds before each transition to 4 seconds after it. A transition that can't be planned becomes a straight cut.",
+            tool("render_set", "Render songs in order, with every transition, to one WAV. Returns the same timeline as plan_set, with the level each second around each transition. A transition that can't be planned becomes a straight cut.",
                  ["songs": ids("Song ids in playing order"), "name": named, "out": out, "sound_check": soundCheck], required: ["songs"]),
-            tool("save_set", "Save songs and every edited transition between them to a file, to carry on after a restart: the songs in order with their genres and settings, and each transition's edit. Saving under a name that exists replaces it.",
+            tool("save_set", "Save songs, their genres and settings, and every edited transition between them, to carry on after a restart. Saving under a name that exists replaces it.",
                  ["name": string("A name for the set"), "songs": ids("Song ids in playing order. Left out, every song added this session")], required: ["name"]),
-            tool("load_set", "Load a saved set: adds its songs, puts back their genres and settings and every saved transition edit, and returns the song ids in order. Edits made since on the same transitions are replaced.",
+            tool("load_set", "Load a saved set: adds its songs, puts back their genres, settings and transition edits, and returns the song ids in order.",
                  ["name": string("The set's name, from list_sets")], required: ["name"]),
             tool("list_sets", "The saved sets, newest first."),
         ] + (!extensions ? [] : [
-            tool("set_song", "Settings a song keeps for the whole time it plays. key_shift moves its key by semitones without changing its tempo, to make two songs' keys go together; a couple of semitones is clean, more starts to sound processed. gain_db makes it louder or quieter on top of Sound Check, for a quiet song or version.",
+            tool("set_song", "Settings a song keeps for the whole time it plays. key_shift moves its key by semitones without changing its tempo; a couple of semitones is clean, more starts to sound processed. gain_db makes it louder or quieter on top of Sound Check.",
                  ["song": string("Song id"), "songs": ids("Song ids"),
-                  "key_shift": integer("Semitones, -6 to 6. 0 is the song's own key"), "gain_db": number("dB, -12 to 12. 0 is Sound Check's level")]),
+                  "key_shift": integer("Semitones, -6 to 6"), "gain_db": number("dB, -12 to 12")]),
         ])
     }
 
     /// The moves a transition can be put together from, with what each does. `tails` is in bars.
     private static let exits: [(String, String, tail: Double)] = [
-        ("cut", "plays at full volume and stops when the window ends", 0),
-        ("fade", "fades out across the window", 0),
-        ("filter_fade", "a low-pass closes across the window, then it stops", 0),
-        ("filter_rise", "a high-pass thins it out across the window, then it stops", 0),
-        ("echo_out", "plays to the end of the window, then the song stops and its last beat echoes away over 2 more bars", 2),
+        ("cut", "stops when the window ends", 0),
+        ("fade", "fades out", 0),
+        ("filter_fade", "a low-pass closes", 0),
+        ("filter_rise", "a high-pass thins it out", 0),
+        ("echo_out", "stops at the end and its last beat echoes over 2 more bars", 2),
     ]
     private static let entries: [(String, String)] = [
-        ("full", "plays at full volume from the start of the window"),
-        ("fade_in", "fades in across the window"),
-        ("filter_in", "a high-pass opens across the window"),
-        ("drop_in", "silent until the window ends, then in at full volume"),
+        ("full", "full volume throughout"),
+        ("fade_in", "fades in"),
+        ("filter_in", "a high-pass opens"),
+        ("drop_in", "silent, then in at full volume when the window ends"),
     ]
 
     private func call(_ name: String, _ args: [String: Any]) async throws -> Any {
@@ -231,26 +241,14 @@ final class MCPServer {
         case "list_songs":
             return list(args)
         case "get_song":
-            let song = try entry(args["song"])
-            var detail = songDetail(song, beats: args["beats"] as? Bool ?? false, bars: args["bars"] as? Bool ?? true)
-            if args["stems"] as? Bool == true {
-                guard stemSource(song) != nil else { throw PlannerError("\(song.title) is not a stem file") }
-                let levels = try await levels(ofStems: song), bars = song.analysis.bars
-                detail["stem_bars"] = Dictionary(uniqueKeysWithValues: AudioSource.stemNames.enumerated().map { k, name in
-                    (name, zip(bars, bars.dropFirst() + [song.analysis.duration]).map { lo, hi in
-                        String(max(0, min(9, Int(((level(levels[k], song, from: lo, to: hi) + 60) / 6).rounded()))))
-                    }.joined())
-                })
-                detail["sections"] = (detail["sections"] as? [[String: Any]] ?? []).map { section -> [String: Any] in
-                    guard let lo = (section["start"] as? NSNumber)?.doubleValue, let hi = (section["end"] as? NSNumber)?.doubleValue else { return section }
-                    var section = section
-                    section["stems_db"] = Dictionary(uniqueKeysWithValues: AudioSource.stemNames.enumerated().map { k, name in
-                        (name, NSDecimalNumber(string: String(format: "%.0f", level(levels[k], song, from: lo, to: hi))))
-                    })
-                    return section
-                }
+            // Several at once, so looking over the songs of a set is one call and not one for each.
+            guard let ids = args["songs"] as? [String] else {
+                guard args["song"] != nil else { throw PlannerError("give song or songs") }
+                return try await songDetail(try entry(args["song"]), args)
             }
-            return detail
+            var details: [[String: Any]] = []
+            for id in ids { details.append(try await songDetail(try entry(id), args)) }
+            return details
         case "set_genre":
             guard let genre = (args["genre"] as? String).flatMap(Genre.init(rawValue:)) else {
                 throw PlannerError("genre must be one of: \(Genre.allCases.map(\.rawValue).joined(separator: ", "))")
@@ -288,6 +286,13 @@ final class MCPServer {
         case "plan_set", "render_set":
             guard let ids = args["songs"] as? [String], !ids.isEmpty else { throw PlannerError("songs must be a list of song ids") }
             let list = try ids.map { try entry($0) }
+            // As `describe`: the stem checks need both songs' stem levels.
+            if extensions {
+                for (a, b) in zip(list, list.dropFirst()) where stemSource(a) != nil && stemSource(b) != nil {
+                    _ = try? await levels(ofStems: a)
+                    _ = try? await levels(ofStems: b)
+                }
+            }
             if name == "plan_set" { return timeline(list).json }
             return try await renderSet(list, out: try outputURL(args), soundCheck: args["sound_check"] as? Bool ?? true)
         case "set_song":
@@ -440,6 +445,17 @@ final class MCPServer {
         return json
     }
 
+    /// A song as list_songs shows it. A row is repeated for every song listed, so it leaves out what the rest of
+    /// it already says: Pop, which is what a song is unless it was set otherwise, and the stem source when the
+    /// title ends with it. 593 songs came to about 30,000 tokens as full summaries.
+    private func row(_ s: Entry) -> [String: Any] {
+        var json = summary(s)
+        json["duration"] = Int(s.analysis.duration.rounded())
+        if s.genre == .pop { json["genre"] = nil }
+        if let source = stemSource(s), s.title.hasSuffix("(\(source.name))") { json["stems"] = nil }
+        return json
+    }
+
     private static let tonics = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 
     /// The key the song plays in, which its key shift moves.
@@ -471,7 +487,7 @@ final class MCPServer {
             return words.allSatisfy { text.contains($0) } && Double(s.analysis.bpm) >= low && Double(s.analysis.bpm) <= high
                 && (key == nil || self.key(s).lowercased() == key) && (genre == nil || s.genre.rawValue == genre)
         }
-        if args["unique"] as? Bool == true {
+        if args["unique"] as? Bool ?? true {
             // The version with the best stems stands for the song; a file with no stems comes last.
             var best: [String: Entry] = [:], order: [String] = []
             let rank = { (s: Entry) in self.stemSource(s)?.rank ?? Self.stemSources.count }
@@ -482,8 +498,30 @@ final class MCPServer {
             }
             matches = order.compactMap { best[$0] }
         }
-        let offset = max(0, Int(number(args["offset"]) ?? 0)), limit = max(1, Int(number(args["limit"]) ?? 50))
-        return ["total": matches.count, "songs": matches.dropFirst(offset).prefix(limit).map(summary)]
+        // Capped, so the whole library can't be asked for in one call: an agent is meant to search it.
+        let offset = max(0, Int(number(args["offset"]) ?? 0)), limit = max(1, min(100, Int(number(args["limit"]) ?? 50)))
+        return ["total": matches.count, "songs": matches.dropFirst(offset).prefix(limit).map(row)]
+    }
+
+    private func songDetail(_ song: Entry, _ args: [String: Any]) async throws -> [String: Any] {
+        var detail = songDetail(song, beats: args["beats"] as? Bool ?? false, bars: args["bars"] as? Bool ?? true)
+        guard args["stems"] as? Bool == true else { return detail }
+        guard stemSource(song) != nil else { throw PlannerError("\(song.title) is not a stem file") }
+        let levels = try await levels(ofStems: song), bars = song.analysis.bars
+        detail["stem_bars"] = Dictionary(uniqueKeysWithValues: AudioSource.stemNames.enumerated().map { k, name in
+            (name, zip(bars, bars.dropFirst() + [song.analysis.duration]).map { lo, hi in
+                String(max(0, min(9, Int(((level(levels[k], song, from: lo, to: hi) + 60) / 6).rounded()))))
+            }.joined())
+        })
+        detail["sections"] = (detail["sections"] as? [[String: Any]] ?? []).map { section -> [String: Any] in
+            guard let lo = (section["start"] as? NSNumber)?.doubleValue, let hi = (section["end"] as? NSNumber)?.doubleValue else { return section }
+            var section = section
+            section["stems_db"] = Dictionary(uniqueKeysWithValues: AudioSource.stemNames.enumerated().map { k, name in
+                (name, NSDecimalNumber(string: String(format: "%.0f", level(levels[k], song, from: lo, to: hi))))
+            })
+            return section
+        }
+        return detail
     }
 
     private func songDetail(_ s: Entry, beats: Bool, bars: Bool) -> [String: Any] {
@@ -599,10 +637,15 @@ final class MCPServer {
             // The song's bars inside the window on the mix clock, so points on either song can be put on the same bar.
             json["bars_at"] = played(song.analysis.bars, s).filter { $0 >= s.start - 0.01 && $0 <= s.end + 0.01 }.map { r(s.transitionTime(at: $0)) }
             json["lanes"] = s.automations.values.filter { detail == "all" || $0.moves }.sorted { $0.id < $1.id }.map { auto -> [String: Any] in
-                var lane: [String: Any] = ["id": auto.id, "name": EffectCatalog.name(auto.id), "points": s.editPoints(auto.id).map {
-                    ["at": r(s.transitionTime(at: s.start + $0.offset)), "offset": r($0.offset), "value": r($0.value), "curve": $0.curve]
+                // Lanes are most of a transition's reply, and an agent reads it again after every edit, so a point
+                // leaves out the curve when it is linear, which is what a point given without one gets, and a lane
+                // leaves out its range, which list_parameters has. That took the lanes of a planned transition
+                // from about 2,500 characters to 1,800.
+                var lane: [String: Any] = ["id": auto.id, "name": EffectCatalog.name(auto.id), "points": s.editPoints(auto.id).map { p -> [String: Any] in
+                    var point: [String: Any] = ["at": r(s.transitionTime(at: s.start + p.offset)), "offset": r(p.offset), "value": r(p.value)]
+                    if p.curve != "linear" { point["curve"] = p.curve }
+                    return point
                 }]
-                if let range = range(s, auto.id) { lane["range"] = [r(range.lowerBound), r(range.upperBound)] }
                 if detail == "all" { lane["moves"] = auto.moves }
                 return lane
             }
@@ -1387,9 +1430,8 @@ final class MCPServer {
                 transitions.append(["from": a.id, "to": b.id, "technique": technique, "starts_at": r(clock), "duration": r(plan.duration),
                                     "length_bars": r((plan.outgoing.end - (edits[planKey(a, b)]?.outgoingTail ?? 0) - plan.outgoing.start) / barLength(a, plan.outgoing))])
                 techniques.append(technique)
-                let heard = heard(a, b, plan)
-                if let level = heard["level"] { transitions[transitions.count - 1]["level"] = level }
-                if let stems = heard["stems"] { transitions[transitions.count - 1]["stems"] = stems }
+                // Every check, so the transitions that need work can be picked out here without asking for each.
+                transitions[transitions.count - 1]["checks"] = checks(a, b, plan)
                 (enteredAt, enteredFrom) = (clock, plan.incoming.start)
                 // The clock moves on by the incoming side's length on it, which is when that song is on its own.
                 clock += plan.incoming.transitionTime(at: plan.incoming.end)

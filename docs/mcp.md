@@ -21,8 +21,8 @@ Add songs first with `add_songs`. Every other tool takes the song ids it returns
 | Tool | What |
 | --- | --- |
 | `add_songs` | Adds audio files, stem files or folders and analyzes them. A song's first analysis takes several seconds, so add a large uncached folder in parts if the client times out. Later adds read the cache, and a library of 600 songs takes a couple of seconds. Past 25 songs it returns a count, not the list |
-| `list_songs` | Songs added, filtered by words, BPM range, key or genre, a page at a time. A stem file shows where its stems came from. `unique` lists each song once when it is there in several versions, as the one with the best stems |
-| `get_song` | A song's bars, vocal ranges, loudness and Sound Check gain, and its sections. Beats on request, and `bars: false` leaves the bar times out. `stems: true` adds each stem's level per section and bar by bar |
+| `list_songs` | Songs added, filtered by words, BPM range, key or genre, at most 100 at a time. A row leaves out the genre when it is Pop, and a stem file's source when the title ends with it. A song there in several versions is listed once, as the one with the best stems; `unique: false` lists them all |
+| `get_song` | Takes one song, or several as `songs`. A song's bars, vocal ranges, loudness and Sound Check gain, and its sections. Beats on request, and `bars: false` leaves the bar times out. `stems: true` adds each stem's level per section and bar by bar |
 | `set_song` | A song's key shift in semitones and its gain in dB, kept for the whole time it plays |
 | `set_genre` | Sets the genre of one song, several, or all. A song starts with the genre its genre tag names when that is one of Apple's twelve, and as Pop otherwise |
 | `get_transition` | The transition between two songs with edits applied: style, length, each side's start and end, handoff point, automation lanes, and the checks below |
@@ -30,7 +30,7 @@ Add songs first with `add_songs`. Every other tool takes the song ids it returns
 | `list_parameters` | Every parameter a lane can automate: code, name, range, resting value, and what each value of a note-length or filter-type parameter selects |
 | `edit_transition` | Changes a transition. Only the fields given change |
 | `reset_transition` | Drops the edit and goes back to Apple's plan |
-| `plan_set` | The timeline of songs played in order, without rendering: where each transition starts, its technique and length, which part of each song plays, how long it plays alone, the total length, and any run of three or more transitions using the same technique |
+| `plan_set` | The timeline of songs played in order, without rendering: where each transition starts, its technique and length, the checks below, which part of each song plays, how long it plays alone, the total length, and any run of three or more transitions using the same technique |
 | `save_set`, `load_set`, `list_sets` | Saves songs and the edited transitions between them to a file, and loads them back after a restart |
 | `render_transition` | Renders one transition to a WAV with some of each song around it, and reports the result's level each second, its peak, and how many samples sit at full scale |
 | `render_set` | Renders songs in order with every transition to one WAV, with the same timeline as `plan_set` and the level each second around every transition |
@@ -45,7 +45,7 @@ Renders play every song at the same loudness, as the app does with Sound Check o
 Apple's analysis finds where a song's sections start but not what they are, so pink diamond cannot name a chorus or a drop. `get_song` gives each section its length in bars, its loudness against the whole song, and the share of it that has vocals, which is usually enough to tell them apart.
 
 ## Checks
-pink diamond works these out from the plan and the analyses, so they cost nothing and come with every transition.
+pink diamond works these out from the plan and the analyses, so they cost nothing and come with every transition, in `get_transition` and in `plan_set`.
 
 | Check | What |
 | --- | --- |
@@ -77,7 +77,7 @@ pink diamond works these out from the plan and the analyses, so they cost nothin
 
 Shifts are absolute, not cumulative: `outgoing_shift_bars: -4` twice is still four bars earlier.
 
-A lane is a list of points, each a position, a `value` and a `curve` (`linear`, `easedIn`, `easedOut`, `easedInOut`). Give the position as `at`, seconds since the transition started on the mix clock, or as `offset`, song seconds from the start of that song's side. `at` is the same clock for both songs, so use it to make something happen on both at once; `get_transition` lists each song's bars on it as `bars_at`. A value outside the parameter's range is refused.
+A lane is a list of points, each a position, a `value` and a `curve` (`linear`, `easedIn`, `easedOut`, `easedInOut`). Give the position as `at`, seconds since the transition started on the mix clock, or as `offset`, song seconds from the start of that song's side. `at` is the same clock for both songs, so use it to make something happen on both at once; `get_transition` lists each song's bars on it as `bars_at`. A value outside the parameter's range is refused. `get_transition` leaves a point's `curve` out when it is `linear`, and a lane's range is in `list_parameters`.
 
 An edit belongs to the genres it was made with, as in the app. Changing a song's genre starts its transitions from a fresh plan, and setting the genre back brings the edit back.
 
@@ -126,3 +126,6 @@ For a stem file, lanes named `stem_drums`, `stem_bass`, `stem_other` and `stem_v
 The server has no playback, playlists or live mode. Tails, loops and stems exist only here: the app's editor does not show or set them. An agent hears nothing: rendering gives it a WAV file and timings.
 
 One request runs at a time, and a render blocks until it finishes.
+
+## Log
+pink diamond writes a line to stderr for every call: the tool, the size of its reply in bytes and how long it took. A reply stays in the agent's context for the rest of the session, so this is where to look when a session costs more than expected. Claude desktop keeps it in `~/Library/Logs/Claude/mcp-server-pink-diamond.log`.
