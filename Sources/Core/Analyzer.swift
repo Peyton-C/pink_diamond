@@ -112,6 +112,11 @@ enum Analyzer {
                                  "f": "F", "fSharp": "F#", "gFlat": "F#", "g": "G", "gSharp": "Ab", "aFlat": "Ab", "a": "A",
                                  "aSharp": "Bb", "bFlat": "Bb", "b": "B"]
 
+    /// Songs analyzed at once, by the app's library and the MCP server alike. One analysis holds a single core at 100%
+    /// and leaves the GPU and Neural Engine idle, so songs run side by side: half the cores, which leaves the rest for
+    /// the UI and playback, and at most 8, since each song in flight holds its whole decoded audio (100 to 200 MB).
+    static let workerLimit = min(8, max(2, ProcessInfo.processInfo.activeProcessorCount / 2))
+
     static func analyze(playable url: URL, id: String) async throws -> SongAnalysis {
         let asset = AVURLAsset(url: url)
         let duration = try await asset.load(.duration).seconds

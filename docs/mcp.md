@@ -20,7 +20,7 @@ Add songs first with `add_songs`. Every other tool takes the song ids it returns
 ## Tools
 | Tool | What |
 | --- | --- |
-| `add_songs` | Adds audio files, stem files or folders and analyzes them. A song's first analysis takes several seconds, so add a large uncached folder in parts if the client times out. Past 25 songs it returns a count, not the list |
+| `add_songs` | Adds audio files, stem files or folders and analyzes them. A song's first analysis takes several seconds and pink diamond runs up to 8 at once, so add a large uncached folder in parts if the client times out. Past 25 songs it returns a count, not the list |
 | `list_songs` | Songs added, filtered by words, BPM range, key or genre, a page at a time. A stem file shows where its stems came from. `unique` lists each song once when it is there in several versions, as the one with the best stems |
 | `get_song` | A song's bars, vocal ranges, loudness and Sound Check gain, and its sections. Beats on request, and `bars: false` leaves the bar times out. `stems: true` adds each stem's level per section and bar by bar |
 | `set_song` | A song's key shift in semitones and its gain in dB, kept for the whole time it plays |

@@ -271,13 +271,8 @@ final class Library: ObservableObject {
         pump()
     }
 
-    /// Songs analyzed at once. One analysis holds a single core at 100% and leaves the GPU and Neural Engine idle, so
-    /// songs run side by side: half the cores, which leaves the rest for the UI and playback, and at most 8, since
-    /// each song in flight holds its whole decoded audio (100 to 200 MB).
-    private static let analysisWorkerLimit = min(8, max(2, ProcessInfo.processInfo.activeProcessorCount / 2))
-
     private func pump() {
-        while analysisWorkers < Self.analysisWorkerLimit, !analysisQueue.isEmpty {
+        while analysisWorkers < Analyzer.workerLimit, !analysisQueue.isEmpty {
             let id = analysisQueue.removeFirst()
             analysisWorkers += 1
             Task {

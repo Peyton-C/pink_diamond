@@ -167,7 +167,7 @@ final class MCPServer {
             editing["incoming_loop"] = loop("incoming")
         }
         return [
-            tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. A song's genre comes from its genre tag when that names one of the genres set_genre takes, and is Pop otherwise. The first analysis of a song takes a few seconds; later ones come from the cache. Returns the songs added with their ids, or only how many when there are more than 25: find those with list_songs.",
+            tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. A song's genre comes from its genre tag when that names one of the genres set_genre takes, and is Pop otherwise. The first analysis of a song takes a few seconds, with several songs analyzed at once; later ones come from the cache. Returns the songs added with their ids, or only how many when there are more than 25: find those with list_songs.",
                  ["paths": ids("Absolute paths")], required: ["paths"]),
             tool("list_songs", "Songs added this session: id, title, artist, genre, BPM, key and length, and for a stem file where its stems came from: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them.",
                  ["query": string("Words that must all appear in the title, artist or path"),
@@ -350,47 +350,79 @@ final class MCPServer {
                 failed.append(["path": path, "error": "not an audio file pink diamond reads"])
             }
         }
+        // Side by side, as the app's library analyzes: `Analyzer.workerLimit` songs at a time. A path given twice is
+        // loaded once.
+        var loading: Set<String> = []
+        let fresh = files.filter { url in !songs.contains { $0.path == url.path } && loading.insert(url.path).inserted }
+        var loaded: [String: Result<Entry, Error>] = [:]
+        await withTaskGroup(of: (String, Result<Entry, Error>).self) { group in
+            var next = 0
+            func addTask() {
+                guard next < fresh.count else { return }
+                let url = fresh[next]
+                next += 1
+                group.addTask {
+                    do { return (url.path, .success(try await Self.load(url))) } catch { return (url.path, .failure(error)) }
+                }
+            }
+            for _ in 0..<Analyzer.workerLimit { addTask() }
+            for await (path, result) in group {
+                loaded[path] = result
+                addTask()
+            }
+        }
+        // Added in the order the files were given, not the order they finished in, so list_songs and the answer
+        // read the same from one run to the next.
         var added: [[String: Any]] = []
         for url in files {
             if let known = songs.first(where: { $0.path == url.path }) {
                 added.append(summary(known))
                 continue
             }
-            do {
-                let key = fileKey(url)
-                let playable = try await AudioSource.playableURL(for: url)
-                // The app's analysis cache, by the same key and under the same catalog ID, so a song analyzed by
-                // either is ready in both.
-                let cache = AppPaths.cacheDir("analysis").appendingPathComponent(key + ".json")
-                var analysis: SongAnalysis
-                if let cached = (try? Data(contentsOf: cache)).flatMap({ try? JSONDecoder().decode(SongAnalysis.self, from: $0) }) {
-                    analysis = cached
-                    // As `Library.readAnalysis`: analyses cached before Sound Check hold their loudness only in the Apple-format JSON.
-                    if analysis.loudness == nil { analysis.loudness = Loudness(audioAnalysis: analysis.audioAnalysisJSON) }
-                } else {
-                    analysis = try await Analyzer.analyze(playable: playable, id: "99" + String(key.prefix(8)))
-                    try? JSONEncoder().encode(analysis).write(to: cache)
-                }
-                var name = url.deletingPathExtension().lastPathComponent
-                if AudioSource.isStem(url), name.lowercased().hasSuffix(".stem") { name = String(name.dropLast(5)) }
-                var song = Entry(id: String(key.prefix(8)), path: url.path, title: name, artist: "", playable: playable, analysis: analysis)
-                let asset = AVURLAsset(url: url)
-                for item in (try? await asset.load(.commonMetadata)) ?? [] {
-                    guard let value = try? await item.load(.stringValue), !value.isEmpty else { continue }
-                    if item.commonKey == .commonKeyTitle { song.title = value }
-                    if item.commonKey == .commonKeyArtist { song.artist = value }
-                }
-                // As the app's library: only on adding, so a genre set since with set_genre or load_set is kept.
-                if let tagged = await Genre.tagged(in: asset) { song.genre = tagged }
+            switch loaded[url.path] {
+            case .success(let song):
                 songs.append(song)
                 added.append(summary(song))
-            } catch {
+            case .failure(let error):
                 failed.append(["path": url.path, "error": String(describing: error)])
+            case nil:
+                break
             }
         }
         // A folder of a few hundred songs would otherwise answer with every one of them.
         if added.count > 25 { return ["added": added.count, "failed": failed] }
         return ["added": added.count, "songs": added, "failed": failed]
+    }
+
+    /// One file as a song: its mixdown, its analysis from the cache or made now, and its tags. Static and touching
+    /// none of the server's state, so `add` can run several at once.
+    private static func load(_ url: URL) async throws -> Entry {
+        let key = fileKey(url)
+        let playable = try await AudioSource.playableURL(for: url)
+        // The app's analysis cache, by the same key and under the same catalog ID, so a song analyzed by
+        // either is ready in both.
+        let cache = AppPaths.cacheDir("analysis").appendingPathComponent(key + ".json")
+        var analysis: SongAnalysis
+        if let cached = (try? Data(contentsOf: cache)).flatMap({ try? JSONDecoder().decode(SongAnalysis.self, from: $0) }) {
+            analysis = cached
+            // As `Library.readAnalysis`: analyses cached before Sound Check hold their loudness only in the Apple-format JSON.
+            if analysis.loudness == nil { analysis.loudness = Loudness(audioAnalysis: analysis.audioAnalysisJSON) }
+        } else {
+            analysis = try await Analyzer.analyze(playable: playable, id: "99" + String(key.prefix(8)))
+            try? JSONEncoder().encode(analysis).write(to: cache)
+        }
+        var name = url.deletingPathExtension().lastPathComponent
+        if AudioSource.isStem(url), name.lowercased().hasSuffix(".stem") { name = String(name.dropLast(5)) }
+        var song = Entry(id: String(key.prefix(8)), path: url.path, title: name, artist: "", playable: playable, analysis: analysis)
+        let asset = AVURLAsset(url: url)
+        for item in (try? await asset.load(.commonMetadata)) ?? [] {
+            guard let value = try? await item.load(.stringValue), !value.isEmpty else { continue }
+            if item.commonKey == .commonKeyTitle { song.title = value }
+            if item.commonKey == .commonKeyArtist { song.artist = value }
+        }
+        // As the app's library: only on adding, so a genre set since with set_genre or load_set is kept.
+        if let tagged = await Genre.tagged(in: asset) { song.genre = tagged }
+        return song
     }
 
     private func summary(_ s: Entry) -> [String: Any] {
