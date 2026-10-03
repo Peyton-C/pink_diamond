@@ -56,7 +56,7 @@ final class Library: ObservableObject {
     private var playable: [UUID: URL] = [:]
     private var pendingPlans: Set<String> = []
     private var analysisQueue: [UUID] = []
-    private var analyzing = false
+    private var analysisWorkers = 0
     private var summaryIndex: [String: SongSummary] = [:]   // by file key; persisted
     private var summarySavePending = false
     private var fullQueue: [UUID] = []
@@ -157,6 +157,7 @@ final class Library: ObservableObject {
             }
         }
         let known = Set(songs.map(\.path))
+        var added: [Song] = []
         for f in files.sorted(by: { $0.path < $1.path }) where !known.contains(f.path) {
             let stem = AudioSource.isStem(f)
             var name = f.deletingPathExtension().lastPathComponent
@@ -164,13 +165,17 @@ final class Library: ObservableObject {
             let song = Song(path: f.path, title: name, artist: "", isStem: stem, fileKey: fileKey(f))
             songs.append(song)
             enqueue(song.id)
-            Task {
-                await self.loadMetadata(song.id, genre: true)
-                save()
-                if let image = await Self.artwork(song) { self.setArtwork([(song.id, image)]) }
-            }
+            added.append(song)
         }
         save()
+        guard !added.isEmpty else { return }
+        // One task for the whole import, saving once: a task per song each saved the entire library when its tags
+        // came in, so a folder of n songs encoded the library n times on the main thread.
+        Task {
+            for song in added { await self.loadMetadata(song.id, genre: true) }
+            save()
+            await loadArtwork(added)
+        }
     }
 
     func remove(_ ids: Set<UUID>) {
@@ -224,9 +229,13 @@ final class Library: ObservableObject {
         let untagged = songs.filter { $0.album == nil }
         for song in untagged { await loadMetadata(song.id) }
         if !untagged.isEmpty { save() }
-        // Playlist songs first, the rest in library order; four files at a time, published in batches.
+        // Playlist songs first, the rest in library order.
         let inPlaylists = Set(playlists.flatMap(\.songIDs))
-        let ordered = songs.filter { inPlaylists.contains($0.id) } + songs.filter { !inPlaylists.contains($0.id) }
+        await loadArtwork(songs.filter { inPlaylists.contains($0.id) } + songs.filter { !inPlaylists.contains($0.id) })
+    }
+
+    /// Cover art for `ordered`, four files at a time, published in batches.
+    private func loadArtwork(_ ordered: [Song]) async {
         await withTaskGroup(of: (UUID, NSImage?).self) { group in
             var batch: [(UUID, NSImage)] = [], next = 0
             func addTask() {
@@ -262,14 +271,20 @@ final class Library: ObservableObject {
         pump()
     }
 
+    /// Songs analyzed at once. One analysis holds a single core at 100% and leaves the GPU and Neural Engine idle, so
+    /// songs run side by side: half the cores, which leaves the rest for the UI and playback, and at most 8, since
+    /// each song in flight holds its whole decoded audio (100 to 200 MB).
+    private static let analysisWorkerLimit = min(8, max(2, ProcessInfo.processInfo.activeProcessorCount / 2))
+
     private func pump() {
-        guard !analyzing, !analysisQueue.isEmpty else { return }
-        analyzing = true
-        let id = analysisQueue.removeFirst()
-        Task {
-            await analyze(id)
-            analyzing = false
-            pump()
+        while analysisWorkers < Self.analysisWorkerLimit, !analysisQueue.isEmpty {
+            let id = analysisQueue.removeFirst()
+            analysisWorkers += 1
+            Task {
+                await analyze(id)
+                analysisWorkers -= 1
+                pump()
+            }
         }
     }
 
