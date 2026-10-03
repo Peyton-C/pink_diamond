@@ -69,6 +69,28 @@ enum Genre: String, CaseIterable, Codable, Identifiable {
         case .reggae: "24"; case .singerSongwriter: "10"
         }
     }
+
+    /// The genre a file's genre tag names, or nil if it names none of these. Case, spaces and punctuation are ignored,
+    /// so "Hip-Hop/Rap", "hip hop" and "HipHop" all match. A tag listing several genres ("Dance; Pop") goes by its first.
+    init?(tag: String) {
+        func normalized(_ s: Substring) -> String { String(s.lowercased().unicodeScalars.filter(CharacterSet.alphanumerics.contains)) }
+        let whole = normalized(tag[...]), first = normalized(tag.prefix { $0 != ";" && $0 != "," })
+        guard let genre = Self.tagNames[whole] ?? Self.tagNames[first] else { return nil }
+        self = genre
+    }
+
+    /// Normalized tag → genre: Apple's own names, then the common spellings that aren't Apple's.
+    private static let tagNames: [String: Genre] = {
+        var names: [String: Genre] = [
+            "hiphop": .hipHop, "rap": .hipHop, "rnb": .rnb, "rb": .rnb, "soul": .rnb, "edm": .dance, "house": .dance,
+            "electronica": .electronic, "indie": .alternative, "alternativerock": .alternative, "indierock": .alternative,
+            "korean": .kpop, "latino": .latin, "folk": .singerSongwriter,
+        ]
+        for genre in allCases {
+            names[String(genre.rawValue.lowercased().unicodeScalars.filter(CharacterSet.alphanumerics.contains))] = genre
+        }
+        return names
+    }()
 }
 
 enum Analyzer {
