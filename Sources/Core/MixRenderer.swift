@@ -128,7 +128,7 @@ final class MixRenderer {
             }
             for c in chains where c.active && !c.finished {
                 if let leaving = c.item.leaving, c.songTime >= leaving.end { c.finished = true }
-                if c.songTime >= c.duration { c.finished = true }
+                if c.ended { c.finished = true }
                 if c.finished { c.unload() }
             }
             // The listener's song changes halfway through the transition into the next one. An edited transition can
@@ -284,6 +284,11 @@ private final class Chain {
     var songTime: Double { position / sampleRate }
     /// The song's length as played, in frames.
     var frames: Int { Int(duration * sampleRate) }
+    /// Whether the song has played to its end. Counted in frames, as the source node counts them: it stops at
+    /// `frames`, which rounds down, so a song read through `fill` could stop a frame short of `duration` and
+    /// never be seen to end. As the last song of a set that left the render running on in silence until the safety
+    /// stop (Womanizer with a stem lane, last of ten: a 32-minute file for a 14:37 mix).
+    var ended: Bool { position >= Double(remixes ? frames : min(frames, audio.map { Int($0.frameLength) } ?? frames)) }
     /// Whether the song is read through `fill` rather than copied straight from the file.
     var remixes: Bool { !loops.isEmpty || !item.stems.isEmpty }
 
