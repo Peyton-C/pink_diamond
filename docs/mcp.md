@@ -17,11 +17,13 @@ The server keeps its songs, genres and edits in memory and forgets them when it 
 
 Add songs first with `add_songs`. Every other tool takes the song ids it returns. An id stays the same for a file between sessions, as long as the file is not moved or changed.
 
+A large library is meant to be searched, not listed. The overview shows what is there, with artists counted ignoring case and shown in the spelling most of their songs have, and `list_songs` finds the songs.
+
 ## Tools
 | Tool | What |
 | --- | --- |
-| `add_songs` | Adds audio files, stem files or folders and analyzes them. A song's first analysis takes several seconds, so add a large uncached folder in parts if the client times out. Later adds read the cache, and a library of 600 songs takes a couple of seconds. Past 25 songs it returns a count, not the list |
-| `list_songs` | Songs added, filtered by words, BPM range, key or genre, at most 100 at a time. A row leaves out the genre when it is Pop, and a stem file's source when the title ends with it. A song there in several versions is listed once, as the one with the best stems; `unique: false` lists them all |
+| `add_songs` | Adds audio files, stem files or folders and analyzes them. A song's first analysis takes several seconds, so add a large uncached folder in parts if the client times out. Later adds read the cache, and a library of 600 songs takes a couple of seconds. Past 25 songs it returns an overview in place of the list: how many songs, how many by each artist and in each band of ten BPM |
+| `list_songs` | Songs added, filtered by words, BPM range, key or genre, at most 100 at a time. A row leaves out the genre when it is Pop, and a stem file's source when the title ends with it. A song there in several versions is listed once, as the one with the best stems; `unique: false` lists them all. `mixes_with` keeps the songs that could go next to one: a key that does not clash with its key, and a tempo within 8% of its own, or of half or double it. `tempo_percent` widens that, up to 25. `any_key` keeps songs in a clashing key too, listed after the others and marked `key_clash`, for bringing in by their drums alone. `overview: true` returns the counts by artist and BPM band for whatever matches, in place of the songs |
 | `get_song` | Takes one song, or several as `songs`. A song's bars, vocal ranges, loudness and Sound Check gain, and its sections. Beats on request, and `bars: false` leaves the bar times out. `stems: true` adds each stem's level per section and bar by bar |
 | `set_song` | A song's key shift in semitones and its gain in dB, kept for the whole time it plays |
 | `set_genre` | Sets the genre of one song, several, or all. A song starts with the genre its genre tag names when that is one of Apple's twelve, and as Pop otherwise |

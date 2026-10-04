@@ -177,12 +177,16 @@ final class MCPServer {
             editing["incoming_loop"] = ["type": ["object", "null"], "description": "The same as outgoing_loop, for the incoming song"] as [String: Any]
         }
         return [
-            tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. The first analysis of a song takes a few seconds; later ones come from the cache. Returns the songs added with their ids, or only how many when there are more than 25: find those with list_songs.",
+            tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. The first analysis of a song takes a few seconds; later ones come from the cache. Returns the songs added with their ids, or for more than 25 an overview: how many songs, how many by each artist and in each BPM band, each song counted once however many versions there are. Search them with list_songs.",
                  ["paths": ids("Absolute paths")], required: ["paths"]),
-            tool("list_songs", "Search the songs added this session: id, title, artist, BPM, key, length in seconds, genre when it is not Pop, and for a stem file where its stems came from when the title doesn't end with it: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them, so filter rather than page through everything.",
+            tool("list_songs", "Search the songs added this session: id, title, artist, BPM, key, length in seconds, genre when it is not Pop, and for a stem file where its stems came from when the title doesn't end with it: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them, so search for what you want rather than paging through everything.",
                  ["query": string("Words that must all appear in the title, artist or path"),
                   "bpm_min": number("Lowest BPM"), "bpm_max": number("Highest BPM"),
                   "key": string("A key as list_songs shows it, such as G minor"), "genre": string("A genre set_genre takes"),
+                  "mixes_with": string("A song id: only songs that could go next to it, in a key that doesn't clash with its key and within 8% of its tempo, or of half or double it"),
+                  "tempo_percent": number("With mixes_with, how far the tempo can be, in percent. Defaults to 8, 25 at most; widen it when few songs come back"),
+                  "any_key": bool("With mixes_with, keep songs in a clashing key too, after the others and marked key_clash. They can work when only the drums come in, since every other stem is pitched"),
+                  "overview": bool("Return how many songs match, by artist and by BPM band, in place of the songs"),
                   "unique": bool("List a song that is there in several versions once, as the version with the best stems. Defaults to true"),
                   "limit": integer("Most songs to return. Defaults to 50, and 100 at most"), "offset": integer("Songs to skip, to page through a long list")]),
             tool("get_song", "A song's analysis: bars and vocal ranges in song seconds, its loudness, and its sections, each with its length in bars, how loud it is against the whole song, and how much of it has vocals. Sections have no names.",
@@ -239,7 +243,7 @@ final class MCPServer {
             guard let paths = args["paths"] as? [String] else { throw PlannerError("paths must be a list of file or folder paths") }
             return await add(paths)
         case "list_songs":
-            return list(args)
+            return try list(args)
         case "get_song":
             // Several at once, so looking over the songs of a set is one call and not one for each.
             guard let ids = args["songs"] as? [String] else {
@@ -382,25 +386,26 @@ final class MCPServer {
         await load(fresh.filter { if case .success(nil) = loaded[$0.path] { return true } else { return false } }, atOnce: Analyzer.workerLimit, analyze: true)
         // Added in the order the files were given, not the order they finished in, so list_songs and the answer
         // read the same from one run to the next.
-        var added: [[String: Any]] = []
+        var added: [Entry] = []
         for url in files {
             if let known = songs.first(where: { $0.path == url.path }) {
-                added.append(summary(known))
+                added.append(known)
                 continue
             }
             switch loaded[url.path] {
             case .success(let song?):
                 songs.append(song)
-                added.append(summary(song))
+                added.append(song)
             case .failure(let error):
                 failed.append(["path": url.path, "error": String(describing: error)])
             default:
                 break
             }
         }
-        // A folder of a few hundred songs would otherwise answer with every one of them.
-        if added.count > 25 { return ["added": added.count, "failed": failed] }
-        return ["added": added.count, "songs": added, "failed": failed]
+        // A folder of a few hundred songs would otherwise answer with every one of them. It answers with the
+        // overview and not the count alone, which left an agent nothing to search by, so it listed the library.
+        if added.count > 25 { return ["added": added.count, "overview": overview(unique(added)), "failed": failed] }
+        return ["added": added.count, "songs": added.map(summary), "failed": failed]
     }
 
     /// One file as a song: its mixdown, its analysis from the cache or made now, and its tags. Nil when the analysis
@@ -478,7 +483,48 @@ final class MCPServer {
         return (Self.stemSources[rank], rank)
     }
 
-    private func list(_ args: [String: Any]) -> [String: Any] {
+    /// What one song is called whichever version it is: its artist and its title without the bracketed tags at
+    /// the end, such as (FN) or (Official).
+    private func name(_ s: Entry) -> String {
+        let title = s.title.replacingOccurrences(of: #"(\s*[\(\[][^\)\]]*[\)\]])+\s*$"#, with: "", options: .regularExpression)
+        return "\(s.artist)|\(title)".lowercased()
+    }
+
+    /// One version of each song: the one with the best stems, and a file with no stems last.
+    private func unique(_ list: [Entry]) -> [Entry] {
+        var best: [String: Entry] = [:], order: [String] = []
+        let rank = { (s: Entry) in self.stemSource(s)?.rank ?? Self.stemSources.count }
+        for s in list {
+            let key = name(s)
+            if let held = best[key] { if rank(s) < rank(held) { best[key] = s } } else { best[key] = s; order.append(key) }
+        }
+        return order.compactMap { best[$0] }
+    }
+
+    /// What is in a list of songs without listing it: how many by each artist and in each band of ten BPM. Enough
+    /// for an agent to know what to search for, at about a tenth of the rows (311 songs: 1,100 tokens against
+    /// 12,000). Artists are counted ignoring case and shown in the spelling most of their songs have, since a
+    /// library can hold one artist under two (Charli XCX before brat, Charli xcx from it on).
+    private func overview(_ list: [Entry]) -> [String: Any] {
+        var spellings: [String: [String: Int]] = [:]
+        for s in list { spellings[s.artist.lowercased(), default: [:]][s.artist, default: 0] += 1 }
+        var artists: [String: Int] = [:]
+        for counts in spellings.values {
+            let spelling = counts.max { ($0.value, $1.key) < ($1.value, $0.key) }!.key
+            artists[spelling.isEmpty ? "(no artist)" : spelling] = counts.values.reduce(0, +)
+        }
+        let bands = Dictionary(grouping: list) { Int($0.analysis.bpm) / 10 * 10 }
+        return ["total": list.count, "artists": artists,
+                "bpm_bands": bands.keys.sorted().map { ["\($0)-\($0 + 9)", bands[$0]!.count] as [Any] }]
+    }
+
+    /// How far a song's tempo can be from another's, in percent of it, for the two to be offered as a pair unless
+    /// the agent asks for more. A working DJ's rule of thumb for how far a song stretches before it sounds wrong,
+    /// not something measured here, and Apple's tempo match copes with more: at 8, 27 of 311 songs had fewer than
+    /// five songs to go with, and at 16 none did.
+    private static let tempoReach = 8.0
+
+    private func list(_ args: [String: Any]) throws -> [String: Any] {
         let words = (args["query"] as? String ?? "").lowercased().split(separator: " ")
         let low = number(args["bpm_min"]) ?? 0, high = number(args["bpm_max"]) ?? .infinity
         let key = (args["key"] as? String)?.lowercased(), genre = args["genre"] as? String
@@ -487,20 +533,34 @@ final class MCPServer {
             return words.allSatisfy { text.contains($0) } && Double(s.analysis.bpm) >= low && Double(s.analysis.bpm) <= high
                 && (key == nil || self.key(s).lowercased() == key) && (genre == nil || s.genre.rawValue == genre)
         }
-        if args["unique"] as? Bool ?? true {
-            // The version with the best stems stands for the song; a file with no stems comes last.
-            var best: [String: Entry] = [:], order: [String] = []
-            let rank = { (s: Entry) in self.stemSource(s)?.rank ?? Self.stemSources.count }
-            for s in matches {
-                let title = s.title.replacingOccurrences(of: #"(\s*[\(\[][^\)\]]*[\)\]])+\s*$"#, with: "", options: .regularExpression)
-                let key = "\(s.artist)|\(title)".lowercased()
-                if let held = best[key] { if rank(s) < rank(held) { best[key] = s } } else { best[key] = s; order.append(key) }
+        var clashing: Set<String> = []
+        if args["mixes_with"] != nil {
+            // Songs to go next to this one: a key that doesn't clash and a tempo the match can reach, at the
+            // song's own tempo or half or double it, which the tempo match pairs two beats to one for. Other
+            // versions of the song itself are left out.
+            let other = try entry(args["mixes_with"])
+            let theirs = Self.camelot(self.key(other)), anyKey = args["any_key"] as? Bool == true
+            let reach = max(0, min(25, number(args["tempo_percent"]) ?? Self.tempoReach)) / 100
+            matches = matches.filter { s in
+                let ratio = Double(s.analysis.bpm) / Double(max(other.analysis.bpm, 1))
+                guard name(s) != name(other), [0.5, 1, 2].contains(where: { abs(ratio / $0 - 1) <= reach }) else { return false }
+                if let theirs, let ours = Self.camelot(self.key(s)), Self.relation(theirs, ours) != "clash" { return true }
+                clashing.insert(s.id)
+                return anyKey
             }
-            matches = order.compactMap { best[$0] }
         }
+        if args["unique"] as? Bool ?? true { matches = unique(matches) }
+        // With any key allowed most of the library is in reach (a typical song goes from 16 matches to 101), so
+        // the ones that need no help come first and the first page is still the easy choices.
+        matches = matches.filter { !clashing.contains($0.id) } + matches.filter { clashing.contains($0.id) }
+        if args["overview"] as? Bool == true { return overview(matches) }
         // Capped, so the whole library can't be asked for in one call: an agent is meant to search it.
         let offset = max(0, Int(number(args["offset"]) ?? 0)), limit = max(1, min(100, Int(number(args["limit"]) ?? 50)))
-        return ["total": matches.count, "songs": matches.dropFirst(offset).prefix(limit).map(row)]
+        return ["total": matches.count, "songs": matches.dropFirst(offset).prefix(limit).map { s -> [String: Any] in
+            var json = row(s)
+            if clashing.contains(s.id) { json["key_clash"] = true }
+            return json
+        }]
     }
 
     private func songDetail(_ song: Entry, _ args: [String: Any]) async throws -> [String: Any] {
@@ -738,14 +798,7 @@ final class MCPServer {
         json["vocals_together_seconds"] = r(sung(a, out).map { x in theirs.map { max(0, min(x.1, $0.1) - max(x.0, $0.0)) }.reduce(0, +) }.reduce(0, +))
 
         if let ka = Self.camelot(key(a)), let kb = Self.camelot(key(b)) {
-            let steps = min((ka.number - kb.number + 12) % 12, (kb.number - ka.number + 12) % 12)
-            let relation = switch (steps, ka.minor == kb.minor) {
-            case (0, true): "same key"
-            case (0, false): "relative major and minor"
-            case (1, true): "a fifth apart"
-            default: "clash"
-            }
-            json["keys"] = ["from": "\(key(a)) (\(ka.name))", "to": "\(key(b)) (\(kb.name))", "relation": relation]
+            json["keys"] = ["from": "\(key(a)) (\(ka.name))", "to": "\(key(b)) (\(kb.name))", "relation": Self.relation(ka, kb)]
         }
         json.merge(heard(a, b, plan)) { a, _ in a }
         return json
@@ -895,6 +948,16 @@ final class MCPServer {
         let asMinor = minor ? pitch : (pitch + 9) % 12
         let number = ((asMinor - 9 + 12) * 7 % 12 + 7) % 12 + 1
         return (number, minor, "\(number)\(minor ? "A" : "B")")
+    }
+
+    /// How two keys go together, by their places on the wheel.
+    private static func relation(_ a: (number: Int, minor: Bool, name: String), _ b: (number: Int, minor: Bool, name: String)) -> String {
+        switch (min((a.number - b.number + 12) % 12, (b.number - a.number + 12) % 12), a.minor == b.minor) {
+        case (0, true): "same key"
+        case (0, false): "relative major and minor"
+        case (1, true): "a fifth apart"
+        default: "clash"
+        }
     }
 
     private func parameters(_ plan: TransitionPlan) -> [[String: Any]] {
