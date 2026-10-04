@@ -23,7 +23,7 @@ A large library is meant to be searched, not listed. The overview shows what is 
 | Tool | What |
 | --- | --- |
 | `add_songs` | Adds audio files, stem files or folders and analyzes them. A song's first analysis takes several seconds, so add a large uncached folder in parts if the client times out. Later adds read the cache, and a library of 600 songs takes a couple of seconds. Past 25 songs it returns an overview in place of the list: how many songs, how many by each artist and in each band of ten BPM |
-| `list_songs` | Songs added, filtered by words, BPM range, key or genre, at most 100 at a time. A row leaves out the genre when it is Pop, and a stem file's source when the title ends with it. A song there in several versions is listed once, as the one with the best stems; `unique: false` lists them all. `mixes_with` keeps the songs that could go next to one: a key that does not clash with its key, and a tempo within 8% of its own, or of half or double it. `tempo_percent` widens that, up to 25. `any_key` keeps songs in a clashing key too, listed after the others and marked `key_clash`, for bringing in by their drums alone. `overview: true` returns the counts by artist and BPM band for whatever matches, in place of the songs |
+| `list_songs` | Songs added, filtered by words, BPM range, key or genre, at most 100 at a time. A row leaves out the genre when it is Pop, and a stem file's source when the title ends with it. A song there in several versions is listed once, as the one with the best stems; `unique: false` lists them all. `mixes_with` keeps the songs that could go next to one: a key that does not clash with its key, and a tempo within 8% of its own, or of half or double it. Give it two songs to find one that goes between them, which has to fit both. `tempo_percent` widens that, up to 25. `any_key` keeps songs in a clashing key too, listed after the others and marked `key_clash`, for bringing in by their drums alone. `not_in_set` leaves out the songs a saved set already has, in any version. `overview: true` returns the counts by artist and BPM band for whatever matches, in place of the songs |
 | `get_song` | Takes one song, or several as `songs`. A song's bars, vocal ranges, loudness and Sound Check gain, and its sections. Beats on request, and `bars: false` leaves the bar times out. `stems: true` adds each stem's level per section and bar by bar |
 | `set_song` | A song's key shift in semitones and its gain in dB, kept for the whole time it plays |
 | `set_genre` | Sets the genre of one song, several, or all. A song starts with the genre its genre tag names when that is one of Apple's twelve, and as Pop otherwise |
@@ -32,14 +32,18 @@ A large library is meant to be searched, not listed. The overview shows what is 
 | `list_parameters` | Every parameter a lane can automate: code, name, range, resting value, and what each value of a note-length or filter-type parameter selects |
 | `edit_transition` | Changes a transition. Only the fields given change |
 | `reset_transition` | Drops the edit and goes back to Apple's plan |
-| `plan_set` | The timeline of songs played in order, without rendering: where each transition starts, its technique and length, the checks below, which part of each song plays, how long it plays alone, the total length, and any run of three or more transitions using the same technique |
+| `plan_set` | The timeline of songs played in order, without rendering: where each transition starts, its technique and length, the checks below, which part of each song plays, how long it plays alone, the total length, any run of three or more transitions using the same technique, and any song that is there twice |
 | `save_set`, `load_set`, `list_sets` | Saves songs and the edited transitions between them to a file, and loads them back after a restart |
 | `render_transition` | Renders one transition to a WAV with some of each song around it, and reports the result's level each second, its peak, and how many samples sit at full scale |
 | `render_set` | Renders songs in order with every transition to one WAV, with the same timeline as `plan_set` and the level each second around every transition |
 
 `get_transition` and `edit_transition` take `detail`: `summary` leaves the lanes out, `moving` has the lanes that change, `all` has every lane and the effects each side can take. Reading defaults to `moving` and editing to `summary`.
 
+`plan_set` and `render_set` take `first` and `last`, positions in the song list counted from 1, to report only that stretch. pink diamond still plans or renders the whole set, and the times are still on its clock. A reply stays in the agent's context, and a long set's timeline is most of what fills it, so ask for the songs being worked on.
+
 Renders take a `name`, which puts the WAV in the renders folder, or `out` for a full path. With neither it goes in the cache under a random name.
+
+`render_transition` takes `solo`, `outgoing` or `incoming`, to render one song's part of the transition alone. It lines up with the full render to the sample, so the two solos show what each song is doing where the mix is hard to pick apart.
 
 Renders play every song at the same loudness, as the app does with Sound Check on. Pass `sound_check: false` to turn it off. The renderer ends in a limiter, so two songs at full volume are held just under full scale rather than clipped, and a peak near 0 dB means the limiter is working.
 
@@ -110,7 +114,9 @@ A transition's `technique` is its moves, or the planner's style, or for one draw
 `set_song` changes how a song plays for its whole length, in every transition and render. `key_shift` moves its key by up to 6 semitones either way without changing its tempo, and the key checks use the shifted key. A couple of semitones is clean, more starts to sound processed. `gain_db` adds up to 12 dB either way on top of Sound Check.
 
 ## Saved sets
-`save_set` writes the songs you name, in order, with their genres and settings and every edited transition between any two of them, to `~/Library/Application Support/pink diamond/sets/`. `load_set` adds the songs again and puts the edits back, so a set can be fixed after a restart instead of rebuilt. A set saved with extensions loads without its extended transitions when the server runs with `--automix-only`.
+`save_set` writes the songs you name, in order, with their genres and settings and every edited transition between any two of them, to `~/Library/Application Support/pink diamond/sets/`. `load_set` adds the songs again and puts the edits back, so a set can be fixed after a restart instead of rebuilt. It returns the set's songs in order, each with its position, id, title and artist, which is enough to carry on without planning all of it.
+
+To add to a set or replace a song in it, search with `not_in_set` so nothing is repeated, plan only the songs around the change, and save the new order. Transitions are kept by pair of songs, so the ones that did not change keep their edits. `save_set` and `plan_set` list any song that is there twice as `duplicates`, counting two versions of a song as one. A set saved with extensions loads without its extended transitions when the server runs with `--automix-only`.
 
 ## Sets in the app
 Choose File, Import Set in the app to bring a saved set in as a mix, a playlist of its own marked with a ◆ in the sidebar. pink diamond adds any songs the library does not have, and plays and exports the mix exactly as `render_set` renders it, stems, loops, tails, key shifts and gains included.

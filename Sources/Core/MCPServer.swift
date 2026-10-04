@@ -164,6 +164,8 @@ final class MCPServer {
                   "incoming_lanes": ["type": "object", "description": "The same as outgoing_lanes, for the incoming song"] as [String: Any],
                   "add_effects": effects]
         let out = string("Where to write the WAV, as a full path")
+        let first = integer("Report only from the song at this position in songs, counted from 1. The whole set is still planned, and times are still on its clock")
+        let last = integer("Report only up to the song at this position")
         let named = string("A name for the WAV, which goes in the renders folder. Without a name or a path it goes in the cache")
         if extensions {
             editing["outgoing_tail_bars"] = number("Bars the outgoing song plays on after the window ends, with its lanes carrying on, so an echo can ring out. 0 removes it")
@@ -183,7 +185,9 @@ final class MCPServer {
                  ["query": string("Words that must all appear in the title, artist or path"),
                   "bpm_min": number("Lowest BPM"), "bpm_max": number("Highest BPM"),
                   "key": string("A key as list_songs shows it, such as G minor"), "genre": string("A genre set_genre takes"),
-                  "mixes_with": string("A song id: only songs that could go next to it, in a key that doesn't clash with its key and within 8% of its tempo, or of half or double it"),
+                  "mixes_with": ["type": ["string", "array"], "items": ["type": "string"],
+                                 "description": "A song id: only songs that could go next to it, in a key that doesn't clash with its key and within 8% of its tempo, or of half or double it. Two ids, for a song to go between them: only songs that could go next to both"],
+                  "not_in_set": string("A saved set's name: leaves out the songs in it, whichever version"),
                   "tempo_percent": number("With mixes_with, how far the tempo can be, in percent. Defaults to 8, 25 at most; widen it when few songs come back"),
                   "any_key": bool("With mixes_with, keep songs in a clashing key too, after the others and marked key_clash. They can work when only the drums come in, since every other stem is pitched"),
                   "overview": bool("Return how many songs match, by artist and by BPM band, in place of the songs"),
@@ -205,14 +209,15 @@ final class MCPServer {
                  editing, required: ["from", "to"]),
             tool("reset_transition", "Drop every edit to a transition and go back to Apple's plan.", ["from": from, "to": to], required: ["from", "to"]),
             tool("render_transition", "Render one transition to a WAV, with some of each song either side of it. Returns the level of the result second by second and its peak, in dB below full scale, and how many samples sit at full scale. The renderer ends in a limiter, which pumps when it works hard.",
-                 ["from": from, "to": to, "name": named, "out": out, "margin": number("Seconds of each song around the transition. Defaults to 15"), "sound_check": soundCheck], required: ["from", "to"]),
-            tool("plan_set", "The timeline of playing songs in order, without rendering: where each transition starts in the mix, its technique and length, the checks get_transition makes, which part of each song plays, the total length, and any run of three or more transitions in a row that use the same technique.",
-                 ["songs": ids("Song ids in playing order")], required: ["songs"]),
+                 ["from": from, "to": to, "name": named, "out": out, "margin": number("Seconds of each song around the transition. Defaults to 15"), "sound_check": soundCheck,
+                  "solo": ["type": "string", "enum": ["outgoing", "incoming"], "description": "Render this song's part alone, on the same clock"]], required: ["from", "to"]),
+            tool("plan_set", "The timeline of playing songs in order, without rendering: where each transition starts in the mix, its technique and length, the checks get_transition makes, which part of each song plays, the total length, and any run of three or more transitions in a row that use the same technique, and any song that is there twice.",
+                 ["songs": ids("Song ids in playing order"), "first": first, "last": last], required: ["songs"]),
             tool("render_set", "Render songs in order, with every transition, to one WAV. Returns the same timeline as plan_set, with the level each second around each transition. A transition that can't be planned becomes a straight cut.",
-                 ["songs": ids("Song ids in playing order"), "name": named, "out": out, "sound_check": soundCheck], required: ["songs"]),
+                 ["songs": ids("Song ids in playing order"), "first": first, "last": last, "name": named, "out": out, "sound_check": soundCheck], required: ["songs"]),
             tool("save_set", "Save songs, their genres and settings, and every edited transition between them, to carry on after a restart. Saving under a name that exists replaces it.",
                  ["name": string("A name for the set"), "songs": ids("Song ids in playing order. Left out, every song added this session")], required: ["name"]),
-            tool("load_set", "Load a saved set: adds its songs, puts back their genres, settings and transition edits, and returns the song ids in order.",
+            tool("load_set", "Load a saved set: adds its songs, puts back their genres, settings and transition edits, and returns its songs in order: position, id, title and artist.",
                  ["name": string("The set's name, from list_sets")], required: ["name"]),
             tool("list_sets", "The saved sets, newest first."),
         ] + (!extensions ? [] : [
@@ -285,20 +290,24 @@ final class MCPServer {
             return try await describe(a, b, detail: "summary")
         case "render_transition":
             let (a, b) = try pair(args)
+            let solo = args["solo"] as? String
+            guard solo == nil || solo == "outgoing" || solo == "incoming" else { throw PlannerError("solo must be outgoing or incoming") }
             return try await renderTransition(a, b, margin: number(args["margin"]) ?? 15, out: try outputURL(args),
-                                        soundCheck: args["sound_check"] as? Bool ?? true)
+                                        soundCheck: args["sound_check"] as? Bool ?? true, solo: solo)
         case "plan_set", "render_set":
             guard let ids = args["songs"] as? [String], !ids.isEmpty else { throw PlannerError("songs must be a list of song ids") }
             let list = try ids.map { try entry($0) }
+            let first = Int(number(args["first"]) ?? 1), last = Int(number(args["last"]) ?? Double(list.count))
+            guard first >= 1, last <= list.count, first <= last else { throw PlannerError("first and last are positions in songs, from 1 to \(list.count)") }
             // As `describe`: the stem checks need both songs' stem levels.
             if extensions {
-                for (a, b) in zip(list, list.dropFirst()) where stemSource(a) != nil && stemSource(b) != nil {
+                for (i, (a, b)) in zip(list, list.dropFirst()).enumerated() where i + 1 >= first && i + 2 <= last && stemSource(a) != nil && stemSource(b) != nil {
                     _ = try? await levels(ofStems: a)
                     _ = try? await levels(ofStems: b)
                 }
             }
-            if name == "plan_set" { return timeline(list).json }
-            return try await renderSet(list, out: try outputURL(args), soundCheck: args["sound_check"] as? Bool ?? true)
+            if name == "plan_set" { return timeline(list, report: first...last).json }
+            return try await renderSet(list, report: first...last, out: try outputURL(args), soundCheck: args["sound_check"] as? Bool ?? true)
         case "set_song":
             guard extensions else { throw PlannerError("key shift and song gain are beyond Apple's AutoMix, and this server is running without extensions") }
             var ids = Set(try (args["songs"] as? [String] ?? []).map { try entry($0).id })
@@ -314,7 +323,13 @@ final class MCPServer {
             return songs.filter { ids.contains($0.id) }.map(summary)
         case "save_set":
             guard let set = args["name"] as? String, !set.isEmpty else { throw PlannerError("name the set") }
-            return try save(set, try (args["songs"] as? [String])?.map { try entry($0) } ?? songs)
+            guard let ids = args["songs"] as? [String] else { return try save(set, songs) }
+            let list = try ids.map { try entry($0) }
+            var saved = try save(set, list)
+            // Only for songs given in order, which is a set; every song of the session is a library, with its versions.
+            let twice = duplicates(list)
+            if !twice.isEmpty { saved["duplicates"] = twice }
+            return saved
         case "load_set":
             guard let set = args["name"] as? String else { throw PlannerError("name the set") }
             return try await load(set)
@@ -524,6 +539,16 @@ final class MCPServer {
     /// five songs to go with, and at 16 none did.
     private static let tempoReach = 8.0
 
+    /// Songs that are in a list more than once, in any version, with the positions they are at.
+    private func duplicates(_ list: [Entry]) -> [[String: Any]] {
+        var at: [String: [Int]] = [:], order: [String] = []
+        for (i, s) in list.enumerated() {
+            if at[name(s)] == nil { order.append(name(s)) }
+            at[name(s), default: []].append(i + 1)
+        }
+        return order.compactMap { at[$0] }.filter { $0.count > 1 }.map { ["title": list[$0[0] - 1].title, "positions": $0] }
+    }
+
     private func list(_ args: [String: Any]) throws -> [String: Any] {
         let words = (args["query"] as? String ?? "").lowercased().split(separator: " ")
         let low = number(args["bpm_min"]) ?? 0, high = number(args["bpm_max"]) ?? .infinity
@@ -533,20 +558,31 @@ final class MCPServer {
             return words.allSatisfy { text.contains($0) } && Double(s.analysis.bpm) >= low && Double(s.analysis.bpm) <= high
                 && (key == nil || self.key(s).lowercased() == key) && (genre == nil || s.genre.rawValue == genre)
         }
+        if let set = args["not_in_set"] as? String {
+            // By name and not by id, so another version of a song the set has is left out with it. A filter here
+            // holds however much the agent is carrying: the sets that repeated a song were the long ones.
+            let paths = Set(try saved(set).songs.map(\.path)), held = Set(songs.filter { paths.contains($0.path) }.map(name))
+            matches = matches.filter { !held.contains(name($0)) }
+        }
         var clashing: Set<String> = []
-        if args["mixes_with"] != nil {
+        if let with = args["mixes_with"] {
             // Songs to go next to this one: a key that doesn't clash and a tempo the match can reach, at the
             // song's own tempo or half or double it, which the tempo match pairs two beats to one for. Other
-            // versions of the song itself are left out.
-            let other = try entry(args["mixes_with"])
-            let theirs = Self.camelot(self.key(other)), anyKey = args["any_key"] as? Bool == true
+            // versions of the song itself are left out. Given two songs, for the song between them when one in
+            // the middle of a set is replaced, a song has to pass for both.
+            let others = try (with as? [Any] ?? [with]).map { try entry($0) }
+            let anyKey = args["any_key"] as? Bool == true
             let reach = max(0, min(25, number(args["tempo_percent"]) ?? Self.tempoReach)) / 100
             matches = matches.filter { s in
-                let ratio = Double(s.analysis.bpm) / Double(max(other.analysis.bpm, 1))
-                guard name(s) != name(other), [0.5, 1, 2].contains(where: { abs(ratio / $0 - 1) <= reach }) else { return false }
-                if let theirs, let ours = Self.camelot(self.key(s)), Self.relation(theirs, ours) != "clash" { return true }
-                clashing.insert(s.id)
-                return anyKey
+                var clash = false
+                for other in others {
+                    let ratio = Double(s.analysis.bpm) / Double(max(other.analysis.bpm, 1))
+                    guard name(s) != name(other), [0.5, 1, 2].contains(where: { abs(ratio / $0 - 1) <= reach }) else { return false }
+                    if let theirs = Self.camelot(self.key(other)), let ours = Self.camelot(self.key(s)), Self.relation(theirs, ours) != "clash" { continue }
+                    clash = true
+                }
+                if clash { clashing.insert(s.id) }
+                return !clash || anyKey
             }
         }
         if args["unique"] as? Bool ?? true { matches = unique(matches) }
@@ -1370,10 +1406,14 @@ final class MCPServer {
         return ["name": name, "path": url.path, "songs": list.count, "transitions": transitions.count]
     }
 
-    private func load(_ name: String) async throws -> [String: Any] {
+    private func saved(_ name: String) throws -> SavedSet {
         let url = setsFolder.appendingPathComponent(Self.fileName(name) + ".json")
         guard let data = try? Data(contentsOf: url) else { throw PlannerError("no saved set called \(name); see list_sets") }
-        let saved = try JSONDecoder().decode(SavedSet.self, from: data)
+        return try JSONDecoder().decode(SavedSet.self, from: data)
+    }
+
+    private func load(_ name: String) async throws -> [String: Any] {
+        let saved = try saved(name)
         let added = await add(saved.songs.map(\.path))
         var ids: [String?] = []
         for song in saved.songs {
@@ -1392,7 +1432,13 @@ final class MCPServer {
             if t.handTempo { handTempo.insert(key) } else { handTempo.remove(key) }
             restored += 1
         }
-        return ["name": name, "songs": ids.map { $0 ?? NSNull() as Any }, "transitions_restored": restored, "transitions_saved": saved.transitions.count,
+        // The tracklist, so an agent carrying on with a set knows what is in it without planning all of it:
+        // plan_set for the 36 songs of an hour is 24,000 characters, and this is about 3,000.
+        let rows = ids.enumerated().map { i, id -> [String: Any] in
+            guard let s = songs.first(where: { $0.id == id }) else { return ["n": i + 1, "missing": saved.songs[i].path] }
+            return s.artist.isEmpty ? ["n": i + 1, "id": s.id, "title": s.title] : ["n": i + 1, "id": s.id, "title": s.title, "artist": s.artist]
+        }
+        return ["name": name, "songs": rows, "transitions_restored": restored, "transitions_saved": saved.transitions.count,
                 "failed": added["failed"] ?? []]
     }
 
@@ -1421,10 +1467,13 @@ final class MCPServer {
                                 pitch: Double(s.keyShift))
     }
 
-    private func renderTransition(_ a: Entry, _ b: Entry, margin: Double, out url: URL, soundCheck: Bool) async throws -> [String: Any] {
+    private func renderTransition(_ a: Entry, _ b: Entry, margin: Double, out url: URL, soundCheck: Bool, solo: String? = nil) async throws -> [String: Any] {
         let plan = try plan(a, b)
-        let items = [try await item(a, entering: nil, leaving: plan.outgoing, soundCheck: soundCheck),
+        var items = [try await item(a, entering: nil, leaving: plan.outgoing, soundCheck: soundCheck),
                      try await item(b, entering: plan.incoming, leaving: nil, soundCheck: soundCheck)]
+        // A song alone is the same render with the other song silent, not a render of one song: the muted song still
+        // runs the clock, so the three files line up to the sample and can be compared second by second.
+        if let solo { items[solo == "outgoing" ? 1 : 0].gain = 0 }
         let start = max(0, plan.outgoing.start - margin)
         let seconds = try MixRenderer.render(items, startTime: start, tail: margin, to: url)
         var json: [String: Any] = ["path": url.path, "seconds": r(seconds), "transition_starts_at": r(plan.outgoing.start - start),
@@ -1467,13 +1516,18 @@ final class MCPServer {
     ///
     /// Song times here are as played. A loop on the side that brings a song in pushes the rest of that song later,
     /// so the side that takes it out is moved by the same amount.
-    private func timeline(_ list: [Entry]) -> (entering: [TransitionSide?], leaving: [TransitionSide?], json: [String: Any]) {
+    ///
+    /// `report` is the positions, from 1, of the songs the timeline lists. The rest are still planned, since every
+    /// time after them depends on them, but a set is worked on a few songs at a time and listing all of it each
+    /// time is what fills an agent's context: 62 songs came to 42,000 characters planned and 55,000 rendered.
+    private func timeline(_ list: [Entry], report: ClosedRange<Int>? = nil) -> (entering: [TransitionSide?], leaving: [TransitionSide?], json: [String: Any]) {
+        let report = report ?? 1...list.count
         var entering: [TransitionSide?] = [nil], leaving: [TransitionSide?] = []
         var transitions: [[String: Any]] = [], played: [[String: Any]] = [], techniques: [String] = []
         var clock = 0.0, songTime = 0.0   // the mix clock and the current song's time, at the point reached so far
         var enteredAt = 0.0, enteredFrom = 0.0, pushed = 0.0
-        for (a, b) in zip(list, list.dropFirst()) {
-            var song: [String: Any] = ["id": a.id, "title": a.title, "enters_at": r(enteredAt), "plays_from": r(enteredFrom)]
+        for (i, (a, b)) in zip(list, list.dropFirst()).enumerated() {
+            var song: [String: Any] = ["n": i + 1, "id": a.id, "title": a.title, "enters_at": r(enteredAt), "plays_from": r(enteredFrom)]
             do {
                 let plan = try plan(a, b)
                 let out = plan.outgoing.retimed(by: pushed)
@@ -1486,7 +1540,7 @@ final class MCPServer {
                                     "length_bars": r((plan.outgoing.end - (edits[planKey(a, b)]?.outgoingTail ?? 0) - plan.outgoing.start) / barLength(a, plan.outgoing))])
                 techniques.append(technique)
                 // Every check, so the transitions that need work can be picked out here without asking for each.
-                transitions[transitions.count - 1]["checks"] = checks(a, b, plan)
+                if report.contains(i + 1), report.contains(i + 2) { transitions[transitions.count - 1]["checks"] = checks(a, b, plan) }
                 (enteredAt, enteredFrom) = (clock, plan.incoming.start)
                 // The clock moves on by the incoming side's length on it, which is when that song is on its own.
                 clock += plan.incoming.transitionTime(at: plan.incoming.end)
@@ -1507,7 +1561,7 @@ final class MCPServer {
             played.append(song)
         }
         let last = list[list.count - 1], end = last.analysis.duration + pushed
-        played.append(["id": last.id, "title": last.title, "enters_at": r(enteredAt), "plays_from": r(enteredFrom),
+        played.append(["n": list.count, "id": last.id, "title": last.title, "enters_at": r(enteredAt), "plays_from": r(enteredFrom),
                        "alone_seconds": r(end - songTime), "plays_to": r(last.analysis.duration)])
         leaving.append(nil)
         clock += end - songTime
@@ -1516,14 +1570,19 @@ final class MCPServer {
         while i < techniques.count {
             var j = i
             while j + 1 < techniques.count, techniques[j + 1] == techniques[i] { j += 1 }
-            if j - i >= 2 { runs.append(["technique": techniques[i], "count": j - i + 1, "first_transition": i + 1]) }
+            // Transition k, from 0, is between the songs at positions k + 1 and k + 2.
+            if j - i >= 2, i + 1 < report.upperBound, j + 2 > report.lowerBound { runs.append(["technique": techniques[i], "count": j - i + 1, "first_transition": i + 1]) }
             i = j + 1
         }
-        return (entering, leaving, ["seconds": r(clock), "songs": played, "transitions": transitions, "repeated": runs])
+        var json: [String: Any] = ["seconds": r(clock), "songs": Array(played[(report.lowerBound - 1)..<report.upperBound]),
+                                   "transitions": Array(transitions[(report.lowerBound - 1)..<(report.upperBound - 1)]), "repeated": runs]
+        let twice = duplicates(list)
+        if !twice.isEmpty { json["duplicates"] = twice }
+        return (entering, leaving, json)
     }
 
-    private func renderSet(_ list: [Entry], out url: URL, soundCheck: Bool) async throws -> [String: Any] {
-        var (entering, leaving, json) = timeline(list)
+    private func renderSet(_ list: [Entry], report: ClosedRange<Int>, out url: URL, soundCheck: Bool) async throws -> [String: Any] {
+        var (entering, leaving, json) = timeline(list, report: report)
         var items: [MixRenderer.Item] = []
         for (i, s) in list.enumerated() { items.append(try await item(s, entering: entering[i], leaving: leaving[i], soundCheck: soundCheck)) }
         json["seconds"] = r(try MixRenderer.render(items, startTime: 0, tail: nil, to: url))
