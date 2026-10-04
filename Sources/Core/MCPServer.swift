@@ -15,7 +15,8 @@ final class MCPServer {
         let path: String
         var title: String
         var artist: String
-        var genre: Genre = .pop
+        var year: Int?               // of release, from the file's date tag
+        var genre: Genre = .pop      // what the planner is told, not what the song sounds like
         var keyShift = 0             // semitones the whole song plays shifted by
         var gainDB = 0.0             // on top of Sound Check
         let playable: URL
@@ -181,15 +182,15 @@ final class MCPServer {
         return [
             tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. The first analysis of a song takes a few seconds; later ones come from the cache. Returns the songs added with their ids, or for more than 25 an overview: how many songs, how many by each artist and in each BPM band, each song counted once however many versions there are. Search them with list_songs.",
                  ["paths": ids("Absolute paths")], required: ["paths"]),
-            tool("list_songs", "Search the songs added this session: id, title, artist, BPM, key, length in seconds, genre when it is not Pop, and for a stem file where its stems came from when the title doesn't end with it: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them, so search for what you want rather than paging through everything.",
+            tool("list_songs", "Search the songs added this session: id, title, artist, year of release when the file has it, BPM, key, length in seconds, planner_genre when it is not Pop, and for a stem file where its stems came from when the title doesn't end with it: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them, so search for what you want rather than paging through everything. planner_genre is the set_genre setting and says nothing about how a song sounds; go by the title, artist and year for that.",
                  ["query": string("Words that must all appear in the title, artist or path"),
                   "bpm_min": number("Lowest BPM"), "bpm_max": number("Highest BPM"),
-                  "key": string("A key as list_songs shows it, such as G minor"), "genre": string("A genre set_genre takes"),
-                  "mixes_with": ["type": ["string", "array"], "items": ["type": "string"],
-                                 "description": "A song id: only songs that could go next to it, in a key that doesn't clash with its key and within 8% of its tempo, or of half or double it. Two ids, for a song to go between them: only songs that could go next to both"],
+                  "key": string("A key as list_songs shows it, such as G minor"), "genre": string("A planner genre set_genre takes"),
+                  "key_tempo_like": ["type": ["string", "array"], "items": ["type": "string"],
+                                 "description": "A song id: only songs in a key that doesn't clash with its key and within 8% of its tempo, or of half or double it. Two ids, for a song to go between them: only songs that pass for both. It tests key and tempo and nothing else, so it narrows the library and does not pick the song: most of what it returns would beat-match and still sound wrong next to it. Choose from the result by what you know of the songs, their style, era and mood, and pass over all of it when nothing belongs"],
                   "not_in_set": string("A saved set's name: leaves out the songs in it, whichever version"),
-                  "tempo_percent": number("With mixes_with, how far the tempo can be, in percent. Defaults to 8, 25 at most; widen it when few songs come back"),
-                  "any_key": bool("With mixes_with, keep songs in a clashing key too, after the others and marked key_clash. They can work when only the drums come in, since every other stem is pitched"),
+                  "tempo_percent": number("With key_tempo_like, how far the tempo can be, in percent. Defaults to 8, 25 at most; widen it when few songs come back"),
+                  "any_key": bool("With key_tempo_like, keep songs in a clashing key too, after the others and marked key_clash. They can work when only the drums come in, since every other stem is pitched"),
                   "overview": bool("Return how many songs match, by artist and by BPM band, in place of the songs"),
                   "unique": bool("List a song that is there in several versions once, as the version with the best stems. Defaults to true"),
                   "limit": integer("Most songs to return. Defaults to 50, and 100 at most"), "offset": integer("Songs to skip, to page through a long list")]),
@@ -197,7 +198,7 @@ final class MCPServer {
                  ["song": string("Song id"), "songs": ids("Song ids, to get several in one call as a list"), "beats": bool("Include every beat time"),
                   "bars": bool("Include every bar time. Defaults to true; turn it off when scanning many songs"),
                   "stems": bool("For a stem file, include how loud each stem is: per section in dB, and bar by bar as a row of digits, where 0 is silent, each step up is 6 dB and 9 is -6 dB or louder")]),
-            tool("set_genre", "Set the genre of one song, several, or all. Genres decide which transition styles Apple's planner can pick, and an edit belongs to the genres it was made with.",
+            tool("set_genre", "Set the genre of one song, several, or all. Genres decide which transition styles Apple's planner can pick, and an edit belongs to the genres it was made with. It is a setting for the planner and not a description of the song: setting a song to Dance does not make it sit well next to a dance song.",
                  ["song": string("Song id"), "songs": ids("Song ids"), "all": bool("Every song added"), "genre": genre], required: ["genre"]),
             tool("get_transition", "The planned transition between two songs with any edits applied: style, length, where each side starts and ends in song seconds, the handoff point, the automation lanes, and checks made without rendering: how far apart the beats and bars land, whether the keys go together, how long both songs have vocals at once, the predicted level in LUFS with any sag, and for two stem files how long the mix has no drums, no bass, two basses or two vocals.",
                  ["from": from, "to": to, "detail": detail("moving")], required: ["from", "to"]),
@@ -451,27 +452,38 @@ final class MCPServer {
             if item.commonKey == .commonKeyTitle { song.title = value }
             if item.commonKey == .commonKeyArtist { song.artist = value }
         }
+        // The date tag has no common key, as the genre tag has none, so it is looked up by each container's own
+        // identifier. A bare year or a dashed date is the release. Eight digits run together is the day a video
+        // was uploaded, which yt-dlp writes in the same tag: Flashing Lights, from 2007, carries 20190215.
+        let dates: [AVMetadataIdentifier] = [.iTunesMetadataReleaseDate, .id3MetadataYear, .id3MetadataRecordingTime, .quickTimeMetadataYear]
+        for item in (try? await asset.load(.metadata)) ?? [] {
+            guard let identifier = item.identifier, dates.contains(identifier), let value = try? await item.load(.stringValue) else { continue }
+            if value.count == 4 || value.dropFirst(4).hasPrefix("-") { song.year = Int(value.prefix(4)) }
+        }
         // As the app's library: only on adding, so a genre set since with set_genre or load_set is kept.
         if let tagged = await Genre.tagged(in: asset) { song.genre = tagged }
         return song
     }
 
     private func summary(_ s: Entry) -> [String: Any] {
-        var json: [String: Any] = ["id": s.id, "title": s.title, "artist": s.artist, "genre": s.genre.rawValue,
+        var json: [String: Any] = ["id": s.id, "title": s.title, "artist": s.artist, "planner_genre": s.genre.rawValue,
                                    "bpm": s.analysis.bpm, "key": key(s), "duration": r(s.analysis.duration)]
+        if let year = s.year { json["year"] = year }
         if let source = stemSource(s) { json["stems"] = source.name }
         if s.keyShift != 0 { json["key_shift"] = s.keyShift }
         if s.gainDB != 0 { json["gain_db"] = r(s.gainDB) }
         return json
     }
 
-    /// A song as list_songs shows it. A row is repeated for every song listed, so it leaves out what the rest of
+    /// A song as list_songs shows it. The genre is named planner_genre because it is a setting and not a
+    /// description: an agent that set every song to Dance for the plans it gives then read Dance on every row,
+    /// One More Time and Love Story alike. The year is the one thing here that says what kind of song it is. A row is repeated for every song listed, so it leaves out what the rest of
     /// it already says: Pop, which is what a song is unless it was set otherwise, and the stem source when the
     /// title ends with it. 593 songs came to about 30,000 tokens as full summaries.
     private func row(_ s: Entry) -> [String: Any] {
         var json = summary(s)
         json["duration"] = Int(s.analysis.duration.rounded())
-        if s.genre == .pop { json["genre"] = nil }
+        if s.genre == .pop { json["planner_genre"] = nil }
         if let source = stemSource(s), s.title.hasSuffix("(\(source.name))") { json["stems"] = nil }
         return json
     }
@@ -565,10 +577,14 @@ final class MCPServer {
             matches = matches.filter { !held.contains(name($0)) }
         }
         var clashing: Set<String> = []
-        if let with = args["mixes_with"] {
-            // Songs to go next to this one: a key that doesn't clash and a tempo the match can reach, at the
-            // song's own tempo or half or double it, which the tempo match pairs two beats to one for. Other
-            // versions of the song itself are left out. Given two songs, for the song between them when one in
+        if let with = args["key_tempo_like"] {
+            // Songs a transition to or from this one is possible with: a key that doesn't clash and a tempo the
+            // match can reach, at the song's own tempo or half or double it, which the tempo match pairs two
+            // beats to one for. Other versions of the song itself are left out. It was called mixes_with and
+            // described as the songs that could go next to this one, and an agent took passing it as the
+            // songs belonging together: it put One More Time into Love Story and good 4 u into Flashing Lights,
+            // which pass on key and tempo and share nothing else. The name, the description and the note on the
+            // result now say it is those two tests only. Given two songs, for the song between them when one in
             // the middle of a set is replaced, a song has to pass for both.
             let others = try (with as? [Any] ?? [with]).map { try entry($0) }
             let anyKey = args["any_key"] as? Bool == true
@@ -592,11 +608,14 @@ final class MCPServer {
         if args["overview"] as? Bool == true { return overview(matches) }
         // Capped, so the whole library can't be asked for in one call: an agent is meant to search it.
         let offset = max(0, Int(number(args["offset"]) ?? 0)), limit = max(1, min(100, Int(number(args["limit"]) ?? 50)))
-        return ["total": matches.count, "songs": matches.dropFirst(offset).prefix(limit).map { s -> [String: Any] in
+        var json: [String: Any] = ["total": matches.count, "songs": matches.dropFirst(offset).prefix(limit).map { s -> [String: Any] in
             var json = row(s)
             if clashing.contains(s.id) { json["key_clash"] = true }
             return json
         }]
+        // On the result and not only in the tool's description, so it is read with the list it is about.
+        if args["key_tempo_like"] != nil { json["note"] = "Matched on key and tempo only. Whether a song belongs next to it is yours to judge." }
+        return json
     }
 
     private func songDetail(_ song: Entry, _ args: [String: Any]) async throws -> [String: Any] {
