@@ -31,6 +31,24 @@ extension FocusedValues {
     }
 }
 
+struct ImportSetKey: FocusedValueKey { typealias Value = () -> Void }
+
+extension FocusedValues {
+    var importSet: (() -> Void)? {
+        get { self[ImportSetKey.self] }
+        set { self[ImportSetKey.self] = newValue }
+    }
+}
+
+struct ImportSetCommand: View {
+    @FocusedValue(\.importSet) private var importSet
+    var body: some View {
+        Button("Import Set…") { importSet?() }
+            .keyboardShortcut("i", modifiers: [.command, .shift])
+            .disabled(importSet == nil)
+    }
+}
+
 struct ExportMixCommand: View {
     @FocusedValue(\.exportMix) private var exportMix
     var body: some View {
@@ -60,7 +78,7 @@ struct PinkDiamondApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
-            CommandGroup(replacing: .importExport) { ExportMixCommand() }
+            CommandGroup(replacing: .importExport) { ImportSetCommand(); ExportMixCommand() }
         }
         Settings { SettingsView().environmentObject(library).environmentObject(player) }
     }
@@ -98,6 +116,7 @@ struct ContentView: View {
     @EnvironmentObject var player: MixPlayer
     @State private var selection: SidebarItem? = .library
     @State private var renaming: UUID?
+    @State private var importFailure: String?
     @FocusState private var renameFocused: Bool
 
     var body: some View {
@@ -118,7 +137,8 @@ struct ContentView: View {
                                 Text(playlist.name)
                             }
                         } icon: {
-                            Image(systemName: player.queue?.context == playlist.id ? "speaker.wave.2.fill" : "music.note.list")
+                            Image(systemName: player.queue?.context == playlist.id ? "speaker.wave.2.fill"
+                                  : playlist.mix == nil ? "music.note.list" : "diamond")
                         }
                         .tag(SidebarItem.playlist(playlist.id))
                         .contextMenu {
@@ -148,6 +168,24 @@ struct ContentView: View {
         }
         .tint(Theme.accent)
         .preferredColorScheme(.dark)
+        // Import lives in the menu bar (File → Import Set…), like Export Mix.
+        .focusedSceneValue(\.importSet, { importSet() })
+        .alert("Can't import the set", isPresented: Binding(get: { importFailure != nil }, set: { if !$0 { importFailure = nil } })) {
+            Button("OK") {}
+        } message: { Text(importFailure ?? "") }
+    }
+
+    /// Imports sets saved by the MCP server, each as a mix of its own.
+    private func importSet() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = true
+        panel.directoryURL = AppPaths.sets
+        panel.message = "Choose sets saved by the MCP server"
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls {
+            do { selection = .playlist(try library.importSet(url)) } catch { importFailure = String(describing: error) }
+        }
     }
 
     private func newPlaylist() {

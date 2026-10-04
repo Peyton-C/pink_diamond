@@ -24,19 +24,47 @@ struct PlanVariant: Codable, Hashable {
 }
 
 /// A stretch of a song played more than once before it carries on.
-struct SongLoop: Codable, Equatable {
+struct SongLoop: Codable, Hashable {
     var start: Double            // song seconds; in a TransitionEdit, from the start of that song's side
     var length: Double
     var repeats: Int             // times it plays again after the first
     var extra: Double { length * Double(repeats) }
 }
 
+/// A song's loops in order, in its time as played: each pushes everything after it later by its repeats, the loops
+/// after it included. The analysis and the file know nothing of them, so whatever draws a looped song goes through
+/// these, the way the renderer's `Chain.frame` does for its audio.
+extension Array where Element == SongLoop {
+    /// Where time `s` of the song as played is in its file.
+    func fileTime(_ s: Double) -> Double {
+        var offset = 0.0
+        for l in self where l.length > 0 {
+            if s < l.start { break }
+            if s < l.start + l.length + l.extra { return l.start - offset + (s - l.start).truncatingRemainder(dividingBy: l.length) }
+            offset += l.extra
+        }
+        return s - offset
+    }
+
+    /// Every time the song as played reaches time `f` of its file: once, or once a pass inside a loop.
+    func playedTimes(_ f: Double) -> [Double] {
+        var offset = 0.0
+        for l in self where l.length > 0 {
+            let first = l.start - offset
+            if f < first { break }
+            if f < first + l.length { return (0...l.repeats).map { f + offset + Double($0) * l.length } }
+            offset += l.extra
+        }
+        return [f + offset]
+    }
+}
+
 /// What the user changed about a planned transition. Stored instead of an edited plan, so it's small, survives a
 /// cache wipe (the planner is deterministic) and reapplies after a replan.
-struct TransitionEdit: Codable, Equatable {
+struct TransitionEdit: Codable, Hashable {
     /// An automation point, in song seconds from the start of its side of the transition, so it follows that side when
     /// it's moved.
-    struct Point: Codable, Equatable {
+    struct Point: Codable, Hashable {
         var offset: Double
         var value: Double
         var curve: String
@@ -157,6 +185,10 @@ extension TransitionSide {
                               loop: loop.map { SongLoop(start: $0.start + seconds, length: $0.length, repeats: $0.repeats) })
     }
 
+    /// This side as the way out of a song that came in through `entering`: a loop on the way in pushes the rest of
+    /// the song later, the way out included.
+    func following(_ entering: TransitionSide?) -> TransitionSide { retimed(by: entering?.loop?.extra ?? 0) }
+
     /// An automation's points as edit points, relative to this side's start.
     func editPoints(_ id: String) -> [TransitionEdit.Point] {
         (automations[id]?.points ?? []).map { .init(offset: $0.time - start, value: $0.value, curve: $0.curve) }
@@ -242,4 +274,25 @@ struct EffectPreset: Identifiable {
         default: [id]
         }
     }
+}
+
+/// A set as the MCP server saves it: its songs in order and the edited transitions between any two of them, by position.
+struct SavedSet: Codable {
+    struct Song: Codable { var path: String; var genre: Genre; var keyShift: Int; var gainDB: Double }
+    struct Transition: Codable { var from: Int; var to: Int; var edit: TransitionEdit; var technique: String?; var serverTempo: Bool; var handTempo: Bool }
+    var songs: [Song]
+    var transitions: [Transition]
+}
+
+/// A saved set as the app holds it once imported, on the playlist made for it: each song's genre and settings and each
+/// transition's edit, as the set had them. They belong to the mix alone, so the same songs anywhere else keep the
+/// library's genres and the user's own edits, and importing a set again makes a second mix rather than changing the
+/// first. The app shows and plays a mix but does not edit it: its transitions use what the editor has no controls
+/// for (stems, loops, tails), and most carry the server's tempo match, which has to be redrawn when a side moves.
+struct Mix: Codable, Hashable {
+    struct Song: Codable, Hashable { var genre: Genre; var keyShift: Int; var gainDB: Double }
+    var songs: [String: Song] = [:]              // by song id
+    var edits: [String: TransitionEdit] = [:]    // by `key`
+
+    static func key(_ a: UUID, _ b: UUID) -> String { "\(a)>\(b)" }
 }

@@ -13,7 +13,7 @@ Add `--automix-only` after `--mcp` to leave out everything Apple's AutoMix has n
 Add `--renders <folder>` to choose where named renders go. Without it they go to `~/Music/pink diamond`.
 
 ## Session
-The server keeps its songs, genres and edits in memory and forgets them when it exits, unless they are saved as a set. It does not read or change the app's library, playlists or saved edits. It shares only the analysis cache, so a song either has analyzed is ready in both.
+The server keeps its songs, genres and edits in memory and forgets them when it exits, unless they are saved as a set. It does not read or change the app's library, playlists or saved edits. It shares only the analysis cache, so a song either has analyzed is ready in both. A saved set can be brought into the app, see below.
 
 Add songs first with `add_songs`. Every other tool takes the song ids it returns. An id stays the same for a file between sessions, as long as the file is not moved or changed.
 
@@ -112,6 +112,13 @@ A transition's `technique` is its moves, or the planner's style, or for one draw
 ## Saved sets
 `save_set` writes the songs you name, in order, with their genres and settings and every edited transition between any two of them, to `~/Library/Application Support/pink diamond/sets/`. `load_set` adds the songs again and puts the edits back, so a set can be fixed after a restart instead of rebuilt. A set saved with extensions loads without its extended transitions when the server runs with `--automix-only`.
 
+## Sets in the app
+Choose File, Import Set in the app to bring a saved set in as a mix, a playlist of its own marked with a ◆ in the sidebar. pink diamond adds any songs the library does not have, and plays and exports the mix exactly as `render_set` renders it, stems, loops, tails, key shifts and gains included.
+
+A mix is a copy. Saving the set again does not change it, and importing the set again makes a second mix beside the first, so earlier versions stay until you delete them. The mix keeps its own genres, settings and transitions, so the same songs in another playlist are not affected.
+
+A mix is read-only. The deck view shows its transitions with their lanes, loops and tails, and previews them, but nothing can be dragged, and its songs cannot be reordered, added to or shuffled.
+
 ## Tails and loops
 A tail lets the outgoing song play past the window, so a fade can finish or an echo can ring under the new song. Lane offsets past the window reach into the tail, and the song stops when the tail ends, so bring its volume down before then.
 
@@ -125,7 +132,7 @@ An incoming loop leaves the window as it is and changes what fills it: the incom
 For a stem file, lanes named `stem_drums`, `stem_bass`, `stem_other` and `stem_vocals` set each stem's level from 0 to 2, where 1 is as recorded. A stem is at 1 wherever no lane sets it, so bring it back to 1 before the incoming side ends or it jumps back. A song with a stem lane plays as the sum of its stems for the whole song, which is close to the mixdown but not identical; every other song plays its mixdown.
 
 ## Limits
-The server has no playback, playlists or live mode. Tails, loops and stems exist only here: the app's editor does not show or set them. An agent hears nothing: rendering gives it a WAV file and timings.
+The server has no playback, playlists or live mode. Tails, loops, stems and song settings are made only here: the app shows and plays them in an imported set, and its editor does not set them. An agent hears nothing: rendering gives it a WAV file and timings.
 
 One request runs at a time, and a render blocks until it finishes.
 

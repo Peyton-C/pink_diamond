@@ -161,7 +161,7 @@ struct SongTable: View {
         }
         .contextMenu(forSelectionType: UUID.self) { ids in
             Menu("Add to Playlist") {
-                ForEach(library.playlists) { p in
+                ForEach(library.playlists.filter { $0.mix == nil }) { p in
                     Button(p.name) { addToPlaylist(p.id, ids) }
                 }
             }

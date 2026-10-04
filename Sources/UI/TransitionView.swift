@@ -23,10 +23,17 @@ struct SideTimeline {
         songTimes = s; times = t
     }
 
+    /// When this song's side is over on the transition's clock. A mix's outgoing song can play on past the window,
+    /// through its tail.
+    var end: Double { isOutgoing ? max(duration, times.last ?? duration) : duration }
+
+    /// The side's loop, for finding a song time as played in the song's file and analysis.
+    var loops: [SongLoop] { side.loop.map { [$0] } ?? [] }
+
     /// Song time playing at transition time `t`, or nil when this song is silent then.
     func songTime(at t: Double) -> Double? {
         if t < 0 { return side.start + t }          // before the transition (incoming: shown dimmed as a preview)
-        if t > duration { return isOutgoing ? nil : side.end + (t - duration) }
+        if t > end { return isOutgoing ? nil : side.end + (t - duration) }
         var lo = 0, hi = times.count - 1
         while lo < hi { let mid = (lo + hi + 1) / 2; if times[mid] <= t { lo = mid } else { hi = mid - 1 } }
         guard lo + 1 < times.count else { return songTimes.last }
@@ -37,7 +44,7 @@ struct SideTimeline {
     /// Transition time at which song time `s` plays.
     func transitionTime(at s: Double) -> Double {
         if s < side.start { return s - side.start }
-        if s > side.end { return duration + (s - side.end) }
+        if s > side.end { return end + (s - side.end) }
         var lo = 0, hi = songTimes.count - 1
         while lo < hi { let mid = (lo + hi + 1) / 2; if songTimes[mid] <= s { lo = mid } else { hi = mid - 1 } }
         guard lo + 1 < songTimes.count else { return times.last ?? duration }
@@ -46,7 +53,7 @@ struct SideTimeline {
     }
 
     /// Whether the song is audible at `t` (the incoming song is silent before the transition).
-    func audible(at t: Double) -> Bool { isOutgoing ? t <= duration : t >= 0 }
+    func audible(at t: Double) -> Bool { isOutgoing ? t <= end : t >= 0 }
 }
 
 /// The deck view, which is also the mix editor: drag a song to move its side of the transition by bars, edit or add
@@ -58,6 +65,7 @@ struct TransitionView: View {
     @Environment(\.undoManager) private var undo
     let ref: TransitionRef
     let plan: TransitionPlan
+    var playlist: UUID? = nil    // the playlist it is shown in, whose transition it is when that is a mix
     @StateObject private var player = PreviewPlayer()
     @State private var dragStart: TransitionEdit?   // the edit before the drag under way, for undo
     @State private var showingStyles = false
@@ -65,7 +73,9 @@ struct TransitionView: View {
 
     private var from: Song? { library.song(ref.from) }
     private var to: Song? { library.song(ref.to) }
-    private var edit: TransitionEdit { library.edit(from: ref.from, to: ref.to) }
+    private var edit: TransitionEdit { library.edit(from: ref.from, to: ref.to, in: playlist) }
+    /// A mix's transitions are shown as they were made, with nothing to drag.
+    private var locked: Bool { library.isMix(playlist) }
 
     var body: some View {
         let out = SideTimeline(side: plan.outgoing, isOutgoing: true, duration: plan.duration)
@@ -75,29 +85,29 @@ struct TransitionView: View {
         VStack(alignment: .leading, spacing: 10) {
             header
             GeometryReader { geo in
-                let range = -Self.margin...(plan.duration + Self.margin)
+                let range = -Self.margin...(out.end + Self.margin)
                 ScrollView(.vertical) {
                     VStack(spacing: 6) {
                         TimeRuler(range: range, duration: plan.duration, pivot: plan.pivot,
-                                  onLength: { resize(by: $0, ended: $1) })
+                                  onLength: locked ? nil : { resize(by: $0, ended: $1) })
                             .frame(height: 18)
                         // Each song's effects sit on its outer side, the outgoing song's above it and the incoming
                         // song's below, so the two waveforms stay together in the middle.
                         EffectLanes(plan: plan, timeline: out, color: Theme.outgoing, range: range, playhead: playhead,
-                                    pinned: pinned(base?.outgoing, edit.outgoing), presets: presets(plan.outgoing),
-                                    onChange: { setLane(true, $0, $1, ended: $2) }, onAdd: { addPreset($0, outgoing: true) },
+                                    pinned: pinned(base?.outgoing, edit.outgoing), presets: locked ? [] : presets(plan.outgoing),
+                                    onChange: locked ? nil : { setLane(true, $0, $1, ended: $2) }, onAdd: { addPreset($0, outgoing: true) },
                                     onRemove: { removeLane($0, outgoing: true) }, onReset: resetLane(true, base?.outgoing))
                         DeckLane(title: from?.title ?? "outgoing", color: Theme.outgoing, timeline: out,
                                  analysis: library.analyses[ref.from], range: range, plan: plan, playhead: playhead,
-                                 onDrag: { move(true, by: $0, ended: $1) })
+                                 onDrag: locked ? nil : { move(true, by: $0, ended: $1) })
                             .frame(height: 92)
                         DeckLane(title: to?.title ?? "incoming", color: Theme.incoming, timeline: inc,
                                  analysis: library.analyses[ref.to], range: range, plan: plan, playhead: playhead,
-                                 onDrag: { move(false, by: $0, ended: $1) })
+                                 onDrag: locked ? nil : { move(false, by: $0, ended: $1) })
                             .frame(height: 92)
                         EffectLanes(plan: plan, timeline: inc, color: Theme.incoming, range: range, playhead: playhead,
-                                    pinned: pinned(base?.incoming, edit.incoming), presets: presets(plan.incoming),
-                                    onChange: { setLane(false, $0, $1, ended: $2) }, onAdd: { addPreset($0, outgoing: false) },
+                                    pinned: pinned(base?.incoming, edit.incoming), presets: locked ? [] : presets(plan.incoming),
+                                    onChange: locked ? nil : { setLane(false, $0, $1, ended: $2) }, onAdd: { addPreset($0, outgoing: false) },
                                     onRemove: { removeLane($0, outgoing: false) }, onReset: resetLane(false, base?.incoming))
                     }
                     .frame(width: geo.size.width)
@@ -122,8 +132,13 @@ struct TransitionView: View {
                 .font(.system(size: 15, weight: .bold))
                 HStack(spacing: 10) {
                     StyleChip(plan: plan)
-                    if edit.hasChanges { Text("edited").foregroundStyle(Theme.accent) }
-                    lengthControl
+                    if locked {
+                        Text("mix").foregroundStyle(Theme.accent).help("Imported from a saved set. It plays as it was made and can't be edited here.")
+                        Text(barsLabel)
+                    } else {
+                        if edit.hasChanges { Text("edited").foregroundStyle(Theme.accent) }
+                        lengthControl
+                    }
                     Text(String(format: "%.1f s", plan.duration))
                     Text("out \(Theme.time(plan.outgoing.start)) → \(Theme.time(plan.outgoing.end))").foregroundStyle(Theme.outgoing)
                     Text("in \(Theme.time(plan.incoming.start)) → \(Theme.time(plan.incoming.end))").foregroundStyle(Theme.incoming)
@@ -135,17 +150,19 @@ struct TransitionView: View {
                 .font(.system(size: 11)).monospacedDigit()
             }
             Spacer()
-            Button { showingStyles = true } label: { Label("Styles", systemImage: "diamond") }
-                .help("Other plans Apple's planner makes for these two songs")
-                .popover(isPresented: $showingStyles, arrowEdge: .bottom) {
-                    StylePicker(ref: ref, current: edit.variant) { variant in
-                        showingStyles = false
-                        apply(TransitionEdit(variant: variant), ended: true)
+            if !locked {
+                Button { showingStyles = true } label: { Label("Styles", systemImage: "diamond") }
+                    .help("Other plans Apple's planner makes for these two songs")
+                    .popover(isPresented: $showingStyles, arrowEdge: .bottom) {
+                        StylePicker(ref: ref, current: edit.variant) { variant in
+                            showingStyles = false
+                            apply(TransitionEdit(variant: variant), ended: true)
+                        }
                     }
-                }
-            Button("Reset") { apply(TransitionEdit(), ended: true) }
-                .help("Back to Apple's plan")
-                .disabled(edit.isEmpty)
+                Button("Reset") { apply(TransitionEdit(), ended: true) }
+                    .help("Back to Apple's plan")
+                    .disabled(edit.isEmpty)
+            }
             Button {
                 player.isPlaying ? player.stop() : preview()
             } label: {
@@ -160,18 +177,15 @@ struct TransitionView: View {
     }
 
     private func preview() {
-        guard let a = library.playableURL(ref.from), let b = library.playableURL(ref.to),
-              let aa = library.analyses[ref.from], let ab = library.analyses[ref.to] else { return }
+        guard let items = try? library.previewItems(plan, from: ref.from, to: ref.to, in: playlist) else { return }
         mixPlayer.pause()   // one thing plays at a time
-        let items = [MixRenderer.Item(audio: a, beats: aa.beats, entering: nil, leaving: plan.outgoing, gain: library.gain(ref.from)),
-                     MixRenderer.Item(audio: b, beats: ab.beats, entering: plan.incoming, leaving: nil, gain: library.gain(ref.to))]
         player.renderAndPlay(items, startTime: plan.outgoing.start - Self.margin, tail: Self.margin, offset: -Self.margin)
     }
 
     // MARK: Editing
 
     private var basePlan: TransitionPlan? {
-        if case .ready(let p) = library.basePlan(from: ref.from, to: ref.to, variant: edit.variant) { return p }
+        if case .ready(let p) = library.basePlan(from: ref.from, to: ref.to, variant: edit.variant, in: playlist) { return p }
         return nil
     }
 
@@ -239,8 +253,12 @@ struct TransitionView: View {
         return d.isEmpty ? 240 / Double(max(a.bpm, 1)) : d[d.count / 2]
     }
 
-    /// The transition's length in the outgoing song's bars.
-    private var bars: Double { (plan.outgoing.end - plan.outgoing.start) / barLength }
+    /// The transition's length in the outgoing song's bars. A mix's tail plays after the transition, not in it.
+    private var bars: Double { (plan.outgoing.end - edit.outgoingTail - plan.outgoing.start) / barLength }
+
+    private var barsLabel: String {
+        abs(bars - bars.rounded()) < 0.05 ? "\(Int(bars.rounded())) bars" : String(format: "%.1f bars", bars)
+    }
 
     /// Lengths the control snaps to: phrase lengths (1, 2, then every 4 bars), or every bar with ⇧.
     private static func lengths(perBar: Bool) -> [Double] {
@@ -250,8 +268,7 @@ struct TransitionView: View {
     private var lengthControl: some View {
         HStack(spacing: 2) {
             Button { step(-1) } label: { Image(systemName: "minus") }
-            Text(abs(bars - bars.rounded()) < 0.05 ? "\(Int(bars.rounded())) bars" : String(format: "%.1f bars", bars))
-                .frame(minWidth: 52)
+            Text(barsLabel).frame(minWidth: 52)
             Button { step(1) } label: { Image(systemName: "plus") }
         }
         .buttonStyle(.borderless)
@@ -458,7 +475,7 @@ struct DeckLane: View {
                     .gesture(DragGesture(minimumDistance: 2)
                         .onChanged { onDrag?(seconds($0.translation.width), false) }
                         .onEnded { onDrag?(seconds($0.translation.width), true) })
-                    .help("Drag to move this song's side of the transition by bars, ⌥ for beats")
+                    .help(onDrag == nil ? "" : "Drag to move this song's side of the transition by bars, ⌥ for beats")
             }
         }
     }
@@ -472,14 +489,20 @@ struct DeckLane: View {
         let wf = analysis.waveform
         let spp = wf.secondsPerPoint
         let volume = timeline.side.automations["out_gain"]
+        // The side's times count a loop's repeats. The waveform and the grid are the file's.
+        let loops = timeline.loops
+        for loop in loops {
+            let x0 = x(timeline.transitionTime(at: loop.start + loop.length)), x1 = x(timeline.transitionTime(at: loop.start + loop.length + loop.extra))
+            ctx.fill(Path(CGRect(x: x0, y: 0, width: x1 - x0, height: size.height)), with: .color(Theme.accent.opacity(0.12)))
+        }
         // Waveform columns, colored by band (low red, mid green, high blue), height × output volume.
         for col in stride(from: 0.0, to: width, by: 1) {
             let t = range.lowerBound + col / width * (range.upperBound - range.lowerBound)
             guard let s = timeline.songTime(at: t), s >= 0 else { continue }
-            let i = Int(s / spp)
+            let i = Int(loops.fileTime(s) / spp)
             guard i >= 0, i < wf.peak.count else { continue }
             var gain = 1.0
-            if t >= 0, t <= plan.duration, let v = volume?.value(at: s) { gain = v }
+            if t >= 0, t <= timeline.end, let v = volume?.value(at: s) { gain = v }
             let dim = timeline.audible(at: t) ? 1.0 : 0.25
             let h = Double(wf.peak[i]) * gain * (mid - 2)
             let c = Color(red: Double(wf.low[i]) * 1.6 + 0.15, green: Double(wf.mid[i]) * 1.3 + 0.15, blue: Double(wf.high[i]) * 1.6 + 0.2)
@@ -488,19 +511,19 @@ struct DeckLane: View {
         // Beat grid, bars, sections.
         let bars = Set(analysis.bars.map { Int(($0 * 100).rounded()) })
         for b in analysis.beats {
-            let t = timeline.transitionTime(at: b)
-            guard range.contains(t) else { continue }
             let isBar = bars.contains(Int((b * 100).rounded()))
-            ctx.fill(Path(CGRect(x: x(t), y: isBar ? 0 : size.height - 8, width: isBar ? 1 : 0.5, height: isBar ? size.height : 8)),
-                     with: .color(.white.opacity(isBar ? 0.22 : 0.18)))
+            for t in loops.playedTimes(b).map(timeline.transitionTime(at:)) where range.contains(t) {
+                ctx.fill(Path(CGRect(x: x(t), y: isBar ? 0 : size.height - 8, width: isBar ? 1 : 0.5, height: isBar ? size.height : 8)),
+                         with: .color(.white.opacity(isBar ? 0.22 : 0.18)))
+            }
         }
         for sec in analysis.sections {
-            let t = timeline.transitionTime(at: sec)
-            guard range.contains(t) else { continue }
-            ctx.draw(Text("◆").font(.system(size: 9)).foregroundColor(Theme.accent), at: CGPoint(x: x(t), y: 7))
+            for t in loops.playedTimes(sec).map(timeline.transitionTime(at:)) where range.contains(t) {
+                ctx.draw(Text("◆").font(.system(size: 9)).foregroundColor(Theme.accent), at: CGPoint(x: x(t), y: 7))
+            }
         }
-        // Transition edges and pivot.
-        for (t, o) in [(0.0, 0.6), (plan.duration, 0.6), (plan.pivot, 0.35)] {
+        // Transition edges and pivot, and where a tail ends.
+        for (t, o) in [(0.0, 0.6), (plan.duration, 0.6), (plan.pivot, 0.35)] + (timeline.end > plan.duration + 0.01 ? [(timeline.end, 0.35)] : []) {
             ctx.fill(Path(CGRect(x: x(t), y: 0, width: 1, height: size.height)), with: .color(Theme.accent.opacity(o)))
         }
         if let playhead, range.contains(playhead) {
@@ -660,7 +683,7 @@ struct EffectLanes: View {
         var path = Path()
         var fill = Path()
         var started = false
-        for col in stride(from: max(0, x(0)), through: min(width, x(plan.duration)), by: 1) {
+        for col in stride(from: max(0, x(0)), through: min(width, x(timeline.end)), by: 1) {
             let t = range.lowerBound + col / width * (range.upperBound - range.lowerBound)
             guard let s = timeline.songTime(at: t), let v = lane.value(at: s) else { continue }
             let n = EffectCatalog.normalize(lane, v)

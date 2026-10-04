@@ -23,11 +23,17 @@ final class MixPlayer: ObservableObject {
     private let engine = AVAudioEngine()
     private let node = AVAudioPlayerNode()
     private var session: Session?
+    private var loops: [[SongLoop]] = []   // each queued song's, as rendered
     private var timer: Timer?
 
     /// Index into `queue.ids` of the song the listener hears, and its song time.
     var index: Int { position?.index ?? 0 }
-    var songTime: Double { position?.songTime ?? 0 }
+    /// In the song's file, not as played: a mix's loops play a stretch more than once, and the seek slider, the
+    /// system's elapsed time and a restart at this point all mean the place in the song.
+    var songTime: Double {
+        guard let position else { return 0 }
+        return loops.indices.contains(position.index) ? loops[position.index].fileTime(position.songTime) : position.songTime
+    }
     var currentSongID: UUID? { queue.map { $0.ids[min(index, $0.ids.count - 1)] } }
     /// Position of the current song in the order being played: the playlist, or the shuffled order.
     var currentPosition: Int? { queue.map { $0.startIndex + index } }
@@ -57,7 +63,8 @@ final class MixPlayer: ObservableObject {
     /// Starts `playlist` from the song at `index`, or from the top. With shuffle on that song comes first and the
     /// rest follow in a random order, and from the top means from any song.
     func start(_ playlist: UUID, from index: Int? = nil) async throws {
-        guard shuffle, var rest = library.playlists.first(where: { $0.id == playlist })?.songIDs else {
+        // A mix plays in its own order: its transitions were made for it.
+        guard shuffle, !library.isMix(playlist), var rest = library.playlists.first(where: { $0.id == playlist })?.songIDs else {
             return try play(playlist, from: index ?? 0)
         }
         let first = index.flatMap { rest.indices.contains($0) ? rest.remove(at: $0) : nil }
@@ -71,7 +78,7 @@ final class MixPlayer: ObservableObject {
     func setShuffle(_ on: Bool) async throws {
         shuffle = on
         UserDefaults.standard.set(on, forKey: "shuffle")
-        guard let queue, (queue.shuffled != nil) != on, let id = currentSongID,
+        guard let queue, !library.isMix(queue.context), (queue.shuffled != nil) != on, let id = currentSongID,
               var rest = library.playlists.first(where: { $0.id == queue.context })?.songIDs,
               let at = rest.firstIndex(of: id) else { return }
         guard on else { return try play(queue.context, from: at, at: songTime, paused: isPaused) }
@@ -87,21 +94,25 @@ final class MixPlayer: ObservableObject {
                       paused: Bool = false) throws {
         guard order.indices.contains(index) else { return }
         let queue = Queue(context: playlist, ids: Array(order[index...]), startIndex: index, shuffled: shuffled ? order : nil)
-        let items = try library.mixItems(queue.ids)
+        let items = try library.mixItems(queue.ids, in: playlist)
         stop()
+        loops = items.map(\.loops)
+        // `time` is a place in the song's file. The renderer runs on the song as played, where a loop on the way out
+        // makes everything after it later.
+        let start = items[0].loops.playedTimes(time).first ?? time
         do { try engine.start() } catch { throw PlannerError("couldn't start audio output: \(error)") }
         let session = Session()
         self.session = session
         self.queue = queue
         isPaused = paused
-        position = MixRenderer.Position(index: 0, songTime: time, deck: 0, deckOut: time, deckIn: nil)
+        position = MixRenderer.Position(index: 0, songTime: start, deck: 0, deckOut: start, deckIn: nil)
         enteredAt = time
         timer = Timer.scheduledTimer(withTimeInterval: 1 / 30, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
         let node = node
         Thread.detachNewThread {
-            session.run(items, startTime: time, node: node) { event in
+            session.run(items, startTime: start, node: node) { event in
                 Task { @MainActor [weak self] in
                     guard let self, self.session === session else { return }
                     switch event {
@@ -165,8 +176,8 @@ final class MixPlayer: ObservableObject {
         session.setPlayed(played)
         guard let p = session.position(at: played) else { return }
         let changed = p.index != position?.index
-        if changed { enteredAt = p.songTime }
         position = p
+        if changed { enteredAt = songTime }
         if changed { updateNowPlaying() }
     }
 

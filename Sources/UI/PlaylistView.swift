@@ -13,6 +13,8 @@ struct PlaylistView: View {
     @State private var failure: (title: String, message: String)?
 
     private var playlist: Playlist? { library.playlists.first { $0.id == playlistID } }
+    /// An imported set, which is shown and played but not changed.
+    private var isMix: Bool { playlist?.mix != nil }
 
     var body: some View {
         VSplitView {
@@ -20,7 +22,7 @@ struct PlaylistView: View {
                 if player.queue?.context == playlistID {
                     LiveDeckView()
                 } else if let selected, let plan = planIfReady(selected) {
-                    TransitionView(ref: selected, plan: plan)
+                    TransitionView(ref: selected, plan: plan, playlist: playlistID)
                 } else {
                     ContentUnavailableView("Select a transition", systemImage: "arrow.down.forward.and.arrow.up.backward",
                                            description: Text("Click the ◆ between two songs below to open it in the deck view"))
@@ -48,7 +50,8 @@ struct PlaylistView: View {
                 Toggle(isOn: Binding(get: { player.shuffle }, set: { on in attempt { try await player.setShuffle(on) } })) {
                     Label("Shuffle", systemImage: "shuffle")
                 }
-                .help("Play playlists in a random order")
+                .help(isMix ? "A mix plays in its own order" : "Play playlists in a random order")
+                .disabled(isMix)
             }
         }
         .overlay(alignment: .bottom) {
@@ -88,31 +91,33 @@ struct PlaylistView: View {
             if let playlist {
                 ForEach(Array(playlist.songIDs.enumerated()), id: \.offset) { index, id in
                     VStack(alignment: .leading, spacing: 4) {
-                        SongRow(song: library.song(id), artwork: library.cover(id), summary: library.summaries[id], index: index + 1,
-                                playing: isPlaying(index, id))
+                        SongRow(song: library.song(id, in: playlistID), artwork: library.cover(id), summary: library.summaries[id], index: index + 1,
+                                playing: isPlaying(index, id), settings: playlist.mix?.songs[id.uuidString])
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(Rectangle())
                             .onTapGesture(count: 2) { play(from: index) }
                             .contextMenu { Button("Play from Here") { play(from: index) } }
                         if index + 1 < playlist.songIDs.count {
                             let ref = TransitionRef(from: id, to: playlist.songIDs[index + 1])
-                            TransitionRow(ref: ref, state: library.plan(from: ref.from, to: ref.to), selected: (liveRef ?? selected) == ref,
-                                          edited: !library.edit(from: ref.from, to: ref.to).isEmpty)
+                            TransitionRow(ref: ref, state: library.plan(from: ref.from, to: ref.to, in: playlistID),
+                                          selected: (liveRef ?? selected) == ref,
+                                          edited: !library.edit(from: ref.from, to: ref.to, in: playlistID).isEmpty)
                                 .onTapGesture { selected = ref }
                         }
                     }
                 }
-                .onMove { from, to in
+                .onMove(perform: isMix ? nil : { from, to in
                     move(from, to)
-                }
-                .onDelete { offsets in
+                })
+                .onDelete(perform: isMix ? nil : { offsets in
                     guard let i = library.playlists.firstIndex(where: { $0.id == playlistID }) else { return }
                     library.playlists[i].songIDs.remove(atOffsets: offsets)
                     library.save()
-                }
+                })
             }
         }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            guard !isMix else { return false }
             loadURLs(providers) { urls in
                 library.add(urls)
                 guard let i = library.playlists.firstIndex(where: { $0.id == playlistID }) else { return }
@@ -138,7 +143,7 @@ struct PlaylistView: View {
     }
 
     private func planIfReady(_ ref: TransitionRef) -> TransitionPlan? {
-        if case .ready(let p) = library.plan(from: ref.from, to: ref.to) { return p }
+        if case .ready(let p) = library.plan(from: ref.from, to: ref.to, in: playlistID) { return p }
         return nil
     }
 
@@ -149,7 +154,7 @@ struct PlaylistView: View {
         panel.nameFieldStringValue = "\(playlist.name).wav"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let items: [MixRenderer.Item]
-        do { items = try library.mixItems(playlist.songIDs) } catch { failure = ("Export failed", String(describing: error)); return }
+        do { items = try library.mixItems(playlist.songIDs, in: playlistID) } catch { failure = ("Export failed", String(describing: error)); return }
         exporting = true
         exportProgress = 0
         Task.detached {
@@ -171,6 +176,7 @@ struct SongRow: View {
     let summary: SongSummary?
     let index: Int
     var playing = false
+    var settings: Mix.Song? = nil   // what a mix plays the song with
     var body: some View {
         HStack(spacing: 10) {
             Group {
@@ -188,6 +194,10 @@ struct SongRow: View {
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
+            if let settings {
+                if settings.keyShift != 0 { Text(String(format: "%+d st", settings.keyShift)).foregroundStyle(Theme.accent).help("Key shift in this mix") }
+                if settings.gainDB != 0 { Text(String(format: "%+.1f dB", settings.gainDB)).foregroundStyle(Theme.accent).help("Gain in this mix") }
+            }
             if let summary {
                 Text("\(summary.bpm) BPM").monospacedDigit()
                 KeyBadge(key: summary.key).frame(width: 44, alignment: .trailing)

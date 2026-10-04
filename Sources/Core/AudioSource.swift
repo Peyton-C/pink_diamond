@@ -14,6 +14,8 @@ enum AppPaths {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
+    /// Where the MCP server saves sets, and the app looks for them to import.
+    static var sets: URL { support.appendingPathComponent("sets") }
     static var cache: URL {
         let url = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent(appName)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)

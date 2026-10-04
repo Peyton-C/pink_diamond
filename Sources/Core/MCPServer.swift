@@ -1348,15 +1348,7 @@ final class MCPServer {
 
     // MARK: Saved sets
 
-    /// A set as saved: its songs in order and the edited transitions between any two of them, by position.
-    private struct SavedSet: Codable {
-        struct Song: Codable { var path: String; var genre: Genre; var keyShift: Int; var gainDB: Double }
-        struct Transition: Codable { var from: Int; var to: Int; var edit: TransitionEdit; var technique: String?; var serverTempo: Bool; var handTempo: Bool }
-        var songs: [Song]
-        var transitions: [Transition]
-    }
-
-    private var setsFolder: URL { AppPaths.support.appendingPathComponent("sets") }
+    private var setsFolder: URL { AppPaths.sets }
 
     private func save(_ name: String, _ list: [Entry]) throws -> [String: Any] {
         var transitions: [SavedSet.Transition] = []

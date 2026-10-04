@@ -21,6 +21,8 @@ struct Playlist: Codable, Identifiable, Hashable {
     var id = UUID()
     var name: String
     var songIDs: [UUID] = []
+    /// Set on a playlist made by importing a saved set, which plays with the set's own genres, settings and edits.
+    var mix: Mix?
 }
 
 enum SongState: Equatable {
@@ -54,6 +56,7 @@ final class Library: ObservableObject {
     }
     private var albumArtwork: [String: NSImage] = [:]   // updated alongside `artwork`, whose publish redraws
     private var playable: [UUID: URL] = [:]
+    private var stemFiles: [UUID: [URL]] = [:]   // for songs a mix plays as their stems
     private var pendingPlans: Set<String> = []
     private var analysisQueue: [UUID] = []
     private var analysisWorkers = 0
@@ -140,6 +143,68 @@ final class Library: ObservableObject {
     }
 
     func song(_ id: UUID) -> Song? { songs.first { $0.id == id } }
+
+    // MARK: Mixes
+
+    private func mix(_ playlist: UUID?) -> Mix? { playlist.flatMap { id in playlists.first { $0.id == id }?.mix } }
+
+    func isMix(_ playlist: UUID?) -> Bool { mix(playlist) != nil }
+
+    /// A song as `playlist` plays it: with the genre a mix gives it, which decides its plans there.
+    func song(_ id: UUID, in playlist: UUID?) -> Song? {
+        guard var song = song(id) else { return nil }
+        if let genre = mix(playlist)?.songs[id.uuidString]?.genre { song.genre = genre }
+        return song
+    }
+
+    /// Imports a set saved by the MCP server as a playlist of its own, adding the songs the library doesn't have, and
+    /// returns the playlist's id. The set is copied, so saving over it later leaves this mix as it was.
+    @discardableResult
+    func importSet(_ url: URL) throws -> UUID {
+        let saved: SavedSet
+        do { saved = try JSONDecoder().decode(SavedSet.self, from: Data(contentsOf: url)) } catch {
+            throw PlannerError("\(url.lastPathComponent) isn't a saved set.")
+        }
+        // Transitions are saved by position, so a set with a song missing can't be played as it was made.
+        let missing = saved.songs.map(\.path).filter { path in
+            !FileManager.default.fileExists(atPath: path) || !Self.audioExtensions.contains(URL(fileURLWithPath: path).pathExtension.lowercased())
+        }
+        guard missing.isEmpty else {
+            throw PlannerError("These songs of the set can't be found:\n" + missing.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: "\n"))
+        }
+        add(saved.songs.map { URL(fileURLWithPath: $0.path) })
+        let known = Dictionary(songs.map { ($0.path, $0.id) }, uniquingKeysWith: { a, _ in a })
+        let ids = saved.songs.compactMap { known[$0.path] }
+        guard ids.count == saved.songs.count else { throw PlannerError("Couldn't add every song of the set to the library.") }
+        var mix = Mix()
+        for (song, id) in zip(saved.songs, ids) {
+            mix.songs[id.uuidString] = .init(genre: song.genre, keyShift: song.keyShift, gainDB: song.gainDB)
+        }
+        for t in saved.transitions where ids.indices.contains(t.from) && ids.indices.contains(t.to) {
+            mix.edits[Mix.key(ids[t.from], ids[t.to])] = t.edit
+        }
+        let base = url.deletingPathExtension().lastPathComponent
+        var name = base, n = 2
+        while playlists.contains(where: { $0.name == name }) { name = "\(base) \(n)"; n += 1 }
+        let playlist = Playlist(name: name, songIDs: ids, mix: mix)
+        playlists.append(playlist)
+        save()
+        return playlist.id
+    }
+
+    /// Songs a mix sets stem levels on. They play as the sum of their stems, which have to be extracted first.
+    private var remixedSongs: Set<UUID> {
+        var ids = Set<UUID>()
+        for mix in playlists.compactMap(\.mix) {
+            for (key, edit) in mix.edits {
+                let pair = key.split(separator: ">").compactMap { UUID(uuidString: String($0)) }
+                guard pair.count == 2 else { continue }
+                if TransitionEdit.stemLanes.contains(where: { edit.outgoing[$0] != nil }) { ids.insert(pair[0]) }
+                if TransitionEdit.stemLanes.contains(where: { edit.incoming[$0] != nil }) { ids.insert(pair[1]) }
+            }
+        }
+        return ids
+    }
 
     // MARK: Adding songs
 
@@ -342,8 +407,10 @@ final class Library: ObservableObject {
     private func loadPlaylistSongs() {
         guard started else { return }
         var seen = Set<UUID>()
+        let remixed = remixedSongs
         for id in playlists.flatMap(\.songIDs) where seen.insert(id).inserted {
-            guard states[id] == .ready, analyses[id] == nil || playable[id] == nil, !fullLoading.contains(id) else { continue }
+            guard states[id] == .ready, analyses[id] == nil || playable[id] == nil || remixed.contains(id) && stemFiles[id] == nil,
+                  !fullLoading.contains(id) else { continue }
             fullLoading.insert(id)
             fullQueue.append(id)
         }
@@ -351,7 +418,7 @@ final class Library: ObservableObject {
             let id = fullQueue.removeFirst()
             fullWorkers += 1
             Task {
-                await loadFull(id)
+                await loadFull(id, stems: remixed.contains(id))
                 fullWorkers -= 1
                 fullLoading.remove(id)
                 loadPlaylistSongs()
@@ -359,10 +426,11 @@ final class Library: ObservableObject {
         }
     }
 
-    private func loadFull(_ id: UUID) async {
+    private func loadFull(_ id: UUID, stems: Bool) async {
         guard let song = song(id) else { return }
         do {
             if playable[id] == nil { playable[id] = try await AudioSource.playableURL(for: song.url) }
+            if stems, stemFiles[id] == nil { stemFiles[id] = try await AudioSource.stemURLs(for: song.url) }
             if analyses[id] == nil {
                 guard let a = await Self.readAnalysis(Self.cacheFile(song)) else {
                     enqueue(id)   // the cache file went missing: analyze again
@@ -398,6 +466,11 @@ final class Library: ObservableObject {
 
     private nonisolated func baseKey(_ key: String, _ variant: PlanVariant?) -> String { variant.map { key + "#" + $0.key } ?? key }
 
+    /// Where a transition's plan with its edit applied is kept. A mix's edits are its own, so its plans are too.
+    private func planKey(_ key: String, in playlist: UUID?) -> String {
+        isMix(playlist) ? "\(playlist?.uuidString ?? "")/\(key)" : key
+    }
+
     private func invalidatePlans(involving id: UUID) {
         plans = plans.filter { !$0.key.contains(id.uuidString) }
         basePlans = basePlans.filter { !$0.key.contains(id.uuidString) }
@@ -405,12 +478,13 @@ final class Library: ObservableObject {
 
     /// The plan for a → b with the user's edits applied: cached, or started in the background (published when ready).
     /// Everything that plays or draws a transition gets it from here, so edits reach the deck views, playback and export.
-    func plan(from a: UUID, to b: UUID) -> PlanState? {
-        guard let sa = song(a), let sb = song(b) else { return nil }
-        let key = planKey(sa, sb)
+    /// In a mix, `playlist` makes it the mix's transition and not the user's own between the same two songs.
+    func plan(from a: UUID, to b: UUID, in playlist: UUID? = nil) -> PlanState? {
+        guard let sa = song(a, in: playlist), let sb = song(b, in: playlist) else { return nil }
+        let key = planKey(planKey(sa, sb), in: playlist)
         if let existing = plans[key] { return existing }
-        let edit = edits[key] ?? TransitionEdit()
-        guard let base = basePlan(from: a, to: b, variant: edit.variant) else { return nil }
+        let edit = edit(from: a, to: b, in: playlist)
+        guard let base = basePlan(from: a, to: b, variant: edit.variant, in: playlist) else { return nil }
         guard case .ready(let plan) = base else { return base }
         let state = PlanState.ready(edit.isEmpty ? plan : plan.applying(edit))
         // Called while SwiftUI renders, where publishing isn't allowed; the next call finds it cached.
@@ -419,8 +493,8 @@ final class Library: ObservableObject {
     }
 
     /// Apple's plan for a → b before any edits, as `variant` if given: cached, or started in the background.
-    func basePlan(from a: UUID, to b: UUID, variant: PlanVariant? = nil) -> PlanState? {
-        guard let sa = song(a), let sb = song(b), let aa = analyses[a], let ab = analyses[b] else { return nil }
+    func basePlan(from a: UUID, to b: UUID, variant: PlanVariant? = nil, in playlist: UUID? = nil) -> PlanState? {
+        guard let sa = song(a, in: playlist), let sb = song(b, in: playlist), let aa = analyses[a], let ab = analyses[b] else { return nil }
         let key = planKey(sa, sb), base = baseKey(key, variant)
         if let existing = basePlans[base] { return existing }
         guard !pendingPlans.contains(base) else { return .planning }
@@ -432,7 +506,8 @@ final class Library: ObservableObject {
             await MainActor.run {
                 self.pendingPlans.remove(base)
                 self.basePlans[base] = state
-                self.plans[key] = nil   // recomputed with the edit on the next request
+                // Recomputed with the edit on the next request, in every mix that has the pair too.
+                self.plans = self.plans.filter { !$0.key.hasSuffix(key) }
             }
         }
         return .planning
@@ -451,7 +526,8 @@ final class Library: ObservableObject {
 
     // MARK: Edits
 
-    func edit(from a: UUID, to b: UUID) -> TransitionEdit {
+    func edit(from a: UUID, to b: UUID, in playlist: UUID? = nil) -> TransitionEdit {
+        if let mix = mix(playlist) { return mix.edits[Mix.key(a, b)] ?? TransitionEdit() }
         guard let sa = song(a), let sb = song(b) else { return TransitionEdit() }
         return edits[planKey(sa, sb)] ?? TransitionEdit()
     }
@@ -524,11 +600,32 @@ final class Library: ObservableObject {
         }
     }
 
+    /// A song as the renderer plays it in `playlist`, between these two sides. A mix adds what Apple's AutoMix has no
+    /// counterpart for: its loops, its key shift, its gain on top of Sound Check, and its stems. As in the MCP server,
+    /// a song plays as its stems only if one of its sides sets a stem's level: the sum of the stems is not the
+    /// mixdown sample for sample, so a song nobody remixes plays the mixdown.
+    private func item(_ id: UUID, entering: TransitionSide?, leaving: TransitionSide?, in playlist: UUID?) throws -> MixRenderer.Item {
+        let remixed = [entering, leaving].contains { side in TransitionEdit.stemLanes.contains { side?.automations[$0] != nil } }
+        guard let audio = playableURL(id), let a = analyses[id], !remixed || stemFiles[id] != nil else {
+            throw PlannerError("\(song(id)?.title ?? "A song") isn't ready yet.")
+        }
+        let settings = mix(playlist)?.songs[id.uuidString]
+        return MixRenderer.Item(audio: audio, beats: a.beats, entering: entering, leaving: leaving,
+                                gain: gain(id) * Float(pow(10, (settings?.gainDB ?? 0) / 20)),
+                                loops: [entering?.loop, leaving?.loop].compactMap { $0 },
+                                stems: remixed ? stemFiles[id] ?? [] : [], pitch: Double(settings?.keyShift ?? 0))
+    }
+
+    /// Renderer items for one transition on its own, for the deck view's preview.
+    func previewItems(_ plan: TransitionPlan, from a: UUID, to b: UUID, in playlist: UUID? = nil) throws -> [MixRenderer.Item] {
+        [try item(a, entering: nil, leaving: plan.outgoing, in: playlist), try item(b, entering: plan.incoming, leaving: nil, in: playlist)]
+    }
+
     /// Renderer items for playing `ids` in order. Every song must be analyzed and every transition planned or
     /// failed; a failed transition becomes a straight cut to the next song rather than blocking the whole mix.
-    func mixItems(_ ids: [UUID]) throws -> [MixRenderer.Item] {
+    func mixItems(_ ids: [UUID], in playlist: UUID? = nil) throws -> [MixRenderer.Item] {
         func side(_ a: UUID, _ b: UUID) throws -> TransitionPlan? {
-            switch plan(from: a, to: b) {
+            switch plan(from: a, to: b, in: playlist) {
             case .ready(let p): return p
             case .failed: return nil
             case .planning, nil: throw PlannerError("Some transitions aren't planned yet; wait for every ◆ to appear.")
@@ -538,10 +635,9 @@ final class Library: ObservableObject {
             throw PlannerError("\(song(missing)?.title ?? "A song") isn't ready yet.")
         }
         return try ids.enumerated().map { i, id in
-            let audio = playableURL(id)!, a = analyses[id]!
             let entering = i > 0 ? try side(ids[i - 1], id)?.incoming : nil
             let leaving = i + 1 < ids.count ? try side(id, ids[i + 1])?.outgoing : nil
-            return MixRenderer.Item(audio: audio, beats: a.beats, entering: entering, leaving: leaving, gain: gain(id))
+            return try item(id, entering: entering, leaving: leaving?.following(entering), in: playlist)
         }
     }
 }

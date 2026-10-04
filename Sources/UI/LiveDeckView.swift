@@ -46,8 +46,14 @@ struct LiveDeck {
     let clock: SongClock
 
     var sides: [TransitionSide] { [entering, leaving].compactMap { $0 } }
+    /// A mix's loops. The clock and the sides run on the song as played, which counts their repeats; the waveform and
+    /// the grid are the file's.
+    var loops: [SongLoop] { sides.compactMap(\.loop) }
     /// Song times where the song is heard: from its entering transition (or its start) to the end of its leaving one.
-    var audible: ClosedRange<Double> { (entering?.start ?? 0)...max(entering?.start ?? 0, leaving?.end ?? analysis?.duration ?? 0) }
+    var audible: ClosedRange<Double> {
+        let end = leaving?.end ?? (analysis?.duration ?? 0) + loops.map(\.extra).reduce(0, +)
+        return (entering?.start ?? 0)...max(entering?.start ?? 0, end)
+    }
 }
 
 /// The playing playlist as two decks scrolling past a fixed playhead. Songs alternate between the decks, odd
@@ -68,7 +74,7 @@ struct LiveDeckView: View {
     }
 
     private func plan(_ ids: [UUID], _ i: Int) -> TransitionPlan? {
-        guard i >= 0, i + 1 < ids.count, case .ready(let p) = library.plan(from: ids[i], to: ids[i + 1]) else { return nil }
+        guard i >= 0, i + 1 < ids.count, case .ready(let p) = library.plan(from: ids[i], to: ids[i + 1], in: player.queue?.context) else { return nil }
         return p
     }
 
@@ -77,14 +83,15 @@ struct LiveDeckView: View {
         let current = plan(ids, d)
         // The queue's first song is rendered without its entering transition (playback started inside it).
         let outEntering = d > 0 ? plan(ids, d - 1)?.incoming : nil
+        let outLeaving = current?.outgoing.following(outEntering)
         let outgoing = LiveDeck(song: library.song(ids[d]), analysis: library.analyses[ids[d]], entering: outEntering,
-                                leaving: current?.outgoing,
-                                clock: SongClock(now: p.deckOut, sides: [outEntering, current?.outgoing].compactMap { $0 }, span: Self.span))
+                                leaving: outLeaving,
+                                clock: SongClock(now: p.deckOut, sides: [outEntering, outLeaving].compactMap { $0 }, span: Self.span))
         var incoming: LiveDeck?
         if d + 1 < ids.count {
-            let leaving = plan(ids, d + 1)?.outgoing
+            let leaving = plan(ids, d + 1)?.outgoing.following(current?.incoming)
             // Before it starts, the incoming song is where it will be when the outgoing one reaches the handoff.
-            let cue = current.map { outgoing.clock.time(at: $0.outgoing.start) }
+            let cue = outLeaving.map { outgoing.clock.time(at: $0.start) }
                 ?? outgoing.clock.time(at: outgoing.analysis?.duration ?? 0)
             let now = p.deckIn ?? ((current?.incoming.start ?? 0) - cue)
             incoming = LiveDeck(song: library.song(ids[d + 1]), analysis: library.analyses[ids[d + 1]], entering: current?.incoming,
@@ -119,7 +126,7 @@ struct LiveDeckView: View {
             }
             if let plan {
                 StyleChip(plan: plan)
-                let start = outgoing.clock.time(at: plan.outgoing.start)
+                let start = outgoing.clock.time(at: outgoing.leaving?.start ?? plan.outgoing.start)
                 Text(start > 0 ? "in \(Theme.time(start).dropLast(2))" : "mixing").font(.system(size: 11)).monospacedDigit()
                     .foregroundStyle(.secondary)
             }
@@ -185,7 +192,7 @@ struct LiveDeckLane: View {
         let wf = analysis.waveform
         for col in stride(from: 0.0, to: width, by: 1) {
             let s = clock.songTime(at: col / width * 2 * LiveDeckView.span - LiveDeckView.span)
-            let i = Int(s / wf.secondsPerPoint)
+            let i = Int(deck.loops.fileTime(s) / wf.secondsPerPoint)
             guard s >= 0, i < wf.peak.count else { continue }
             let side = deck.sides.first { s >= $0.start && s <= $0.end }
             let gain = side?.automations["out_gain"]?.value(at: s) ?? 1
@@ -197,13 +204,18 @@ struct LiveDeckLane: View {
         // Beat grid, bars, sections.
         let visible = clock.songTime(at: -LiveDeckView.span)...clock.songTime(at: LiveDeckView.span)
         let bars = Set(analysis.bars.map { Int(($0 * 100).rounded()) })
-        for b in analysis.beats where visible.contains(b) {
+        let loops = deck.loops
+        for b in analysis.beats {
             let isBar = bars.contains(Int((b * 100).rounded()))
-            ctx.fill(Path(CGRect(x: x(clock.time(at: b)), y: isBar ? 0 : size.height - 8, width: isBar ? 1 : 0.5, height: isBar ? size.height : 8)),
-                     with: .color(.white.opacity(isBar ? 0.22 : 0.18)))
+            for s in loops.playedTimes(b) where visible.contains(s) {
+                ctx.fill(Path(CGRect(x: x(clock.time(at: s)), y: isBar ? 0 : size.height - 8, width: isBar ? 1 : 0.5, height: isBar ? size.height : 8)),
+                         with: .color(.white.opacity(isBar ? 0.22 : 0.18)))
+            }
         }
-        for sec in analysis.sections where visible.contains(sec) {
-            ctx.draw(Text("◆").font(.system(size: 9)).foregroundColor(Theme.accent), at: CGPoint(x: x(clock.time(at: sec)), y: 7))
+        for sec in analysis.sections {
+            for s in loops.playedTimes(sec) where visible.contains(s) {
+                ctx.draw(Text("◆").font(.system(size: 9)).foregroundColor(Theme.accent), at: CGPoint(x: x(clock.time(at: s)), y: 7))
+            }
         }
         for side in deck.sides {
             for s in [side.start, side.end] {
