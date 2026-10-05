@@ -13,7 +13,7 @@ Add `--automix-only` after `--mcp` to leave out everything Apple's AutoMix has n
 Add `--renders <folder>` to choose where named renders go. Without it they go to `~/Music/pink diamond`.
 
 ## Session
-The server keeps its songs, genres and edits in memory and forgets them when it exits, unless they are saved as a set. It does not read or change the app's library, playlists or saved edits. It shares only the analysis cache, so a song either has analyzed is ready in both. A saved set can be brought into the app, see below.
+The server keeps its songs, genres and edits in memory and forgets them when it exits, unless they are saved as a set. Tags are kept, see below. It does not read or change the app's library, playlists or saved edits. It shares only the analysis cache, so a song either has analyzed is ready in both. A saved set can be brought into the app, see below.
 
 Add songs first with `add_songs`. Every other tool takes the song ids it returns. An id stays the same for a file between sessions, as long as the file is not moved or changed.
 
@@ -23,7 +23,8 @@ A large library is meant to be searched, not listed. The overview shows what is 
 | Tool | What |
 | --- | --- |
 | `add_songs` | Adds audio files, stem files or folders and analyzes them. A song's first analysis takes several seconds, so add a large uncached folder in parts if the client times out. Later adds read the cache, and a library of 600 songs takes a couple of seconds. Past 25 songs it returns an overview in place of the list: how many songs, how many by each artist and in each band of ten BPM |
-| `list_songs` | Songs added, filtered by words, BPM range, key or genre, at most 100 at a time. A row has the year of release when the file's date tag gives one, and the genre as `planner_genre`, since it is the setting the planner is given and not a description of the song. It leaves that out when it is Pop, and a stem file's source when the title ends with it. A song there in several versions is listed once, as the one with the best stems; `unique: false` lists them all. `key_tempo_like` keeps the songs in a key that does not clash with a song's key, and at a tempo within 8% of its own, or of half or double it. It tests nothing else, so it narrows the library and leaves the agent to choose a song that belongs there. Give it two songs to find one that goes between them, which has to pass for both. `tempo_percent` widens that, up to 25. `any_key` keeps songs in a clashing key too, listed after the others and marked `key_clash`, for bringing in by their drums alone. `not_in_set` leaves out the songs a saved set already has, in any version. `overview: true` returns the counts by artist and BPM band for whatever matches, in place of the songs |
+| `list_songs` | Songs added, filtered by words, BPM range, key or genre, at most 100 at a time. A row has the year of release when the file's date tag gives one, and the genre as `planner_genre`, since it is the setting the planner is given and not a description of the song. It leaves that out when it is Pop, and a stem file's source when the title ends with it. A song there in several versions is listed once, as the one with the best stems; `unique: false` lists them all. `key_tempo_like` keeps the songs in a key that does not clash with a song's key, and at a tempo within 8% of its own, or of half or double it. It tests nothing else, so it narrows the library and leaves the agent to choose a song that belongs there. Give it two songs to find one that goes between them, which has to pass for both. `tempo_percent` widens that, up to 25. `any_key` keeps songs in a clashing key too, listed after the others and marked `key_clash`, for bringing in by their drums alone. `not_in_set` leaves out the songs a saved set already has, in any version. `overview: true` returns the counts by artist and BPM band for whatever matches, in place of the songs. A tagged song's row has its tags, `energy_min` and `energy_max` keep songs by their energy tag, and `untagged` keeps the songs with no tags yet |
+| `tag_songs` | Writes down what songs are like to hear: energy, style, what the lyrics are about, and whether the sound and the words disagree. See Tags |
 | `get_song` | Takes one song, or several as `songs`. A song's bars, vocal ranges, loudness and Sound Check gain, and its sections. Beats on request, and `bars: false` leaves the bar times out. `stems: true` adds each stem's level per section and bar by bar |
 | `set_song` | A song's key shift in semitones and its gain in dB, kept for the whole time it plays |
 | `set_genre` | Sets the genre the planner is given for one song, several, or all. It decides which styles the planner can pick and says nothing about how the song sounds. A song starts with the genre its genre tag names when that is one of Apple's twelve, and as Pop otherwise |
@@ -46,6 +47,21 @@ Renders take a `name`, which puts the WAV in the renders folder, or `out` for a 
 `render_transition` takes `solo`, `outgoing` or `incoming`, to render one song's part of the transition alone. It lines up with the full render to the sample, so the two solos show what each song is doing where the mix is hard to pick apart.
 
 Renders play every song at the same loudness, as the app does with Sound Check on. Pass `sound_check: false` to turn it off. The renderer ends in a limiter, so two songs at full volume are held just under full scale rather than clipped, and a peak near 0 dB means the limiter is working.
+
+## Tags
+The analysis says nothing about how a song sounds or what it is about, and key and tempo alone will put a house track into a country song. Tags are where an agent writes that down, once, for every later session to read in `list_songs`.
+
+| Tag | What |
+| --- | --- |
+| `energy` | How hard the song hits as a whole, from 1, a still ballad, to 10, the hardest in the library |
+| `style` | Its style in a few words, such as French house or country pop |
+| `lyrics` | What the words are about and how they feel |
+| `mood_clash` | The sound and the words pull opposite ways, as in a bright dance song about misery |
+| `unknown` | The agent did not know the recording. It has no other tags and is not offered for tagging again |
+
+Tag the library in a session that does nothing else, in batches, searching with `untagged`. An agent tags from what it knows of a recording, so a song it does not know should be marked `unknown` and not guessed at. Energy is a judgement and not a measurement: it is for seeing a jump between two songs, and tagging a song again replaces the fields given.
+
+pink diamond keeps tags in `~/Library/Application Support/pink diamond/tags.json`, by artist and title, so they outlast the session and every version of a song shares them. Two files of one song with different artist tags count as two songs.
 
 ## Sections
 Apple's analysis finds where a song's sections start but not what they are, so pink diamond cannot name a chorus or a drop. `get_song` gives each section its length in bars, its loudness against the whole song, and the share of it that has vocals, which is usually enough to tell them apart.

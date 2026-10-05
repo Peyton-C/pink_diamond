@@ -23,7 +23,23 @@ final class MCPServer {
         let analysis: SongAnalysis
     }
 
+    /// What a song is like to hear, which nothing in its analysis says. An agent writes it once with tag_songs, in a
+    /// session that does nothing else, and it is kept between sessions. The agent building a set could be told to go
+    /// by what it knows of the songs, and did while the set was short: deep into a long one it chose on the numbers
+    /// in the row, and put One More Time into Love Story and Lipgloss into Flowers, which match on key and tempo.
+    /// Written into the row, what it knows is there to read however much it is carrying.
+    private struct Tag: Codable {
+        var energy: Int?         // 1 to 10
+        var style: String?
+        var lyrics: String?      // what the words are about and how they feel
+        /// The sound and the words pull opposite ways. No audio model hears this: I Can Do It With a Broken Heart is
+        /// bright synth-pop about being miserable, and sits beside One More Time on every measure of how it sounds.
+        var moodClash: Bool?
+        var unknown: Bool?       // the agent didn't know the song, so it isn't asked again and isn't guessed at
+    }
+
     private var songs: [Entry] = []
+    private var tags: [String: Tag] = [:]                   // by `name`, so every version of a song has the one tag
     private var basePlans: [String: TransitionPlan] = [:]   // Apple's plans, by plan key and variant
     private var edits: [String: TransitionEdit] = [:]       // by plan key
     private var moves: [String: String] = [:]               // the exit and entry moves a transition was built from, by plan key
@@ -182,7 +198,7 @@ final class MCPServer {
         return [
             tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. The first analysis of a song takes a few seconds; later ones come from the cache. Returns the songs added with their ids, or for more than 25 an overview: how many songs, how many by each artist and in each BPM band, each song counted once however many versions there are. Search them with list_songs.",
                  ["paths": ids("Absolute paths")], required: ["paths"]),
-            tool("list_songs", "Search the songs added this session: id, title, artist, year of release when the file has it, BPM, key, length in seconds, planner_genre when it is not Pop, and for a stem file where its stems came from when the title doesn't end with it: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them, so search for what you want rather than paging through everything. planner_genre is the set_genre setting and says nothing about how a song sounds; go by the title, artist and year for that.",
+            tool("list_songs", "Search the songs added this session: id, title, artist, year of release when the file has it, BPM, key, length in seconds, planner_genre when it is not Pop, and for a stem file where its stems came from when the title doesn't end with it: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them, so search for what you want rather than paging through everything. planner_genre is the set_genre setting and says nothing about how a song sounds; go by the tags for that, and by the title, artist and year where a song has none. A tagged song has its energy from 1 to 10, its style, what its lyrics are about, and mood_clash when it sounds happier or sadder than its words.",
                  ["query": string("Words that must all appear in the title, artist or path"),
                   "bpm_min": number("Lowest BPM"), "bpm_max": number("Highest BPM"),
                   "key": string("A key as list_songs shows it, such as G minor"), "genre": string("A planner genre set_genre takes"),
@@ -191,9 +207,21 @@ final class MCPServer {
                   "not_in_set": string("A saved set's name: leaves out the songs in it, whichever version"),
                   "tempo_percent": number("With key_tempo_like, how far the tempo can be, in percent. Defaults to 8, 25 at most; widen it when few songs come back"),
                   "any_key": bool("With key_tempo_like, keep songs in a clashing key too, after the others and marked key_clash. They can work when only the drums come in, since every other stem is pitched"),
+                  "energy_min": integer("Lowest energy tag, 1 to 10. Leaves out songs with no energy tag"), "energy_max": integer("Highest energy tag"),
+                  "untagged": bool("Only songs tag_songs has not been given yet"),
                   "overview": bool("Return how many songs match, by artist and by BPM band, in place of the songs"),
                   "unique": bool("List a song that is there in several versions once, as the version with the best stems. Defaults to true"),
                   "limit": integer("Most songs to return. Defaults to 50, and 100 at most"), "offset": integer("Songs to skip, to page through a long list")]),
+            tool("tag_songs", "Write down what songs are like to hear, for every later session to read in list_songs. Kept between sessions, and shared by every version of a song. Tag from what you know of the recording, not from its title: a song you don't recognise is marked unknown and never guessed at. Tagging a song again replaces the fields given.",
+                 ["songs": ["type": "array", "description": "One entry for each song", "items": [
+                     "type": "object",
+                     "properties": ["song": string("Song id"),
+                                    "energy": integer("How hard it hits as a whole, 1 to 10: 1 a still ballad, 3 a slow or acoustic song, 5 mid-tempo pop, 7 upbeat dance-pop, 9 a club track, 10 the hardest in the library. Judge by the sound, not the tempo"),
+                                    "style": string("Its style in a few words, as specific as you can be: French house, country pop, hyperpop"),
+                                    "lyrics": string("What the words are about and how they feel, in a few words: celebrating the night, hiding heartbreak"),
+                                    "mood_clash": bool("The sound and the words pull opposite ways, such as a bright dance song about misery"),
+                                    "unknown": bool("You don't know this recording")],
+                     "required": ["song"]] as [String: Any]] as [String: Any]], required: ["songs"]),
             tool("get_song", "A song's analysis: bars and vocal ranges in song seconds, its loudness, and its sections, each with its length in bars, how loud it is against the whole song, and how much of it has vocals. Sections have no names.",
                  ["song": string("Song id"), "songs": ids("Song ids, to get several in one call as a list"), "beats": bool("Include every beat time"),
                   "bars": bool("Include every bar time. Defaults to true; turn it off when scanning many songs"),
@@ -259,6 +287,8 @@ final class MCPServer {
             var details: [[String: Any]] = []
             for id in ids { details.append(try await songDetail(try entry(id), args)) }
             return details
+        case "tag_songs":
+            return try tag(args)
         case "set_genre":
             guard let genre = (args["genre"] as? String).flatMap(Genre.init(rawValue:)) else {
                 throw PlannerError("genre must be one of: \(Genre.allCases.map(\.rawValue).joined(separator: ", "))")
@@ -485,7 +515,50 @@ final class MCPServer {
         json["duration"] = Int(s.analysis.duration.rounded())
         if s.genre == .pop { json["planner_genre"] = nil }
         if let source = stemSource(s), s.title.hasSuffix("(\(source.name))") { json["stems"] = nil }
+        if let tag = tags[name(s)] {
+            json["energy"] = tag.energy
+            json["style"] = tag.style
+            json["lyrics"] = tag.lyrics
+            if tag.moodClash == true { json["mood_clash"] = true }
+        }
         return json
+    }
+
+    /// Read again before every call that uses them and not once at launch. Several servers run at a time, one for
+    /// each client session, and each writes the whole file: one that had held its tags since launch put back 59
+    /// entries cleared on disk, and would have dropped whatever another session had tagged since.
+    private func readTags() {
+        tags = (try? Data(contentsOf: AppPaths.tags)).flatMap { try? JSONDecoder().decode([String: Tag].self, from: $0) } ?? [:]
+    }
+
+    private func tag(_ args: [String: Any]) throws -> [String: Any] {
+        readTags()
+        guard let list = args["songs"] as? [[String: Any]], !list.isEmpty else { throw PlannerError("songs must be a list, each with a song id and its tags") }
+        // All checked before any is kept, so a batch with one bad entry can be sent again whole.
+        var changed = tags
+        for item in list {
+            let key = name(try entry(item["song"]))
+            if item["unknown"] as? Bool == true {
+                changed[key] = Tag(unknown: true)
+                continue
+            }
+            var tag = changed[key] ?? Tag()
+            tag.unknown = nil
+            if let energy = number(item["energy"]) {
+                guard (1...10).contains(energy) else { throw PlannerError("energy must be between 1 and 10") }
+                tag.energy = Int(energy)
+            }
+            if let style = item["style"] as? String { tag.style = style }
+            if let lyrics = item["lyrics"] as? String { tag.lyrics = lyrics }
+            if let clash = item["mood_clash"] as? Bool { tag.moodClash = clash ? true : nil }
+            guard tag.energy != nil || tag.style != nil || tag.lyrics != nil else { throw PlannerError("give a song its energy, style or lyrics, or mark it unknown") }
+            changed[key] = tag
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(changed).write(to: AppPaths.tags, options: .atomic)
+        tags = changed
+        return ["tagged": list.count, "untagged_left": Set(songs.map(name)).subtracting(tags.keys).count]
     }
 
     private static let tonics = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
@@ -562,6 +635,7 @@ final class MCPServer {
     }
 
     private func list(_ args: [String: Any]) throws -> [String: Any] {
+        readTags()
         let words = (args["query"] as? String ?? "").lowercased().split(separator: " ")
         let low = number(args["bpm_min"]) ?? 0, high = number(args["bpm_max"]) ?? .infinity
         let key = (args["key"] as? String)?.lowercased(), genre = args["genre"] as? String
@@ -569,6 +643,11 @@ final class MCPServer {
             let text = "\(s.title) \(s.artist) \(s.path)".lowercased()
             return words.allSatisfy { text.contains($0) } && Double(s.analysis.bpm) >= low && Double(s.analysis.bpm) <= high
                 && (key == nil || self.key(s).lowercased() == key) && (genre == nil || s.genre.rawValue == genre)
+        }
+        if args["untagged"] as? Bool == true { matches = matches.filter { tags[name($0)] == nil } }
+        if args["energy_min"] != nil || args["energy_max"] != nil {
+            let least = number(args["energy_min"]) ?? 1, most = number(args["energy_max"]) ?? 10
+            matches = matches.filter { s in tags[name(s)]?.energy.map { Double($0) >= least && Double($0) <= most } ?? false }
         }
         if let set = args["not_in_set"] as? String {
             // By name and not by id, so another version of a song the set has is left out with it. A filter here

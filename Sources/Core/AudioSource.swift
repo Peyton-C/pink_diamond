@@ -16,6 +16,8 @@ enum AppPaths {
     }
     /// Where the MCP server saves sets, and the app looks for them to import.
     static var sets: URL { support.appendingPathComponent("sets") }
+    /// What an agent has written down about each song through the MCP server's tag_songs.
+    static var tags: URL { support.appendingPathComponent("tags.json") }
     static var cache: URL {
         let url = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent(appName)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
