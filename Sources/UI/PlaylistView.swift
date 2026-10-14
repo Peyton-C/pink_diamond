@@ -121,8 +121,7 @@ struct PlaylistView: View {
             loadURLs(providers) { urls in
                 library.add(urls)
                 guard let i = library.playlists.firstIndex(where: { $0.id == playlistID }) else { return }
-                let paths = Set(urls.map(\.path))
-                let added = library.songs.filter { paths.contains($0.path) || urls.contains(where: { $0.hasDirectoryPath && $0.path.hasPrefix($0.path) }) }
+                let added = library.songs(from: urls)
                 library.playlists[i].songIDs.append(contentsOf: added.map(\.id).filter { !library.playlists[i].songIDs.contains($0) })
                 library.save()
             }

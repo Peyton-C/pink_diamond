@@ -102,6 +102,20 @@ struct SettingsView: View {
                 }
             }
             .pickerStyle(.radioGroup)
+            if !library.folders.isEmpty {
+                LabeledContent("Folders") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(library.folders, id: \.self) { folder in
+                            HStack {
+                                Text((folder as NSString).abbreviatingWithTildeInPath).lineLimit(1).truncationMode(.head).help(folder)
+                                Spacer()
+                                Button { library.unwatch(folder) } label: { Image(systemName: "minus.circle") }
+                                    .buttonStyle(.plain).help("Stop looking here for new songs")
+                            }
+                        }
+                    }
+                }
+            }
         }
         .padding(20)
         .frame(width: 320)

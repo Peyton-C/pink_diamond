@@ -34,6 +34,12 @@ struct LibraryView: View {
                 Button { addFiles() } label: { Label("Add Music", systemImage: "plus") }
                     .help("Add audio files, stem files, or folders")
             }
+            ToolbarItem {
+                Menu {
+                    Button("Scan Folders") { library.rescan() }.disabled(library.folders.isEmpty)
+                    Button("Remove Missing Songs") { library.removeMissing() }.disabled(!library.states.values.contains(.missing))
+                } label: { Label("Library", systemImage: "ellipsis.circle") }
+            }
         }
         .overlay {
             if library.songs.isEmpty {
@@ -125,16 +131,27 @@ struct SongTable: View {
     @EnvironmentObject var library: Library
     let songs: [Song]
     @State private var selection = Set<UUID>()
-    @State private var sortOrder = [KeyPathComparator(\Song.title)]
+    @State private var sortOrder = [KeyPathComparator(\Row.song.title)]
+
+    /// A song with what its columns sort by and its own fields don't hold.
+    struct Row: Identifiable {
+        let song: Song
+        let bpm: Int
+        let key: Int                 // in Lancelot order, so keys that mix sort next to each other
+        let duration: Double
+        let source: StemSource
+        let added: Date
+        var id: UUID { song.id }
+    }
 
     var body: some View {
-        Table(sortedSongs, selection: $selection, sortOrder: $sortOrder) {
-            TableColumn("") { song in StatusIcon(state: library.states[song.id]) }.width(18)
-            TableColumn("Title", value: \.title) { song in
+        Table(rows, selection: $selection, sortOrder: $sortOrder) {
+            TableColumn("") { row in StatusIcon(state: library.states[row.id]) }.width(18)
+            TableColumn("Title", value: \.song.title) { row in
                 HStack(spacing: 8) {
-                    Artwork(image: library.cover(song.id), size: 24)
-                    Text(song.title).lineLimit(1)
-                    if song.isStem {
+                    Artwork(image: library.cover(row.id), size: 24)
+                    Text(row.song.title).lineLimit(1)
+                    if row.song.isStem {
                         Text("STEMS").font(.system(size: 9, weight: .bold)).padding(.horizontal, 4).padding(.vertical, 1)
                             .background(Theme.accent.opacity(0.25), in: RoundedRectangle(cornerRadius: 3))
                             .foregroundStyle(Theme.accent)
@@ -143,21 +160,27 @@ struct SongTable: View {
                 }
             }
             .width(min: 180, ideal: 300)
-            TableColumn("Artist", value: \.artist).width(min: 80, ideal: 150)
-            TableColumn("Album", value: \.albumName).width(min: 80, ideal: 150)
-            TableColumn("BPM") { song in Text(library.summaries[song.id].map { "\($0.bpm)" } ?? "–").monospacedDigit() }.width(44)
-            TableColumn("Key") { song in
-                if let key = library.summaries[song.id]?.key { KeyBadge(key: key) } else { Text("–") }
+            TableColumn("Artist", value: \.song.artist).width(min: 80, ideal: 150)
+            TableColumn("Album", value: \.song.albumName).width(min: 80, ideal: 150)
+            TableColumn("BPM", value: \.bpm) { row in Text(row.bpm > 0 ? "\(row.bpm)" : "–").monospacedDigit() }.width(44)
+            TableColumn("Key", value: \.key) { row in
+                if let key = library.summaries[row.id]?.key { KeyBadge(key: key) } else { Text("–") }
             }.width(48)
-            TableColumn("Length") { song in
-                Text(library.summaries[song.id].map { Theme.time($0.duration).dropLast(2) } ?? "–").monospacedDigit()
+            TableColumn("Length", value: \.duration) { row in
+                Text(row.duration > 0 ? String(Theme.time(row.duration).dropLast(2)) : "–").monospacedDigit()
             }.width(52)
-            TableColumn("Genre") { song in
-                Picker("", selection: Binding(get: { song.genre }, set: { library.setGenre($0, for: song.id) })) {
+            TableColumn("Genre", value: \.song.genre.rawValue) { row in
+                Picker("", selection: Binding(get: { row.song.genre }, set: { library.setGenre($0, for: row.id) })) {
                     ForEach(Genre.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .labelsHidden()
             }.width(130)
+            TableColumn("Source", value: \.source.rank) { row in
+                SourceLabel(source: row.source, pinned: row.song.pinned == true, better: library.betterVersion(of: row.song)?.source)
+            }.width(min: 60, ideal: 84)
+            TableColumn("Added", value: \.added) { row in
+                Text(row.song.added.map { $0.formatted(date: .numeric, time: .omitted) } ?? "–").monospacedDigit()
+            }.width(min: 60, ideal: 76)
         }
         .contextMenu(forSelectionType: UUID.self) { ids in
             Menu("Add to Playlist") {
@@ -165,18 +188,64 @@ struct SongTable: View {
                     Button(p.name) { addToPlaylist(p.id, ids) }
                 }
             }
+            if ids.count == 1, let song = ids.first.flatMap(library.song), let versions = song.versions, versions.count > 1 {
+                Menu("Version") {
+                    ForEach(versions.sorted { $0.source.rank < $1.source.rank }, id: \.path) { version in
+                        let name = "\(version.source.label), \(Theme.time(version.duration).dropLast(2))"
+                        Button { library.setVersion(version.path, for: song.id) } label: {
+                            if version.path == song.path { Label(name, systemImage: "checkmark") } else { Text(name) }
+                        }
+                    }
+                    if song.pinned == true {
+                        Divider()
+                        Button("Choose Automatically") { library.setVersion(nil, for: song.id) }
+                    }
+                }
+            }
             Divider()
             Button("Remove from Library", role: .destructive) { library.remove(ids) }
         }
     }
 
-    private var sortedSongs: [Song] { songs.sorted(using: sortOrder) }
+    private var rows: [Row] {
+        songs.map { song -> Row in
+            let summary = library.summaries[song.id]
+            let key = summary.map { MusicalKey($0.key) }
+            let lancelot = key.flatMap { k in k.lancelot.map { $0 * 2 + (k.minor ? 0 : 1) } }
+            return Row(song: song, bpm: summary?.bpm ?? 0, key: lancelot ?? 0, duration: summary?.duration ?? 0,
+                       source: song.source, added: song.added ?? .distantPast)
+        }
+        .sorted(using: sortOrder)
+    }
 
     private func addToPlaylist(_ playlist: UUID, _ ids: Set<UUID>) {
         guard let i = library.playlists.firstIndex(where: { $0.id == playlist }) else { return }
-        let ordered = sortedSongs.map(\.id).filter { ids.contains($0) }
+        let ordered = rows.map(\.id).filter { ids.contains($0) }
         library.playlists[i].songIDs.append(contentsOf: ordered)
         library.save()
+    }
+}
+
+/// Where the file a song plays came from, with a pin when the user chose it over a better one and an arrow when a
+/// better one is waiting to be chosen. It is handed what it shows and doesn't read the library itself: a table
+/// cell is hosted outside the view tree the environment object was put in, and reading it there crashed at launch.
+struct SourceLabel: View {
+    let source: StemSource
+    let pinned: Bool
+    let better: StemSource?
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(source.label).lineLimit(1)
+            if let better {
+                if pinned {
+                    Image(systemName: "pin.fill").foregroundStyle(.secondary).help("You chose this version over \(better.label)")
+                } else {
+                    Image(systemName: "arrow.up.circle").foregroundStyle(Theme.accent)
+                        .help("\(better.label) is a different cut of this song. Right-click, Version, to play it")
+                }
+            }
+        }
     }
 }
 
@@ -208,6 +277,7 @@ struct StatusIcon: View {
         case .ready: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green.opacity(0.7))
         case .analyzing: ProgressView().controlSize(.mini)
         case .failed(let e): Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).help(e)
+        case .missing: Image(systemName: "questionmark.circle.fill").foregroundStyle(.orange).help("Its file is gone")
         default: Image(systemName: "clock").foregroundStyle(.secondary)
         }
     }

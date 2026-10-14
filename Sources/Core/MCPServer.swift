@@ -570,17 +570,12 @@ final class MCPServer {
         return "\(Self.tonics[((i + s.keyShift) % 12 + 12) % 12]) \(parts[1])"
     }
 
-    /// Where a stem file's stems came from, best first, read from the tag its maker leaves at the end of the name:
-    /// official stems, Fortnite's, then separations by roformer and demucs, from an Atmos mix (AT) or from stereo,
-    /// then stemgen's. A cleaner separation is the better one to pull a vocal or the drums out of.
-    private static let stemSources = ["Official", "FN", "RF AT", "DE AT", "RF", "DE", "stemgen"]
-
+    /// Where a stem file's stems came from and how they rank, as the app's library reads it (`StemSource`). A
+    /// cleaner separation is the better one to pull a vocal or the drums out of.
     private func stemSource(_ s: Entry) -> (name: String, rank: Int)? {
-        let url = URL(fileURLWithPath: s.path)
-        guard AudioSource.isStem(url) else { return nil }
-        let name = url.lastPathComponent.dropLast(".stem.mp4".count)
-        let rank = Self.stemSources.firstIndex { name.hasSuffix("(\($0))") } ?? Self.stemSources.count - 1
-        return (Self.stemSources[rank], rank)
+        guard AudioSource.isStem(URL(fileURLWithPath: s.path)) else { return nil }
+        let source = StemSource.of(title: s.title, path: s.path)
+        return (source.label, source.rank)
     }
 
     /// What one song is called whichever version it is: its artist and its title without the bracketed tags at
@@ -593,7 +588,7 @@ final class MCPServer {
     /// One version of each song: the one with the best stems, and a file with no stems last.
     private func unique(_ list: [Entry]) -> [Entry] {
         var best: [String: Entry] = [:], order: [String] = []
-        let rank = { (s: Entry) in self.stemSource(s)?.rank ?? Self.stemSources.count }
+        let rank = { (s: Entry) in self.stemSource(s)?.rank ?? StemSource.audio.rank }
         for s in list {
             let key = name(s)
             if let held = best[key] { if rank(s) < rank(held) { best[key] = s } } else { best[key] = s; order.append(key) }

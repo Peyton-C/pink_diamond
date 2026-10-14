@@ -11,10 +11,26 @@ struct Song: Codable, Identifiable, Hashable {
     var genre: Genre = .pop
     var isStem: Bool
     var fileKey: String
+    // Optional from here on, as older libraries predate them.
+    var added: Date?
+    /// Every file pink diamond has seen this song as, the one at `path` included. Nil until a scan has read its tags.
+    var versions: [SongVersion]?
+    var pinned: Bool?                // the user chose the file at `path`, so a better one doesn't replace it
+    var formerPaths: [String]?       // files it used to play, so a set saved with one of them still finds the song
 
     var url: URL { URL(fileURLWithPath: path) }
     var albumName: String { album ?? "" }
     var fakeCatalogID: String { "99" + String(fileKey.prefix(8)) }
+    var source: StemSource { StemSource.of(title: title, path: path) }
+    var key: String { SongName.key(title: title, artist: artist) }
+}
+
+/// One file of a song. A song keeps every file it has been seen as and plays one of them.
+struct SongVersion: Codable, Hashable {
+    var path: String
+    var title: String                // as tagged, with the marker its source is read from
+    var duration: Double             // 0 when the file couldn't be read
+    var source: StemSource { StemSource.of(title: title, path: path) }
 }
 
 struct Playlist: Codable, Identifiable, Hashable {
@@ -27,6 +43,7 @@ struct Playlist: Codable, Identifiable, Hashable {
 
 enum SongState: Equatable {
     case waiting, analyzing, ready, failed(String)
+    case missing                     // its file is gone and it has no other
 }
 
 enum PlanState {
@@ -35,7 +52,7 @@ enum PlanState {
 
 @MainActor
 final class Library: ObservableObject {
-    static let audioExtensions: Set<String> = ["mp3", "m4a", "mp4", "aac", "wav", "aif", "aiff", "flac", "caf", "alac"]
+    nonisolated static let audioExtensions: Set<String> = ["mp3", "m4a", "mp4", "aac", "wav", "aif", "aiff", "flac", "caf", "alac"]
 
     @Published var songs: [Song] = []
     @Published var playlists: [Playlist] = [] { didSet { loadPlaylistSongs() } }
@@ -67,6 +84,11 @@ final class Library: ObservableObject {
     private var fullWorkers = 0
     private var started = false
     private var migrating = false
+    /// Folders the user added, which pink diamond looks through again for files that have turned up since.
+    @Published private(set) var folders: [String] = []
+    private var ignored: Set<String> = []     // files removed by hand, which a scan would otherwise bring back
+    private var scanning = false
+    private var settling: Set<UUID> = []
 
     private var storeURL: URL { AppPaths.support.appendingPathComponent("library.json") }
     private var summaryURL: URL { AppPaths.cacheDir("analysis").appendingPathComponent("summaries.json") }
@@ -92,8 +114,16 @@ final class Library: ObservableObject {
         started = true
         loadPlaylistSongs()
         Task {
-            if !pending.isEmpty { await summarize(pending) }
+            await scan()
+            // The scan has already queued the songs it moved to another file, and marked the ones with none.
+            let waiting = pending.filter { old in song(old.id)?.fileKey == old.fileKey && states[old.id] == .waiting }
+            if !waiting.isEmpty { await summarize(waiting) }
             await loadCoversWhenIdle()
+        }
+        // Coming back to the app is when files have changed underneath it: they were ripped, culled or separated
+        // again somewhere else. Looking then costs a directory listing, and needs no file-system watcher.
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.rescan() }
         }
     }
 
@@ -125,7 +155,7 @@ final class Library: ObservableObject {
 
     // MARK: Persistence
 
-    private struct Store: Codable { var songs: [Song]; var playlists: [Playlist] }
+    private struct Store: Codable { var songs: [Song]; var playlists: [Playlist]; var folders: [String]?; var ignored: [String]? }
 
     private func load() {
         guard let data = try? Data(contentsOf: storeURL), let store = try? JSONDecoder().decode(Store.self, from: data) else {
@@ -133,13 +163,15 @@ final class Library: ObservableObject {
             return
         }
         songs = store.songs
+        folders = store.folders ?? []
+        ignored = Set(store.ignored ?? [])
         playlists = store.playlists.isEmpty ? [Playlist(name: "Playlist 1")] : store.playlists
     }
 
     func save() {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted]
-        try? encoder.encode(Store(songs: songs, playlists: playlists)).write(to: storeURL, options: .atomic)
+        try? encoder.encode(Store(songs: songs, playlists: playlists, folders: folders, ignored: ignored.sorted())).write(to: storeURL, options: .atomic)
     }
 
     func song(_ id: UUID) -> Song? { songs.first { $0.id == id } }
@@ -165,16 +197,17 @@ final class Library: ObservableObject {
         do { saved = try JSONDecoder().decode(SavedSet.self, from: Data(contentsOf: url)) } catch {
             throw PlannerError("\(url.lastPathComponent) isn't a saved set.")
         }
-        // Transitions are saved by position, so a set with a song missing can't be played as it was made.
+        // Transitions are saved by position, so a set with a song missing can't be played as it was made. A file
+        // that is gone is not a song missing when the library has the song as another file.
         let missing = saved.songs.map(\.path).filter { path in
-            !FileManager.default.fileExists(atPath: path) || !Self.audioExtensions.contains(URL(fileURLWithPath: path).pathExtension.lowercased())
+            song(forFile: path) == nil
+                && (!FileManager.default.fileExists(atPath: path) || !Self.audioExtensions.contains(URL(fileURLWithPath: path).pathExtension.lowercased()))
         }
         guard missing.isEmpty else {
             throw PlannerError("These songs of the set can't be found:\n" + missing.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: "\n"))
         }
-        add(saved.songs.map { URL(fileURLWithPath: $0.path) })
-        let known = Dictionary(songs.map { ($0.path, $0.id) }, uniquingKeysWith: { a, _ in a })
-        let ids = saved.songs.compactMap { known[$0.path] }
+        add(saved.songs.map { URL(fileURLWithPath: $0.path) }.filter { FileManager.default.fileExists(atPath: $0.path) })
+        let ids = saved.songs.compactMap { song(forFile: $0.path)?.id }
         guard ids.count == saved.songs.count else { throw PlannerError("Couldn't add every song of the set to the library.") }
         var mix = Mix()
         for (song, id) in zip(saved.songs, ids) {
@@ -213,60 +246,341 @@ final class Library: ObservableObject {
         for url in urls {
             var isDir: ObjCBool = false
             if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
-                let e = FileManager.default.enumerator(at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
-                while let f = e?.nextObject() as? URL {
-                    if Library.audioExtensions.contains(f.pathExtension.lowercased()) { files.append(f) }
-                }
+                watch(url.path)
+                files += Self.audioFiles(in: url)
             } else if Library.audioExtensions.contains(url.pathExtension.lowercased()) {
                 files.append(url)
             }
         }
-        let known = Set(songs.map(\.path))
-        var added: [Song] = []
-        for f in files.sorted(by: { $0.path < $1.path }) where !known.contains(f.path) {
+        ignored.subtract(files.map(\.path))   // asked for by name, so wanted whatever was removed before
+        let added = addRows(files)
+        save()
+        guard !added.isEmpty else { return }
+        Task { await settle(added, new: Set(added)) }
+    }
+
+    /// A row for each file the library doesn't have, as a song or as another version of one. The rows wait for
+    /// `settle` before they are analyzed: analysis takes seconds a song, and a file that turns out to be a worse
+    /// version of a song is never played.
+    private func addRows(_ files: [URL]) -> [UUID] {
+        var known = Set(songs.flatMap { [$0.path] + ($0.versions ?? []).map(\.path) })
+        var list = songs, added: [UUID] = []
+        for f in files.sorted(by: { $0.path < $1.path }) where known.insert(f.path).inserted {
             let stem = AudioSource.isStem(f)
             var name = f.deletingPathExtension().lastPathComponent
             if stem, name.lowercased().hasSuffix(".stem") { name = String(name.dropLast(5)) }
-            let song = Song(path: f.path, title: name, artist: "", isStem: stem, fileKey: fileKey(f))
-            songs.append(song)
-            enqueue(song.id)
-            added.append(song)
+            let song = Song(path: f.path, title: name, artist: "", isStem: stem, fileKey: fileKey(f), added: Date())
+            list.append(song)
+            added.append(song.id)
         }
-        save()
-        guard !added.isEmpty else { return }
-        // One task for the whole import, saving once: a task per song each saved the entire library when its tags
-        // came in, so a folder of n songs encoded the library n times on the main thread.
-        Task {
-            for song in added { await self.loadMetadata(song.id, genre: true) }
-            save()
-            await loadArtwork(added)
-        }
+        guard !added.isEmpty else { return [] }
+        songs = list
+        states.merge(added.map { ($0, .waiting) }) { _, new in new }
+        return added
     }
 
     func remove(_ ids: Set<UUID>) {
+        // Their files are still in the folders, and the next scan would bring them straight back.
+        for song in songs where ids.contains(song.id) { ignored.formUnion([song.path] + (song.versions ?? []).map(\.path)) }
         songs.removeAll { ids.contains($0.id) }
         for i in playlists.indices { playlists[i].songIDs.removeAll { ids.contains($0) } }
         save()
     }
 
-    /// Reads title, artist and album from the file's tags. Callers save. The genre tag is read only for a song being
-    /// added (`genre`): filling in tags on an older library must not replace a genre the user has set by hand.
-    private func loadMetadata(_ id: UUID, genre: Bool = false) async {
-        guard let song = song(id) else { return }
-        let asset = AVURLAsset(url: song.url)
-        guard let items = try? await asset.load(.commonMetadata) else { return }
-        var title: String?, artist: String?, album: String?
-        for item in items {
-            if item.commonKey == .commonKeyTitle { title = try? await item.load(.stringValue) }
-            if item.commonKey == .commonKeyArtist { artist = try? await item.load(.stringValue) }
-            if item.commonKey == .commonKeyAlbumName { album = try? await item.load(.stringValue) }
+    /// Removes the songs whose files are gone and that have no other file to play.
+    func removeMissing() {
+        remove(Set(songs.filter { states[$0.id] == .missing }.map(\.id)))
+    }
+
+    // MARK: Folders
+
+    private func watch(_ path: String) {
+        guard !folders.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) else { return }
+        folders.removeAll { $0.hasPrefix(path + "/") }
+        folders.append(path)
+    }
+
+    /// Stops looking in a folder. The songs already found there stay.
+    func unwatch(_ path: String) {
+        folders.removeAll { $0 == path }
+        save()
+    }
+
+    private nonisolated static func audioFiles(in folder: URL) -> [URL] {
+        var files: [URL] = []
+        let e = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+        while let f = e?.nextObject() as? URL {
+            if audioExtensions.contains(f.pathExtension.lowercased()) { files.append(f) }
         }
-        let tagged = genre ? await Genre.tagged(in: asset) : nil
+        return files
+    }
+
+    func rescan() { Task { await scan() } }
+
+    /// Looks through the folders again and at every file the library knows: new files become songs or versions of
+    /// them, versions that are gone are forgotten, and a file written over in place is read again. Then `reconcile`
+    /// moves each song to the best file it has left. The looking is off the main thread, and a scan that finds
+    /// nothing changed publishes nothing, since one runs every time the app comes forward.
+    private func scan() async {
+        guard !scanning else { return }
+        scanning = true
+        defer { scanning = false }
+        let folders = folders, skip = ignored
+        let playing = songs.map { ($0.id, $0.path, $0.fileKey) }
+        let others = Set(songs.flatMap { ($0.versions ?? []).map(\.path) })
+        let (found, gone, changed) = await Task.detached(priority: .utility) { () -> ([URL], Set<String>, [UUID]) in
+            let found = folders.flatMap { Self.audioFiles(in: URL(fileURLWithPath: $0)) }.filter { !skip.contains($0.path) }
+            var gone = Set(others.filter { !FileManager.default.fileExists(atPath: $0) }), changed: [UUID] = []
+            for (id, path, key) in playing {
+                if !FileManager.default.fileExists(atPath: path) { gone.insert(path) } else if fileKey(URL(fileURLWithPath: path)) != key { changed.append(id) }
+            }
+            return (found, gone, changed)
+        }.value
+
+        var list = songs, pruned = false
+        for i in list.indices {
+            guard let versions = list[i].versions else { continue }
+            let kept = versions.filter { $0.path == list[i].path || !gone.contains($0.path) }
+            if kept.count != versions.count { list[i].versions = kept; pruned = true }
+        }
+        if pruned { songs = list }
+        // Written over where it was, as bejeweled does when a song is separated again: the same path is a new file.
+        for id in changed {
+            if let song = song(id), song.path == playing.first(where: { $0.0 == id })?.1 {
+                use(SongVersion(path: song.path, title: song.title, duration: 0), for: id)
+            }
+        }
+        // A file that was gone and is back, on a drive that was unplugged say.
+        for song in songs where states[song.id] == .missing && !gone.contains(song.path) { enqueue(song.id) }
+        let fresh = addRows(found)
+        let untagged = songs.filter { $0.versions == nil && !gone.contains($0.path) && !settling.contains($0.id) }.map(\.id)
+        let lost = songs.contains { gone.contains($0.path) && states[$0.id] != .missing }
+        guard !fresh.isEmpty || !untagged.isEmpty || !changed.isEmpty || pruned || lost else { return }
+        await settle(Array(Set(fresh + untagged + changed)), new: Set(fresh))
+    }
+
+    private struct FileTags {
+        var path: String
+        var title: String?, artist: String?, album: String?, genre: Genre?
+        var duration = 0.0
+        var read = false
+    }
+
+    private nonisolated static func tags(of url: URL, genre: Bool) async -> FileTags {
+        var tags = FileTags(path: url.path)
+        let asset = AVURLAsset(url: url)
+        guard let items = try? await asset.load(.commonMetadata) else { return tags }
+        for item in items {
+            if item.commonKey == .commonKeyTitle { tags.title = try? await item.load(.stringValue) }
+            if item.commonKey == .commonKeyArtist { tags.artist = try? await item.load(.stringValue) }
+            if item.commonKey == .commonKeyAlbumName { tags.album = try? await item.load(.stringValue) }
+        }
+        if let seconds = try? await asset.load(.duration).seconds, seconds.isFinite { tags.duration = seconds }
+        if genre { tags.genre = await Genre.tagged(in: asset) }
+        tags.read = true
+        return tags
+    }
+
+    /// Reads the tags of rows that were just added, or added before songs had versions, then lets `reconcile`
+    /// decide which of them are songs of their own, and only those are analyzed. The genre tag is read only for a
+    /// song being added (`new`): filling in an older library must not replace a genre the user has set by hand.
+    /// Tags are read eight files at a time and applied in one publish, for the reason `summarize` batches.
+    private func settle(_ ids: [UUID], new: Set<UUID>) async {
+        settling.formUnion(ids)
+        let files = ids.compactMap { id in song(id).map { (id, $0.url, new.contains(id)) } }
+        var read: [UUID: FileTags] = [:]
+        await withTaskGroup(of: (UUID, FileTags).self) { group in
+            var next = 0
+            func addTask() {
+                guard next < files.count else { return }
+                let (id, url, genre) = files[next]; next += 1
+                group.addTask { (id, await Self.tags(of: url, genre: genre)) }
+            }
+            for _ in 0..<8 { addTask() }
+            while let (id, tags) = await group.next() {
+                read[id] = tags
+                addTask()
+            }
+        }
+        var list = songs
+        for i in list.indices {
+            // Not if the song moved to another file while its tags were being read.
+            guard let tags = read[list[i].id], tags.path == list[i].path else { continue }
+            if let title = tags.title, !title.isEmpty { list[i].title = title }
+            if let artist = tags.artist { list[i].artist = artist }
+            if tags.read { list[i].album = tags.album ?? "" }
+            if let genre = tags.genre { list[i].genre = genre }
+            let version = SongVersion(path: list[i].path, title: list[i].title, duration: tags.duration)
+            list[i].versions = (list[i].versions ?? []).filter { $0.path != version.path } + [version]
+        }
+        songs = list
+        settling.subtract(ids)
+        reconcile(new: new)
+        for id in new where states[id] == .waiting && !analysisQueue.contains(id) { enqueue(id) }
+        save()
+        await loadArtwork(songs.filter { new.contains($0.id) })
+    }
+
+    // MARK: Versions
+
+    /// How far apart two files of a song can run and still be taken for the same cut of it. Stems of one recording
+    /// from different sources differ by a few seconds of silence at either end (Poker Face: 236.8 s official,
+    /// 240.0 s in Fortnite Festival), and a different cut by more (Bad Romance: 301.5 s against 292.5 s).
+    private static let sameCut = 5.0
+
+    /// The song that plays the file at `path`, has it as another version, or played it once.
+    func song(forFile path: String) -> Song? {
+        songs.first { $0.path == path }
+            ?? songs.first { ($0.versions ?? []).contains { $0.path == path } || ($0.formerPaths ?? []).contains(path) }
+    }
+
+    /// The songs that files and folders given to `add` ended up as, whether as rows of their own or as versions.
+    func songs(from urls: [URL]) -> [Song] {
+        songs.filter { song in
+            ([song.path] + (song.versions ?? []).map(\.path)).contains { path in
+                urls.contains { $0.path == path || $0.hasDirectoryPath && path.hasPrefix($0.path + "/") }
+            }
+        }
+    }
+
+    /// A better file of the song than the one it plays, which `reconcile` left alone because it is another cut or
+    /// because the user chose this one.
+    func betterVersion(of song: Song) -> SongVersion? {
+        let rank = song.source.rank
+        return (song.versions ?? []).filter { $0.path != song.path && $0.source.rank < rank }.min { $0.source.rank < $1.source.rank }
+    }
+
+    /// Plays a song from the file the user picked, or with nil goes back to choosing for them. Picking the best
+    /// file there is doesn't pin the song to it: that is taking an upgrade, and the next one should still arrive.
+    func setVersion(_ path: String?, for id: UUID) {
         guard let i = songs.firstIndex(where: { $0.id == id }) else { return }
-        if let title, !title.isEmpty { songs[i].title = title }
-        if let artist { songs[i].artist = artist }
-        songs[i].album = album ?? ""
-        if let tagged { songs[i].genre = tagged }
+        if let path, let version = songs[i].versions?.first(where: { $0.path == path }) {
+            let best = (songs[i].versions ?? []).allSatisfy { $0.source.rank >= version.source.rank }
+            songs[i].pinned = best ? nil : true
+            if path != songs[i].path { use(version, for: id) }
+        } else {
+            songs[i].pinned = nil
+            reconcile()
+        }
+        save()
+    }
+
+    private func isEdited(_ id: UUID) -> Bool {
+        let id = id.uuidString
+        return edits.keys.contains { $0.contains(id) } || playlists.contains { $0.mix?.edits.keys.contains { $0.contains(id) } ?? false }
+    }
+
+    /// The file a song should move to, if any. A song whose file is gone takes the best it has. Otherwise a better
+    /// file replaces the one it plays when the two are the same cut. A different cut replaces it only when nothing
+    /// was built on the old one, no edited transition and no mix, and neither file is a game's cut, which is
+    /// shortened to fit the game.
+    private func choice(for song: Song) -> SongVersion? {
+        let files = FileManager.default
+        let others = (song.versions ?? []).filter { $0.path != song.path && files.fileExists(atPath: $0.path) }
+            .sorted { $0.source.rank < $1.source.rank }
+        guard !others.isEmpty else { return nil }
+        let length = song.versions?.first { $0.path == song.path && $0.duration > 0 }?.duration ?? summaries[song.id]?.duration
+        let source = song.source
+        func fits(_ v: SongVersion) -> Bool {
+            if let length, v.duration > 0, abs(v.duration - length) <= Self.sameCut { return true }
+            return !v.source.gameCut && !source.gameCut && !isEdited(song.id)
+        }
+        guard files.fileExists(atPath: song.path) else { return others.first(where: fits) ?? others[0] }
+        guard song.pinned != true else { return nil }
+        return others.first { $0.source.rank < source.rank && fits($0) }
+    }
+
+    /// Makes the library one row a song, each playing the best file it can.
+    ///
+    /// Rows of the same song become one, and playlists, mixes and edits that named the others name it instead.
+    /// The row kept is the oldest, so the song keeps its genre. A row just added (`new`) is a file turning up,
+    /// which `choice` weighs against the one the song plays. Rows that were both here already are versions an
+    /// older library kept as songs of their own, and the song plays the best of those that still exists.
+    ///
+    /// Then every song moves to the file `choice` gives it, and a song left with no file at all is marked missing.
+    private func reconcile(new: Set<UUID> = []) {
+        let files = FileManager.default
+        var groups: [String: [Int]] = [:]
+        for (i, song) in songs.enumerated() { groups[song.key, default: []].append(i) }
+        var list = songs, into: [UUID: UUID] = [:], moves: [(UUID, SongVersion)] = []
+        for members in groups.values where members.count > 1 {
+            let order = { (i: Int) in (files.fileExists(atPath: list[i].path) ? 0 : 1, list[i].source.rank, i) }
+            let settled = members.filter { !new.contains(list[$0].id) }
+            let best = (settled.isEmpty ? members : settled).min { order($0) < order($1) }!
+            let keep = settled.first ?? best
+            if best != keep, files.fileExists(atPath: list[best].path) {
+                let length = list[best].versions?.first { $0.path == list[best].path }?.duration ?? 0
+                moves.append((list[keep].id, SongVersion(path: list[best].path, title: list[best].title, duration: length)))
+            }
+            for i in members where i != keep {
+                into[list[i].id] = list[keep].id
+                let held = Set((list[keep].versions ?? []).map(\.path))
+                let more = (list[i].versions ?? []).filter { !held.contains($0.path) }
+                if !more.isEmpty { list[keep].versions = (list[keep].versions ?? []) + more }
+                // A row that was a song of its own may be in a saved set under its file. A new one never was.
+                guard !new.contains(list[i].id) else { continue }
+                var former = list[keep].formerPaths ?? []
+                for path in [list[i].path] + (list[i].formerPaths ?? []) where !former.contains(path) { former.append(path) }
+                list[keep].formerPaths = former
+            }
+        }
+        if !into.isEmpty {
+            func rekeyed<V>(_ old: [String: V]) -> [String: V] {
+                var new: [String: V] = [:], moved: [(String, V)] = []
+                for (key, value) in old {
+                    var k = key
+                    for (from, to) in into where k.contains(from.uuidString) { k = k.replacingOccurrences(of: from.uuidString, with: to.uuidString) }
+                    if k == key { new[key] = value } else { moved.append((k, value)) }
+                }
+                for (key, value) in moved where new[key] == nil { new[key] = value }   // what the kept row had stays
+                return new
+            }
+            songs = list.filter { into[$0.id] == nil }
+            var lists = playlists
+            for i in lists.indices {
+                lists[i].songIDs = lists[i].songIDs.map { into[$0] ?? $0 }
+                if let mix = lists[i].mix { lists[i].mix = Mix(songs: rekeyed(mix.songs), edits: rekeyed(mix.edits)) }
+            }
+            playlists = lists
+            edits = rekeyed(edits)
+            saveEdits()
+            for id in into.keys {
+                playable[id] = nil; stemFiles[id] = nil
+                states[id] = nil; summaries[id] = nil; analyses[id] = nil; artwork[id] = nil
+                invalidatePlans(involving: id)
+            }
+            for id in Set(into.values) { invalidatePlans(involving: id) }
+            for (id, version) in moves { use(version, for: id) }
+        }
+        for song in songs {
+            if let version = choice(for: song) { use(version, for: song.id) }
+        }
+        let missing = songs.filter { states[$0.id] != .missing && !files.fileExists(atPath: $0.path) }
+        if !missing.isEmpty { states.merge(missing.map { ($0.id, .missing) }) { _, new in new } }
+        loadPlaylistSongs()
+    }
+
+    /// Points a song at another of its files. Everything known about the old file is dropped, since the new one is
+    /// a different recording as far as an analysis or a plan can tell, and the song is analyzed again.
+    private func use(_ version: SongVersion, for id: UUID) {
+        guard let i = songs.firstIndex(where: { $0.id == id }) else { return }
+        let old = songs[i].path
+        if old != version.path {
+            songs[i].formerPaths = ((songs[i].formerPaths ?? []).filter { $0 != old && $0 != version.path }) + [old]
+        }
+        songs[i].path = version.path
+        songs[i].title = version.title
+        songs[i].isStem = AudioSource.isStem(songs[i].url)
+        songs[i].fileKey = fileKey(songs[i].url)
+        playable[id] = nil
+        stemFiles[id] = nil
+        analyses[id] = nil
+        summaries[id] = nil
+        artwork[id] = nil
+        invalidatePlans(involving: id)
+        enqueue(id)
+        let song = songs[i]
+        Task { await loadArtwork([song]) }
     }
 
     private nonisolated static func artwork(_ song: Song) async -> NSImage? {
@@ -288,12 +602,9 @@ final class Library: ObservableObject {
         states.merge(batch.map { ($0.0, .ready) }) { _, new in new }
     }
 
-    /// Missing tags, then cover art, once the playlists' analyses are in: they're the last thing anyone waits on.
+    /// Cover art, once the playlists' analyses are in: they're the last thing anyone waits on.
     private func loadCoversWhenIdle() async {
         while migrating || fullWorkers > 0 || !fullQueue.isEmpty { try? await Task.sleep(for: .milliseconds(200)) }
-        let untagged = songs.filter { $0.album == nil }
-        for song in untagged { await loadMetadata(song.id) }
-        if !untagged.isEmpty { save() }
         // Playlist songs first, the rest in library order.
         let inPlaylists = Set(playlists.flatMap(\.songIDs))
         await loadArtwork(songs.filter { inPlaylists.contains($0.id) } + songs.filter { !inPlaylists.contains($0.id) })
@@ -366,18 +677,23 @@ final class Library: ObservableObject {
     /// Songs without a summary: read their cached analysis once to make one, or analyze them.
     private func analyze(_ id: UUID) async {
         guard let song = song(id) else { return }
+        guard FileManager.default.fileExists(atPath: song.path) else { states[id] = .missing; return }
         do {
             let a: SongAnalysis
+            var extracted: URL?
             if let cached = await Self.readAnalysis(Self.cacheFile(song)) {
                 a = cached
             } else {
                 states[id] = .analyzing
                 let url = try await AudioSource.playableURL(for: song.url)
-                playable[id] = url
+                extracted = url
                 a = try await Analyzer.analyze(playable: url, id: song.fakeCatalogID)
                 let file = Self.cacheFile(song)
                 await Task.detached(priority: .utility) { try? JSONEncoder().encode(a).write(to: file) }.value
             }
+            // The song moved to another file while this one was being read, and that file's analysis is on its way.
+            guard self.song(id)?.fileKey == song.fileKey else { return }
+            if let extracted { playable[id] = extracted }
             summaries[id] = a.summary
             summaryIndex[song.fileKey] = a.summary
             saveSummariesSoon()
@@ -388,7 +704,7 @@ final class Library: ObservableObject {
             }
             loadPlaylistSongs()
         } catch {
-            states[id] = .failed(String(describing: error))
+            if self.song(id)?.fileKey == song.fileKey { states[id] = .failed(String(describing: error)) }
         }
     }
 
@@ -428,11 +744,24 @@ final class Library: ObservableObject {
 
     private func loadFull(_ id: UUID, stems: Bool) async {
         guard let song = song(id) else { return }
+        guard FileManager.default.fileExists(atPath: song.path) else { states[id] = .missing; return }
+        // Nothing read here is kept if the song moved to another file meanwhile: `use` has queued that one.
+        let current = { self.song(id)?.fileKey == song.fileKey }
         do {
-            if playable[id] == nil { playable[id] = try await AudioSource.playableURL(for: song.url) }
-            if stems, stemFiles[id] == nil { stemFiles[id] = try await AudioSource.stemURLs(for: song.url) }
+            if playable[id] == nil {
+                let url = try await AudioSource.playableURL(for: song.url)
+                guard current() else { return }
+                playable[id] = url
+            }
+            if stems, stemFiles[id] == nil {
+                let urls = try await AudioSource.stemURLs(for: song.url)
+                guard current() else { return }
+                stemFiles[id] = urls
+            }
             if analyses[id] == nil {
-                guard let a = await Self.readAnalysis(Self.cacheFile(song)) else {
+                let cached = await Self.readAnalysis(Self.cacheFile(song))
+                guard current() else { return }
+                guard let a = cached else {
                     enqueue(id)   // the cache file went missing: analyze again
                     return
                 }
@@ -440,7 +769,7 @@ final class Library: ObservableObject {
                 invalidatePlans(involving: id)
             }
         } catch {
-            states[id] = .failed(String(describing: error))
+            if current() { states[id] = .failed(String(describing: error)) }
         }
     }
 
