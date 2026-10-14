@@ -45,6 +45,7 @@ final class MCPServer {
     private var moves: [String: String] = [:]               // the exit and entry moves a transition was built from, by plan key
     private var matched: Set<String> = []                   // transitions whose tempo match is the server's, by plan key
     private var handTempo: Set<String> = []                 // transitions whose tempo lanes the agent drew, which are then left alone
+    private var lastOrder: [String] = []                    // the songs last planned, rendered or loaded as a set, for save_set
     private let renders: URL                                // where a render given a name goes
     /// Whether the server offers what Apple's AutoMix has no counterpart for: stems, loops and outgoing tails. Off,
     /// an agent can do what the app's editor can and no more.
@@ -245,7 +246,7 @@ final class MCPServer {
             tool("render_set", "Render songs in order, with every transition, to one WAV. Returns the same timeline as plan_set, with the level each second around each transition. A transition that can't be planned becomes a straight cut.",
                  ["songs": ids("Song ids in playing order"), "first": first, "last": last, "name": named, "out": out, "sound_check": soundCheck], required: ["songs"]),
             tool("save_set", "Save songs, their genres and settings, and every edited transition between them, to carry on after a restart. Saving under a name that exists replaces it.",
-                 ["name": string("A name for the set"), "songs": ids("Song ids in playing order. Left out, every song added this session")], required: ["name"]),
+                 ["name": string("A name for the set"), "songs": ids("Song ids in playing order. Left out, the songs last given to plan_set or render_set or loaded with load_set, or with none of those every song added this session")], required: ["name"]),
             tool("load_set", "Load a saved set: adds its songs, puts back their genres, settings and transition edits, and returns its songs in order: position, id, title and artist.",
                  ["name": string("The set's name, from list_sets")], required: ["name"]),
             tool("list_sets", "The saved sets, newest first."),
@@ -328,6 +329,7 @@ final class MCPServer {
         case "plan_set", "render_set":
             guard let ids = args["songs"] as? [String], !ids.isEmpty else { throw PlannerError("songs must be a list of song ids") }
             let list = try ids.map { try entry($0) }
+            lastOrder = ids
             let first = Int(number(args["first"]) ?? 1), last = Int(number(args["last"]) ?? Double(list.count))
             guard first >= 1, last <= list.count, first <= last else { throw PlannerError("first and last are positions in songs, from 1 to \(list.count)") }
             // As `describe`: the stem checks need both songs' stem levels.
@@ -354,7 +356,11 @@ final class MCPServer {
             return songs.filter { ids.contains($0.id) }.map(summary)
         case "save_set":
             guard let set = args["name"] as? String, !set.isEmpty else { throw PlannerError("name the set") }
-            guard let ids = args["songs"] as? [String] else { return try save(set, songs) }
+            // Without songs it saves the set last planned, rendered or loaded. It used to save every song of the
+            // session, which after add_songs on a folder is the library: an agent rendered a 14-song set, saved it
+            // without naming the songs, and the app imported a mix of 763 (PINK DIAMOND FLASH; Vroom Zai, 619, the
+            // same way). Every song is still what it saves when no set has been played.
+            guard let ids = args["songs"] as? [String] ?? (lastOrder.isEmpty ? nil : lastOrder) else { return try save(set, songs) }
             let list = try ids.map { try entry($0) }
             var saved = try save(set, list)
             // Only for songs given in order, which is a set; every song of the session is a library, with its versions.
@@ -1514,6 +1520,7 @@ final class MCPServer {
             (songs[i].genre, songs[i].keyShift, songs[i].gainDB) = (song.genre, extensions ? song.keyShift : 0, extensions ? song.gainDB : 0)
             ids.append(songs[i].id)
         }
+        lastOrder = ids.compactMap { $0 }
         var restored = 0
         for t in saved.transitions {
             guard let a = ids[t.from].flatMap({ id in songs.first { $0.id == id } }), let b = ids[t.to].flatMap({ id in songs.first { $0.id == id } }),
