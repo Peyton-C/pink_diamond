@@ -57,9 +57,8 @@ The analysis says nothing about how a song sounds or what it is about, and key a
 | `style` | Its style in a few words, such as French house or country pop |
 | `lyrics` | What the words are about and how they feel |
 | `mood_clash` | The sound and the words pull opposite ways, as in a bright dance song about misery |
-| `unknown` | The agent did not know the recording. It has no other tags and is not offered for tagging again |
 
-Tag the library in a session that does nothing else, in batches, searching with `untagged`. An agent tags from what it knows of a recording, so a song it does not know should be marked `unknown` and not guessed at. Energy is a judgement and not a measurement: it is for seeing a jump between two songs, and tagging a song again replaces the fields given.
+Tag the library in a session that does nothing else, in batches, searching with `untagged`. An agent tags from what it knows of a recording, so a song it does not know is left untagged and not guessed at. Energy is a judgement and not a measurement: it is for seeing a jump between two songs. Tagging a song again replaces the fields given, and `clear` removes all of its tags.
 
 pink diamond keeps tags in `~/Library/Application Support/pink diamond/tags.json`, by artist and title, so they outlast the session and every version of a song shares them. Two files of one song with different artist tags count as two songs.
 

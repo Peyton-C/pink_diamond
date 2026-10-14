@@ -35,7 +35,6 @@ final class MCPServer {
         /// The sound and the words pull opposite ways. No audio model hears this: I Can Do It With a Broken Heart is
         /// bright synth-pop about being miserable, and sits beside One More Time on every measure of how it sounds.
         var moodClash: Bool?
-        var unknown: Bool?       // the agent didn't know the song, so it isn't asked again and isn't guessed at
     }
 
     private var songs: [Entry] = []
@@ -213,7 +212,7 @@ final class MCPServer {
                   "overview": bool("Return how many songs match, by artist and by BPM band, in place of the songs"),
                   "unique": bool("List a song that is there in several versions once, as the version with the best stems. Defaults to true"),
                   "limit": integer("Most songs to return. Defaults to 50, and 100 at most"), "offset": integer("Songs to skip, to page through a long list")]),
-            tool("tag_songs", "Write down what songs are like to hear, for every later session to read in list_songs. Kept between sessions, and shared by every version of a song. Tag from what you know of the recording, not from its title: a song you don't recognise is marked unknown and never guessed at. Tagging a song again replaces the fields given.",
+            tool("tag_songs", "Write down what songs are like to hear, for every later session to read in list_songs. Kept between sessions, and shared by every version of a song. Tag from what you know of the recording, not from its title: leave out a song you don't recognise rather than guess at it. Tagging a song again replaces the fields given, and clear removes all of them.",
                  ["songs": ["type": "array", "description": "One entry for each song", "items": [
                      "type": "object",
                      "properties": ["song": string("Song id"),
@@ -221,7 +220,7 @@ final class MCPServer {
                                     "style": string("Its style in a few words, as specific as you can be: French house, country pop, hyperpop"),
                                     "lyrics": string("What the words are about and how they feel, in a few words: celebrating the night, hiding heartbreak"),
                                     "mood_clash": bool("The sound and the words pull opposite ways, such as a bright dance song about misery"),
-                                    "unknown": bool("You don't know this recording")],
+                                    "clear": bool("Remove the song's tags, leaving it untagged")],
                      "required": ["song"]] as [String: Any]] as [String: Any]], required: ["songs"]),
             tool("get_song", "A song's analysis: bars and vocal ranges in song seconds, its loudness, and its sections, each with its length in bars, how loud it is against the whole song, and how much of it has vocals. Sections have no names.",
                  ["song": string("Song id"), "songs": ids("Song ids, to get several in one call as a list"), "beats": bool("Include every beat time"),
@@ -544,12 +543,11 @@ final class MCPServer {
         var changed = tags
         for item in list {
             let key = name(try entry(item["song"]))
-            if item["unknown"] as? Bool == true {
-                changed[key] = Tag(unknown: true)
+            if item["clear"] as? Bool == true {
+                changed[key] = nil
                 continue
             }
             var tag = changed[key] ?? Tag()
-            tag.unknown = nil
             if let energy = number(item["energy"]) {
                 guard (1...10).contains(energy) else { throw PlannerError("energy must be between 1 and 10") }
                 tag.energy = Int(energy)
@@ -557,7 +555,7 @@ final class MCPServer {
             if let style = item["style"] as? String { tag.style = style }
             if let lyrics = item["lyrics"] as? String { tag.lyrics = lyrics }
             if let clash = item["mood_clash"] as? Bool { tag.moodClash = clash ? true : nil }
-            guard tag.energy != nil || tag.style != nil || tag.lyrics != nil else { throw PlannerError("give a song its energy, style or lyrics, or mark it unknown") }
+            guard tag.energy != nil || tag.style != nil || tag.lyrics != nil else { throw PlannerError("give a song its energy, style or lyrics, or clear its tags") }
             changed[key] = tag
         }
         let encoder = JSONEncoder()
