@@ -144,7 +144,33 @@ struct SongTable: View {
         var id: UUID { song.id }
     }
 
+    /// The order the table last showed, kept to tell a change it can take row by row from one it has to start over
+    /// for. A class, so that noting the order while the view is drawn doesn't ask for it to be drawn again.
+    private final class Shown {
+        var ids: [UUID] = []
+        var generation = 0
+    }
+    @State private var shown = Shown()
+    private static let rebuildPast = 20
+
+    /// The table's identity, which changes when more than `rebuildPast` rows were added or moved at once.
+    ///
+    /// SwiftUI hands AppKit a change as rows inserted and moved, and AppKit measures the height of every one of
+    /// them by building all its cells, on screen or not: flipping the title sort on 662 songs held the main thread
+    /// for 21 s, about 30 ms a row. A table with a new identity is built afresh, which makes only the rows on
+    /// screen. It also scrolls back to the top, so small changes still go row by row.
+    private func generation(_ ids: [UUID]) -> Int {
+        guard shown.ids != ids else { return shown.generation }
+        let before = Set(shown.ids), now = Set(ids)
+        let kept = shown.ids.filter(now.contains), stayed = ids.filter(before.contains)
+        let changed = ids.count - stayed.count + zip(kept, stayed).filter { $0 != $1 }.count
+        if changed > Self.rebuildPast { shown.generation += 1 }
+        shown.ids = ids
+        return shown.generation
+    }
+
     var body: some View {
+        let rows = rows
         Table(rows, selection: $selection, sortOrder: $sortOrder) {
             TableColumn("") { row in StatusIcon(state: library.states[row.id]) }.width(18)
             TableColumn("Title", value: \.song.title) { row in
@@ -205,6 +231,7 @@ struct SongTable: View {
             Divider()
             Button("Remove from Library", role: .destructive) { library.remove(ids) }
         }
+        .id(generation(rows.map(\.id)))
     }
 
     private var rows: [Row] {
