@@ -209,6 +209,10 @@ final class MCPServer {
                   "any_key": bool("With key_tempo_like, keep songs in a clashing key too, after the others and marked key_clash. They can work when only the drums come in, since every other stem is pitched"),
                   "energy_min": integer("Lowest energy tag, 1 to 10. Leaves out songs with no energy tag"), "energy_max": integer("Highest energy tag"),
                   "untagged": bool("Only songs tag_songs has not been given yet"),
+                  "stems": ids("Only songs whose stems came from one of these, as list_songs shows them: Official, FN, RF AT and so on. any is every stem file, none every file without stems"),
+                  "year_min": integer("Earliest year of release. Leaves out songs with no year"), "year_max": integer("Latest year of release"),
+                  "random": integer("Draw this many songs at random from what matches, in place of the first ones. 100 at most"),
+                  "seed": integer("With random, the same seed draws the same songs from the same matches. Left out, one is picked and returned"),
                   "overview": bool("Return how many songs match, by artist and by BPM band, in place of the songs"),
                   "unique": bool("List a song that is there in several versions once, as the version with the best stems. Defaults to true"),
                   "limit": integer("Most songs to return. Defaults to 50, and 100 at most"), "offset": integer("Songs to skip, to page through a long list")]),
@@ -648,6 +652,18 @@ final class MCPServer {
             let least = number(args["energy_min"]) ?? 1, most = number(args["energy_max"]) ?? 10
             matches = matches.filter { s in tags[name(s)]?.energy.map { Double($0) >= least && Double($0) <= most } ?? false }
         }
+        if let sources = args["stems"] as? [String] {
+            // Before `unique`, so asking for FN gives the FN version of a song that also has better stems.
+            let wanted = Set(sources.map { $0.lowercased() })
+            matches = matches.filter { s in
+                guard let source = stemSource(s) else { return wanted.contains("none") }
+                return wanted.contains("any") || wanted.contains(source.name.lowercased())
+            }
+        }
+        if args["year_min"] != nil || args["year_max"] != nil {
+            let earliest = Int(number(args["year_min"]) ?? 0), latest = Int(number(args["year_max"]) ?? 9999)
+            matches = matches.filter { s in s.year.map { $0 >= earliest && $0 <= latest } ?? false }
+        }
         if let set = args["not_in_set"] as? String {
             // By name and not by id, so another version of a song the set has is left out with it. A filter here
             // holds however much the agent is carrying: the sets that repeated a song were the long ones.
@@ -685,7 +701,18 @@ final class MCPServer {
         matches = matches.filter { !clashing.contains($0.id) } + matches.filter { clashing.contains($0.id) }
         if args["overview"] as? Bool == true { return overview(matches) }
         // Capped, so the whole library can't be asked for in one call: an agent is meant to search it.
-        let offset = max(0, Int(number(args["offset"]) ?? 0)), limit = max(1, min(100, Int(number(args["limit"]) ?? 50)))
+        var offset = max(0, Int(number(args["offset"]) ?? 0)), limit = max(1, min(100, Int(number(args["limit"]) ?? 50)))
+        var drawn: Int?
+        if let count = number(args["random"]) {
+            // Shuffled from the songs sorted by id and not in the order they were added, so a seed draws the same
+            // songs in a later session that added the library in another order. Small enough to pass back exactly.
+            let seed = number(args["seed"]).map { Int($0) } ?? Int.random(in: 0..<1_000_000)
+            var generator = SeededGenerator(seed: UInt64(bitPattern: Int64(seed)))
+            matches = matches.sorted { $0.id < $1.id }.shuffled(using: &generator)
+            offset = 0
+            limit = max(1, min(100, Int(count)))
+            drawn = seed
+        }
         var json: [String: Any] = ["total": matches.count, "songs": matches.dropFirst(offset).prefix(limit).map { s -> [String: Any] in
             var json = row(s)
             if clashing.contains(s.id) { json["key_clash"] = true }
@@ -693,7 +720,21 @@ final class MCPServer {
         }]
         // On the result and not only in the tool's description, so it is read with the list it is about.
         if args["key_tempo_like"] != nil { json["note"] = "Matched on key and tempo only. Whether a song belongs next to it is yours to judge." }
+        if let drawn { json["seed"] = drawn }
         return json
+    }
+
+    /// SplitMix64. Swift's own generator can't be seeded, and a draw has to come out the same from the same seed.
+    private struct SeededGenerator: RandomNumberGenerator {
+        var state: UInt64
+        init(seed: UInt64) { state = seed }
+        mutating func next() -> UInt64 {
+            state &+= 0x9E37_79B9_7F4A_7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE5_E9B9
+            z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+            return z ^ (z >> 31)
+        }
     }
 
     private func songDetail(_ song: Entry, _ args: [String: Any]) async throws -> [String: Any] {
