@@ -38,6 +38,8 @@ A large library is meant to be searched, not listed. The overview shows what is 
 | `render_transition` | Renders one transition to a WAV with some of each song around it, and reports the result's level each second, its peak, and how many samples sit at full scale |
 | `render_set` | Renders songs in order with every transition to one WAV, with the same timeline as `plan_set` and the level each second around every transition |
 
+A call with an argument its tool does not take is refused, and the error lists the arguments it does take.
+
 `get_transition` and `edit_transition` take `detail`: `summary` leaves the lanes out, `moving` has the lanes that change, `all` has every lane and the effects each side can take. Reading defaults to `moving` and editing to `summary`.
 
 `plan_set` and `render_set` take `first` and `last`, positions in the song list counted from 1, to report only that stretch. pink diamond still plans or renders the whole set, and the times are still on its clock. A reply stays in the agent's context, and a long set's timeline is most of what fills it, so ask for the songs being worked on.

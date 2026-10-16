@@ -96,7 +96,17 @@ final class MCPServer {
             let name = params["name"] as? String ?? "", started = Date()
             var text: String, failed = false
             do {
-                let value = try await call(name, params["arguments"] as? [String: Any] ?? [:])
+                let args = params["arguments"] as? [String: Any] ?? [:]
+                // Refused and not ignored: an agent passed its search to list_songs as `words`, got the first page of
+                // the whole library back unfiltered, and concluded that search was broken.
+                if let schema = tools.first(where: { $0["name"] as? String == name })?["inputSchema"] as? [String: Any],
+                   let known = schema["properties"] as? [String: Any] {
+                    let unknown = args.keys.filter { known[$0] == nil }.sorted()
+                    if !unknown.isEmpty {
+                        throw PlannerError("\(name) has no argument \(unknown.joined(separator: ", ")); it takes \(known.keys.sorted().joined(separator: ", "))")
+                    }
+                }
+                let value = try await call(name, args)
                 let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
                 text = String(decoding: data, as: UTF8.self)
             } catch {
