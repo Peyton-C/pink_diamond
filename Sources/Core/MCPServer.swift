@@ -86,12 +86,27 @@ final class MCPServer {
         case "initialize":
             let asked = params["protocolVersion"] as? String ?? ""
             result = ["protocolVersion": Self.protocolVersions.contains(asked) ? asked : Self.protocolVersions[0],
-                      "capabilities": ["tools": [String: Any]()],
+                      "capabilities": ["tools": [String: Any](), "prompts": [String: Any]()],
                       "serverInfo": ["name": "pink diamond", "version": "1.0.0"]]
         case "ping":
             result = [:]
         case "tools/list":
             result = ["tools": tools]
+        case "prompts/list":
+            result = ["prompts": Self.prompts.map { p in
+                ["name": p.name, "description": p.description,
+                 "arguments": p.arguments.map { ["name": $0.name, "description": $0.description, "required": $0.required] }] as [String: Any]
+            }]
+        case "prompts/get":
+            guard let prompt = Self.prompts.first(where: { $0.name == params["name"] as? String }) else {
+                return ["jsonrpc": "2.0", "id": id, "error": ["code": -32602, "message": "unknown prompt; see prompts/list"]]
+            }
+            let given = (params["arguments"] as? [String: Any] ?? [:]).compactMapValues { ($0 as? String).flatMap { $0.isEmpty ? nil : $0 } }
+            if let missing = prompt.arguments.first(where: { $0.required && given[$0.name] == nil }) {
+                return ["jsonrpc": "2.0", "id": id, "error": ["code": -32602, "message": "\(prompt.name) needs \(missing.name)"]]
+            }
+            result = ["description": prompt.description,
+                      "messages": [["role": "user", "content": ["type": "text", "text": prompt.text(given)]]]]
         case "tools/call":
             let name = params["name"] as? String ?? "", started = Date()
             var text: String, failed = false
@@ -122,6 +137,40 @@ final class MCPServer {
         }
         return ["jsonrpc": "2.0", "id": id, "result": result]
     }
+
+    // MARK: Prompts
+
+    /// The workflows an agent would otherwise piece together from the tool descriptions. A prompt costs nothing until
+    /// it is chosen, where a tool description is paid for by every session, so the order of the steps lives here.
+    private struct Prompt {
+        let name: String, description: String
+        let arguments: [(name: String, description: String, required: Bool)]
+        let text: ([String: String]) -> String
+    }
+
+    private static let prompts: [Prompt] = [
+        Prompt(name: "tag_library", description: "Tag the library's songs with energy, style and lyrics, in a session that does nothing else",
+               arguments: [("folder", "A folder of songs to add first", false)]) { args in
+            (args["folder"].map { "Add the songs in \($0) with add_songs. " } ?? "")
+                + "Tag pink diamond's library so later sessions can choose songs by how they sound. Search list_songs with untagged: true, 50 at a time, and tag each song you know with tag_songs: energy, style, what the lyrics are about, and mood_clash when the sound and the words pull opposite ways. Tag from what you know of the recording. Leave out a song you don't recognise rather than guess from its title, and page past the ones you left with offset. When only songs you don't know are left, say how many."
+        },
+        Prompt(name: "build_set", description: "Choose songs, order them, fix the transitions and render a set",
+               arguments: [("brief", "What the set is for: an occasion, a style, a feeling", false), ("minutes", "About how long it should run", false),
+                           ("name", "A name to save and render it under", false), ("folder", "A folder of songs to add first", false)]) { args in
+            let name = args["name"] ?? "the set"
+            return (args["folder"].map { "Add the songs in \($0) with add_songs. " } ?? "")
+                + "Build a DJ set with pink diamond" + (args["minutes"].map { ", about \($0) minutes long" } ?? "") + (args["brief"].map { ": \($0)" } ?? "") + ".\n\n"
+                + "1. Choose the songs by what you know of them: style, era, lyrics and mood, from their tags where they have them. To find the next song, narrow the library with list_songs key_tempo_like on the current one, then run compare_transitions from it to a shortlist of the ones that belong. Key and tempo matching doesn't make two songs belong together; use the checks to choose between songs that do.\n"
+                + "2. Plan the order with plan_set, a few songs at a time with first and last. Fix anything under unplanned first. Choose which part of each song a transition sits in from the sections each side lists: a breakdown shows as drums gone. Then work on transitions whose checks show trouble: beats or bars apart, a key clash, tempo_too_far, vocals together, outgoing_vocal_cut_at, a level sag, or phrase points far from a section start. Try list_variants and style before drawing lanes, use exit and entry for a clean move, and avoid runs of one technique.\n"
+                + "3. render_transition each transition you changed and check its level for dips and jumps.\n"
+                + "4. save_set \(name) as you go, so the work survives a restart, and render_set it once at the end."
+        },
+        Prompt(name: "review_set", description: "Find and fix the weak transitions in a saved set",
+               arguments: [("name", "The saved set, from list_sets", true)]) { args in
+            let name = args["name"]!
+            return "Review the saved set \(name) with pink diamond. load_set it, then plan_set its songs a stretch at a time with first and last. Fix anything under unplanned first, then each transition whose checks show trouble: beats or bars apart, a key clash, tempo_too_far, vocals together, outgoing_vocal_cut_at, a level sag, or phrase points far from a section start, and any repeated technique or duplicate song. Check each fix with get_transition and render_transition, then save_set \(name) and say what you changed and what you left."
+        },
+    ]
 
     // MARK: Tools
 
@@ -236,14 +285,18 @@ final class MCPServer {
                                     "mood_clash": bool("The sound and the words pull opposite ways, such as a bright dance song about misery"),
                                     "clear": bool("Remove the song's tags, leaving it untagged")],
                      "required": ["song"]] as [String: Any]] as [String: Any]], required: ["songs"]),
-            tool("get_song", "A song's analysis: bars and vocal ranges in song seconds, its loudness, and its sections, each with its length in bars, how loud it is against the whole song, and how much of it has vocals. Sections have no names.",
+            tool("get_song", "A song's analysis: bars and vocal ranges in song seconds, its loudness, and its sections, numbered from 1, each with its length in bars, how loud it is against the whole song, how much of it has vocals, and for a stem file which stems play in it: all, or those up and those low against their loudest section. Sections have no names; a breakdown shows as drums gone from plays.",
                  ["song": string("Song id"), "songs": ids("Song ids, to get several in one call as a list"), "beats": bool("Include every beat time"),
                   "bars": bool("Include every bar time. Defaults to true; turn it off when scanning many songs"),
                   "stems": bool("For a stem file, include how loud each stem is: per section in dB, and bar by bar as a row of digits, where 0 is silent, each step up is 6 dB and 9 is -6 dB or louder")]),
             tool("set_genre", "Set the genre of one song, several, or all. Genres decide which transition styles Apple's planner can pick, and an edit belongs to the genres it was made with. It is a setting for the planner and not a description of the song: setting a song to Dance does not make it sit well next to a dance song.",
                  ["song": string("Song id"), "songs": ids("Song ids"), "all": bool("Every song added"), "genre": genre], required: ["genre"]),
-            tool("get_transition", "The planned transition between two songs with any edits applied: style, length, where each side starts and ends in song seconds, the handoff point, the automation lanes, and checks made without rendering: how far apart the beats and bars land, whether the keys go together, how long both songs have vocals at once, the predicted level in LUFS with any sag, and for two stem files how long the mix has no drums, no bass, two basses or two vocals.",
+            tool("get_transition", "The planned transition between two songs with any edits applied: style, length, where each side starts and ends in song seconds, the handoff point, the sections of each song each side plays and the one after it, the automation lanes, and checks made without rendering: how far apart the beats and bars land, how far each side's start and end are from a section start in bars, whether the keys go together, how long both songs have vocals that can be heard at once, whether the outgoing song is cut off mid-vocal, the predicted level in LUFS with any sag, and for two stem files how long the mix has no drums, no bass, two basses or two vocals.",
                  ["from": from, "to": to, "detail": detail("moving")], required: ["from", "to"]),
+            tool("compare_transitions", "Plan the transitions from one song to each of several, or from each of several into one, and return each one's technique, length and checks as get_transition makes them, without lanes. 25 at most. It shows how each transition plans, not whether the songs belong together.",
+                 ["from": ["type": ["string", "array"], "items": ["type": "string"], "description": "Outgoing song id, or several"] as [String: Any],
+                  "to": ["type": ["string", "array"], "items": ["type": "string"], "description": "Incoming song id, or several. One of from and to must be a single song"] as [String: Any]],
+                 required: ["from", "to"]),
             tool("list_variants", "The other plans Apple's planner makes for the pair: as other genres, or with lower complexity.",
                  ["from": from, "to": to], required: ["from", "to"]),
             tool("list_parameters", "Every parameter of the transition's effect graph that a lane can automate: code, name, range, the value it rests at, and what each value of a stepped one means.",
@@ -254,7 +307,7 @@ final class MCPServer {
             tool("render_transition", "Render one transition to a WAV, with some of each song either side of it. Returns the level of the result second by second and its peak, in dB below full scale, and how many samples sit at full scale. The renderer ends in a limiter, which pumps when it works hard.",
                  ["from": from, "to": to, "name": named, "out": out, "margin": number("Seconds of each song around the transition. Defaults to 15"), "sound_check": soundCheck,
                   "solo": ["type": "string", "enum": ["outgoing", "incoming"], "description": "Render this song's part alone, on the same clock"]], required: ["from", "to"]),
-            tool("plan_set", "The timeline of playing songs in order, without rendering: where each transition starts in the mix, its technique and length, the checks get_transition makes, which part of each song plays, the total length, and any run of three or more transitions in a row that use the same technique, and any song that is there twice.",
+            tool("plan_set", "The timeline of playing songs in order, without rendering: where each transition starts in the mix, its technique and length, the checks get_transition makes, which part of each song plays and its sections, the total length, any run of three or more transitions in a row that use the same technique, any song that is there twice, and under unplanned every transition in the set that could not be planned and plays as a cut.",
                  ["songs": ids("Song ids in playing order"), "first": first, "last": last], required: ["songs"]),
             tool("render_set", "Render songs in order, with every transition, to one WAV. Returns the same timeline as plan_set, with the level each second around each transition. A transition that can't be planned becomes a straight cut.",
                  ["songs": ids("Song ids in playing order"), "first": first, "last": last, "name": named, "out": out, "sound_check": soundCheck], required: ["songs"]),
@@ -316,6 +369,8 @@ final class MCPServer {
         case "get_transition":
             let (a, b) = try pair(args)
             return try await describe(a, b, detail: args["detail"] as? String ?? "moving")
+        case "compare_transitions":
+            return try await compare(args)
         case "list_variants":
             let (a, b) = try pair(args)
             return variants(a, b)
@@ -345,13 +400,7 @@ final class MCPServer {
             lastOrder = ids
             let first = Int(number(args["first"]) ?? 1), last = Int(number(args["last"]) ?? Double(list.count))
             guard first >= 1, last <= list.count, first <= last else { throw PlannerError("first and last are positions in songs, from 1 to \(list.count)") }
-            // As `describe`: the stem checks need both songs' stem levels.
-            if extensions {
-                for (i, (a, b)) in zip(list, list.dropFirst()).enumerated() where i + 1 >= first && i + 2 <= last && stemSource(a) != nil && stemSource(b) != nil {
-                    _ = try? await levels(ofStems: a)
-                    _ = try? await levels(ofStems: b)
-                }
-            }
+            for (i, (a, b)) in zip(list, list.dropFirst()).enumerated() where i + 1 >= first && i + 2 <= last { await measureStems(a, b) }
             if name == "plan_set" { return timeline(list, report: first...last).json }
             return try await renderSet(list, report: first...last, out: try outputURL(args), soundCheck: args["sound_check"] as? Bool ?? true)
         case "set_song":
@@ -637,6 +686,13 @@ final class MCPServer {
     /// five songs to go with, and at 16 none did.
     private static let tempoReach = 8.0
 
+    /// How far a song can be stretched off its own tempo, in percent, before tempo_too_far warns. Peyton's ears with
+    /// Mixxx's stretcher, not a measurement: past about 140 BPM a song stands twice the stretch of one below it.
+    /// Slow songs give themselves away sooner, at 4 to 6% under 130 BPM, but a warning that tight makes an agent
+    /// refuse every tempo change and build a set flat in BPM, so the limit is the looser one an agent heeds sensibly.
+    /// Stretching MONTERO +37% into Born This Way sounded wrong whatever the stretcher's quality setting.
+    private static func tempoLimit(bpm: Double) -> Double { bpm > 140 ? 16 : 8 }
+
     /// Songs that are in a list more than once, in any version, with the positions they are at.
     private func duplicates(_ list: [Entry]) -> [[String: Any]] {
         var at: [String: [Int]] = [:], order: [String] = []
@@ -748,6 +804,7 @@ final class MCPServer {
     }
 
     private func songDetail(_ song: Entry, _ args: [String: Any]) async throws -> [String: Any] {
+        await measureStems(song)
         var detail = songDetail(song, beats: args["beats"] as? Bool ?? false, bars: args["bars"] as? Bool ?? true)
         guard args["stems"] as? Bool == true else { return detail }
         guard stemSource(song) != nil else { throw PlannerError("\(song.title) is not a stem file") }
@@ -780,21 +837,91 @@ final class MCPServer {
             detail["loudness_lufs"] = r(l.integrated)
             detail["sound_check_db"] = r(20 * log10(Double(l.gain)))
         }
-        // Apple's loudness curve: short-term loudness every half second from 0.5 s, as `Analyzer` writes it.
-        let attributes = ((try? JSONSerialization.jsonObject(with: a.audioAnalysisJSON)) as? [String: Any])?["attributes"] as? [String: Any]
-        let curve = (attributes?["loudnessCurve"] as? [String: Any])?["value"] as? [Double] ?? []
-        let starts = a.sections.first.map { $0 > 0.5 ? [0] + a.sections : a.sections } ?? [0]
-        detail["sections"] = zip(starts, starts.dropFirst() + [a.duration]).map { lo, hi -> [String: Any] in
-            var section: [String: Any] = ["start": r(lo), "end": r(hi), "bars": a.bars.filter { $0 >= lo - 0.05 && $0 < hi - 0.05 }.count]
-            let levels = curve.enumerated().filter { 0.5 * Double($0.offset + 1) >= lo && 0.5 * Double($0.offset + 1) < hi && $0.element > -70 }.map(\.element)
-            if !levels.isEmpty, let l = a.loudness {
-                section["loudness_vs_song_db"] = r(levels.reduce(0, +) / Double(levels.count) - l.integrated)
-            }
-            let sung = a.vocals.map { max(0, min($0.upperBound, hi) - max($0.lowerBound, lo)) }.reduce(0, +)
-            section["vocals"] = r(hi > lo ? sung / (hi - lo) : 0)
+        detail["sections"] = sections(s).enumerated().map { i, span -> [String: Any] in
+            let (lo, hi) = span
+            var section: [String: Any] = ["n": i + 1, "start": r(lo), "end": r(hi), "bars": a.bars.filter { $0 >= lo - 0.05 && $0 < hi - 0.05 }.count]
+            if let loudness = loudness(s, from: lo, to: hi) { section["loudness_vs_song_db"] = r(loudness) }
+            section["vocals"] = r(sung(s, from: lo, to: hi))
+            if let plays = plays(s, from: lo, to: hi) { section["plays"] = plays }
             return section
         }
         return detail
+    }
+
+    // MARK: Sections
+
+    /// A song's sections as get_song numbers them, from 1: Apple's section starts, with the song's start put in
+    /// front when the first one is later than that.
+    private func sections(_ s: Entry) -> [(lo: Double, hi: Double)] {
+        let a = s.analysis
+        let starts = a.sections.first.map { $0 > 0.5 ? [0] + a.sections : a.sections } ?? [0]
+        return Array(zip(starts, starts.dropFirst() + [a.duration]))
+    }
+
+    /// A stretch's loudness against the whole song in dB, from Apple's loudness curve, leaving out silence.
+    private func loudness(_ s: Entry, from lo: Double, to hi: Double) -> Double? {
+        let levels = curve(s).enumerated().filter { 0.5 * Double($0.offset + 1) >= lo && 0.5 * Double($0.offset + 1) < hi && $0.element > -70 }.map(\.element)
+        guard !levels.isEmpty, let l = s.analysis.loudness else { return nil }
+        return levels.reduce(0, +) / Double(levels.count) - l.integrated
+    }
+
+    /// The share of a stretch that has vocals, from the analysis.
+    private func sung(_ s: Entry, from lo: Double, to hi: Double) -> Double {
+        guard hi > lo else { return 0 }
+        return s.analysis.vocals.map { max(0, min($0.upperBound, hi) - max($0.lowerBound, lo)) }.reduce(0, +) / (hi - lo)
+    }
+
+    private var stemPeaks: [String: [Double]] = [:]   // by song id: each stem's level in its loudest section
+
+    /// Which stems play in a stretch of a stem file: up when within 6 dB of that stem's loudest section in the song,
+    /// low when 6 to 18 dB under it. Against the song's own peak and not a fixed level, so a breakdown reads as one
+    /// in a quiet song and a loud one alike. Apple's sections have no names, and agents chose where a transition
+    /// sat by its numbers alone: three tries at One More Time into Love Story put its outgoing side in the full
+    /// groove, at the bar before the breakdown, and inside it, and the breakdown, with its drums gone, is what
+    /// matches Love Story's energy. It shows in the stems at once, as `drums` dropping out of this list.
+    private func plays(_ s: Entry, from lo: Double, to hi: Double) -> String? {
+        guard let levels = stemLevels[s.id] else { return nil }
+        let peaks = stemPeaks[s.id] ?? AudioSource.stemNames.indices.map { k in
+            // Sections of a couple of bars or more, so a one-bar hit at the end doesn't set the peak.
+            sections(s).filter { $0.hi - $0.lo >= 4 }.map { level(levels[k], s, from: $0.lo, to: $0.hi) }.max() ?? -100
+        }
+        stemPeaks[s.id] = peaks
+        var up: [String] = [], low: [String] = []
+        for (k, name) in AudioSource.stemNames.enumerated() where peaks[k] > -50 {   // a stem the song barely has is never up
+            let under = peaks[k] - level(levels[k], s, from: lo, to: hi)
+            if under <= 6 { up.append(name) } else if under <= 18 { low.append(name) }
+        }
+        if up.count == 4 { return "all" }
+        if low.count == 4 { return "all low" }
+        if up.isEmpty && low.isEmpty { return "nothing" }
+        return (up + (low.isEmpty ? [] : ["(low: " + low.joined(separator: " ") + ")"])).joined(separator: " ")
+    }
+
+    /// One section in a line: its number, what plays in it (or for a file without stems, how much has vocals) and
+    /// its loudness against the song.
+    private func line(_ s: Entry, _ i: Int, _ label: String = "") -> String {
+        let (lo, hi) = sections(s)[i]
+        var parts = [plays(s, from: lo, to: hi) ?? "vocals \(Int((sung(s, from: lo, to: hi) * 100).rounded()))%"]
+        if let db = loudness(s, from: lo, to: hi) { parts.append(String(format: "%+.1f dB", db)) }
+        return "\(i + 1)\(label): " + parts.joined(separator: ", ")
+    }
+
+    /// The sections a side plays, in file time from `from` to `to`, then the section after it and how many bars
+    /// off that starts: for the outgoing song what it is taken out before, for the incoming what it plays on into.
+    private func playedSections(_ s: Entry, from: Double, to: Double) -> [String] {
+        let all = sections(s)
+        var lines = all.indices.filter { all[$0].hi > from + 0.05 && all[$0].lo < to - 0.05 }.map { line(s, $0) }
+        if let next = all.indices.first(where: { all[$0].lo >= to - 0.05 }), let grid = barGrid(s) {
+            let bars = ((beat(grid, at: all[next].lo) - beat(grid, at: to)) * 4).rounded() / 4 + 0   // + 0 turns -0 into 0
+            lines.append("then " + line(s, next, " in \(bars.formatted()) bars"))
+        }
+        return lines
+    }
+
+    private func playedSections(_ a: Entry, _ b: Entry, _ plan: TransitionPlan) -> [String: [String]] {
+        let (out, inc) = (plan.outgoing, plan.incoming)
+        return ["outgoing": playedSections(a, from: out.start, to: out.end - (out.loop?.extra ?? 0)),
+                "incoming": playedSections(b, from: inc.start, to: inc.end - (inc.loop?.extra ?? 0))]
     }
 
     // MARK: Plans
@@ -867,16 +994,13 @@ final class MCPServer {
 
     private func describe(_ a: Entry, _ b: Entry, detail: String) async throws -> [String: Any] {
         guard ["summary", "moving", "all"].contains(detail) else { throw PlannerError("detail must be summary, moving or all") }
-        // The stem checks need both songs' stem levels, measured the first time either is asked about.
-        if extensions, stemSource(a) != nil, stemSource(b) != nil {
-            _ = try? await levels(ofStems: a)
-            _ = try? await levels(ofStems: b)
-        }
+        await measureStems(a, b)
         let edit = edits[planKey(a, b)] ?? TransitionEdit()
         let plan = try plan(a, b)
         func side(_ s: TransitionSide, _ song: Entry, shift: Double) -> [String: Any] {
             var json: [String: Any] = ["start": r(s.start), "end": r(s.end), "shift_seconds": r(shift)]
             if let l = s.loop { json["loop"] = ["start": r(l.start), "seconds": r(l.length), "repeats": l.repeats] }
+            json["sections"] = playedSections(song, from: s.start, to: s.end - (s.loop?.extra ?? 0))
             guard detail != "summary" else { return json }
             // The song's bars inside the window on the mix clock, so points on either song can be put on the same bar.
             json["bars_at"] = played(song.analysis.bars, s).filter { $0 >= s.start - 0.01 && $0 <= s.end + 0.01 }.map { r(s.transitionTime(at: $0)) }
@@ -901,13 +1025,53 @@ final class MCPServer {
         }
         return ["from": a.id, "to": b.id, "style": plan.styleName, "style_id": plan.styleID ?? -1,
                 "duration": r(plan.duration), "handoff": r(plan.pivot),
-                "length_bars": r((plan.outgoing.end - edit.outgoingTail - plan.outgoing.start) / barLength(a, plan.outgoing)),
+                "length_bars": lengthBars(a, b, plan),
                 "effects": plan.effectSummary, "edited": !edit.isEmpty, "variant": variantJSON(edit.variant),
                 "checks": checks(a, b, plan), "technique": technique(a, b, plan),
                 "tempo_match": handTempo.contains(planKey(a, b)) ? "hand-drawn" : matched.contains(planKey(a, b)) ? "server" : "planner",
                 "outgoing_tail_seconds": r(edit.outgoingTail),
                 "outgoing": side(plan.outgoing, a, shift: edit.outgoingShift),
                 "incoming": side(plan.incoming, b, shift: edit.incomingShift)]
+    }
+
+    /// What plays in each section and the stem checks need a stem file's stem levels, measured the first time the
+    /// song is asked about and cached after.
+    private func measureStems(_ songs: Entry...) async {
+        for s in songs where stemSource(s) != nil { _ = try? await levels(ofStems: s) }
+    }
+
+    /// The transition's length in the outgoing song's bars, without the tail.
+    private func lengthBars(_ a: Entry, _ b: Entry, _ plan: TransitionPlan) -> NSNumber {
+        r((plan.outgoing.end - (edits[planKey(a, b)]?.outgoingTail ?? 0) - plan.outgoing.start) / barLength(a, plan.outgoing))
+    }
+
+    /// Several transitions side by side, without their lanes: one song to each of several, or each of several into
+    /// one. Choosing the next song took a get_transition for every candidate, the call an agent makes most.
+    private func compare(_ args: [String: Any]) async throws -> [String: Any] {
+        func list(_ v: Any?) throws -> [Entry] { try (v as? [Any] ?? [v as Any]).map { try entry($0) } }
+        let froms = try list(args["from"]), tos = try list(args["to"])
+        guard froms.count == 1 || tos.count == 1 else { throw PlannerError("give one song as from or as to, and the songs to compare on the other") }
+        guard froms.count * tos.count <= 25 else { throw PlannerError("25 transitions at most in one call") }
+        var rows: [[String: Any]] = []
+        for a in froms {
+            for b in tos where a.id != b.id {
+                let other = froms.count == 1 ? b : a
+                var row: [String: Any] = ["from": a.id, "to": b.id, "title": other.title]
+                if !other.artist.isEmpty { row["artist"] = other.artist }
+                do {
+                    await measureStems(a, b)
+                    let plan = try plan(a, b)
+                    row["technique"] = technique(a, b, plan)
+                    row["duration"] = r(plan.duration)
+                    row["length_bars"] = lengthBars(a, b, plan)
+                    row["checks"] = checks(a, b, plan)
+                } catch {
+                    row["error"] = String(describing: error)
+                }
+                rows.append(row)
+            }
+        }
+        return ["transitions": rows, "note": "How each transition plans, not whether the songs belong together."]
     }
 
     /// What a transition is, for telling one from the next across a set: the moves it was built from, or the
@@ -972,14 +1136,25 @@ final class MCPServer {
         }
         if let bars = apart(onClock(a.analysis.bars, out), onClock(b.analysis.bars, inc)) { json["bars_apart_ms"] = r(bars.mean) }
 
-        func sung(_ song: Entry, _ side: TransitionSide) -> [(Double, Double)] {
-            song.analysis.vocals.compactMap { v in
-                let lo = max(v.lowerBound, side.start), hi = min(v.upperBound, side.end)
-                return hi > lo ? (side.transitionTime(at: lo), side.transitionTime(at: hi)) : nil
-            }
+        // How far each song is pushed off its own tempo at the most, in percent, positive when it plays faster. The
+        // stretch keeps the key, so what goes wrong past the limit is the song itself: the stretcher's artifacts and
+        // a groove that feels dragged or rushed. Left out when neither song moves by 1%, to keep plan_set short.
+        func stretch(_ side: TransitionSide) -> Double {
+            (stride(from: side.start, through: side.end, by: 0.1).map { side.rate(at: $0) - 1 }.max { abs($0) < abs($1) } ?? 0) * 100
         }
-        let theirs = sung(b, inc)
-        json["vocals_together_seconds"] = r(sung(a, out).map { x in theirs.map { max(0, min(x.1, $0.1) - max(x.0, $0.0)) }.reduce(0, +) }.reduce(0, +))
+        let moved = [("outgoing", stretch(out), a), ("incoming", stretch(inc), b)]
+        if moved.contains(where: { abs($0.1) >= 1 }) {
+            json["tempo_change_percent"] = Dictionary(uniqueKeysWithValues: moved.map { ($0.0, r($0.1)) })
+            let over = moved.filter { abs($0.1) > Self.tempoLimit(bpm: Double($0.2.analysis.bpm)) }.map(\.0)
+            if !over.isEmpty { json["tempo_too_far"] = over }
+        }
+
+        // Where each side's ends fall in its song's phrasing. Beats and bars can line up while the incoming song's
+        // chorus lands two bars into the outgoing song's verse, which is the first thing a DJ listens for. Ends are
+        // in the file, so a loop's repeats and the outgoing tail are taken off.
+        let tail = edits[planKey(a, b)]?.outgoingTail ?? 0
+        json["phrase"] = ["outgoing_start": phrase(a, at: out.start), "outgoing_end": phrase(a, at: out.end - tail - (out.loop?.extra ?? 0)),
+                          "incoming_start": phrase(b, at: inc.start), "incoming_end": phrase(b, at: inc.end - (inc.loop?.extra ?? 0))]
 
         if let ka = Self.camelot(key(a)), let kb = Self.camelot(key(b)) {
             json["keys"] = ["from": "\(key(a)) (\(ka.name))", "to": "\(key(b)) (\(kb.name))", "relation": Self.relation(ka, kb)]
@@ -1038,14 +1213,23 @@ final class MCPServer {
         return curve
     }
 
+    /// One song in a tenth of a second of the transition: its power, which of its stems can be heard, its volume,
+    /// and while a vocal of it can be heard, how much of that vocal line is left in seconds.
+    private struct Heard {
+        var power = 0.0
+        var stems = [false, false, false, false]
+        var gain = 0.0
+        var vocalLeft: Double?
+    }
+
     /// What one song puts into the mix at each tenth of a second of the transition: its loudness, and which of its
     /// stems can be heard. Worked out from the plan by stepping through the song as the renderer would, with its
     /// volume, its stem levels and the gains that cut it off; filters and effects are not modelled, apart from a
     /// high-pass taking the bass out.
-    private func contribution(_ s: Entry, _ side: TransitionSide, outgoing: Bool, window: Double) -> [(power: Double, stems: [Bool])] {
+    private func contribution(_ s: Entry, _ side: TransitionSide, outgoing: Bool, window: Double) -> [Heard] {
         let bins = Int((window / 0.1).rounded(.up)) + 1, curve = curve(s), stems = stemLevels[s.id], beats = s.analysis.beats
         let trim = 20 * log10(Double(s.analysis.loudness?.gain ?? 1)) + s.gainDB
-        var heard = [(power: Double, stems: [Bool])](repeating: (0, [false, false, false, false]), count: bins)
+        var heard = [Heard](repeating: Heard(), count: bins)
         var x = side.start, t = 0.0, bin = 0, beat = 0
         while bin < bins {
             let inside = x <= side.end
@@ -1072,6 +1256,14 @@ final class MCPServer {
                     }
                     let loudness = curve.isEmpty ? s.analysis.loudness?.integrated ?? -16 : curve[max(0, min(curve.count - 1, Int(file / 0.5) - 1))]
                     heard[bin].power = pow(10, (loudness + trim) / 10) * gain * gain * factor
+                    heard[bin].gain = gain
+                    // A vocal counts while it can be heard: its song's volume and vocal stem up, and no low-pass far
+                    // enough down to leave only the bass. Counting every vocal range regardless marked a fade or a
+                    // stem swap that had fixed a clash as two vocals at once.
+                    let muffled = inside && value("bypa", 1) < 0.5 && value("LP1f", 22000) < 300
+                    if !muffled, gain * value("stem_vocals", 1) > 0.3, let range = s.analysis.vocals.first(where: { $0.contains(file) }) {
+                        heard[bin].vocalLeft = range.upperBound - file
+                    }
                 }
                 bin += 1
                 continue
@@ -1104,7 +1296,15 @@ final class MCPServer {
             json["level"] = ["before": r(before), "lowest": r(db(lowest)), "highest": r(db(smooth.max() ?? lowest)), "after": r(after),
                              "sag_db": r(min(0, db(lowest) - min(before, after)))]
         }
-        if stemLevels[a.id] != nil, stemLevels[b.id] != nil {
+        json["vocals_together_seconds"] = r(Double(zip(out, inc).filter { $0.vocalLeft != nil && $1.vocalLeft != nil }.count) * 0.1)
+        // The outgoing song stopping within a third of a second partway through a vocal line, which is heard as a word
+        // cut in half. A fade through the same line is left alone: it is a choice, and the listener hears it coming.
+        if let last = out.lastIndex(where: { $0.gain >= 0.3 }), let left = out[last].vocalLeft, left > 1,
+           out[max(0, last - 2)...last].contains(where: { $0.gain >= 0.7 }) {
+            json["outgoing_vocal_cut_at"] = r(Double(last) * 0.1)
+        }
+        // Only with extensions: without them there are no stem lanes to act on what it says.
+        if extensions, stemLevels[a.id] != nil, stemLevels[b.id] != nil {
             func seconds(_ test: ([Bool], [Bool]) -> Bool) -> NSNumber { r(Double(zip(out, inc).filter { test($0.stems, $1.stems) }.count) * 0.1) }
             json["stems"] = ["no_drums_seconds": seconds { !$0[0] && !$1[0] }, "no_bass_seconds": seconds { !$0[1] && !$1[1] },
                              "two_basses_seconds": seconds { $0[1] && $1[1] }, "two_vocals_seconds": seconds { $0[3] && $1[3] }]
@@ -1175,12 +1375,26 @@ final class MCPServer {
     /// A move of `bars` on the song's bar grid from the bar nearest `start`, in song seconds. The grid continues past
     /// both ends of the song at its edge spacing, as in the deck view, so a side can be moved out beyond the song.
     private func shift(_ s: Entry, from start: Double, bars: Int) -> Double {
-        var grid = s.analysis.bars.count > 1 ? s.analysis.bars : s.analysis.beats
-        guard grid.count > 1 else { return 0 }
-        let head = grid[1] - grid[0], tail = grid[grid.count - 1] - grid[grid.count - 2]
-        grid = (1...64).reversed().map { grid[0] - Double($0) * head } + grid + (1...64).map { grid[grid.count - 1] + Double($0) * tail }
+        guard let grid = barGrid(s) else { return 0 }
         let i = grid.indices.min { abs(grid[$0] - start) < abs(grid[$1] - start) }!
         return grid[min(max(i + bars, 0), grid.count - 1)] - grid[i]
+    }
+
+    /// The song's bars, continued 64 bars past both ends at the edge spacing.
+    private func barGrid(_ s: Entry) -> [Double]? {
+        let grid = s.analysis.bars.count > 1 ? s.analysis.bars : s.analysis.beats
+        guard grid.count > 1 else { return nil }
+        let head = grid[1] - grid[0], tail = grid[grid.count - 1] - grid[grid.count - 2]
+        return (1...64).reversed().map { grid[0] - Double($0) * head } + grid + (1...64).map { grid[grid.count - 1] + Double($0) * tail }
+    }
+
+    /// How far song time `t` is from the nearest section start, the song's start and end included, in bars to the
+    /// nearest beat: positive after it, negative before.
+    private func phrase(_ s: Entry, at t: Double) -> NSNumber {
+        guard let grid = barGrid(s) else { return 0 }
+        let starts = [0] + s.analysis.sections + [s.analysis.duration]
+        let nearest = starts.min { abs($0 - t) < abs($1 - t) }!
+        return r(((beat(grid, at: t) - beat(grid, at: nearest)) * 4).rounded() / 4)
     }
 
     /// Seconds per beat around song time `t`: the median gap of the beats within two bars either side, so a song
@@ -1673,6 +1887,9 @@ final class MCPServer {
         let report = report ?? 1...list.count
         var entering: [TransitionSide?] = [nil], leaving: [TransitionSide?] = []
         var transitions: [[String: Any]] = [], played: [[String: Any]] = [], techniques: [String] = []
+        // Every transition that fell back to a cut, whatever `report` is: the timeline leaves out the rows outside
+        // it, and a render with a cut in it otherwise reads as a finished mix.
+        var unplanned: [[String: Any]] = []
         var clock = 0.0, songTime = 0.0   // the mix clock and the current song's time, at the point reached so far
         var enteredAt = 0.0, enteredFrom = 0.0, pushed = 0.0
         for (i, (a, b)) in zip(list, list.dropFirst()).enumerated() {
@@ -1686,10 +1903,13 @@ final class MCPServer {
                 clock += out.start - songTime
                 let technique = technique(a, b, plan)
                 transitions.append(["from": a.id, "to": b.id, "technique": technique, "starts_at": r(clock), "duration": r(plan.duration),
-                                    "length_bars": r((plan.outgoing.end - (edits[planKey(a, b)]?.outgoingTail ?? 0) - plan.outgoing.start) / barLength(a, plan.outgoing))])
+                                    "length_bars": lengthBars(a, b, plan)])
                 techniques.append(technique)
                 // Every check, so the transitions that need work can be picked out here without asking for each.
-                if report.contains(i + 1), report.contains(i + 2) { transitions[transitions.count - 1]["checks"] = checks(a, b, plan) }
+                if report.contains(i + 1), report.contains(i + 2) {
+                    transitions[transitions.count - 1]["checks"] = checks(a, b, plan)
+                    transitions[transitions.count - 1]["sections"] = playedSections(a, b, plan)
+                }
                 (enteredAt, enteredFrom) = (clock, plan.incoming.start)
                 // The clock moves on by the incoming side's length on it, which is when that song is on its own.
                 clock += plan.incoming.transitionTime(at: plan.incoming.end)
@@ -1702,6 +1922,7 @@ final class MCPServer {
                 song["plays_to"] = r(a.analysis.duration)
                 clock += end - songTime
                 transitions.append(["from": a.id, "to": b.id, "technique": "cut", "starts_at": r(clock), "error": String(describing: error)])
+                unplanned.append(["between": [i + 1, i + 2], "error": String(describing: error)])
                 techniques.append("cut")
                 (enteredAt, enteredFrom, songTime, pushed) = (clock, 0, 0, 0)
                 leaving.append(nil)
@@ -1727,6 +1948,7 @@ final class MCPServer {
                                    "transitions": Array(transitions[(report.lowerBound - 1)..<(report.upperBound - 1)]), "repeated": runs]
         let twice = duplicates(list)
         if !twice.isEmpty { json["duplicates"] = twice }
+        if !unplanned.isEmpty { json["unplanned"] = unplanned }
         return (entering, leaving, json)
     }
 

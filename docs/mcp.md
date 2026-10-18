@@ -25,15 +25,16 @@ A large library is meant to be searched, not listed. The overview shows what is 
 | `add_songs` | Adds audio files, stem files or folders and analyzes them. A song's first analysis takes several seconds, so add a large uncached folder in parts if the client times out. Later adds read the cache, and a library of 600 songs takes a couple of seconds. Past 25 songs it returns an overview in place of the list: how many songs, how many by each artist and in each band of ten BPM |
 | `list_songs` | Songs added, filtered by words, BPM range, key or genre, at most 100 at a time. A row has the year of release when the file's date tag gives one, and the genre as `planner_genre`, since it is the setting the planner is given and not a description of the song. It leaves that out when it is Pop, and a stem file's source when the title ends with it. A song there in several versions is listed once, as the one with the best stems, ranked as in [Library](library.md); `unique: false` lists them all. `key_tempo_like` keeps the songs in a key that does not clash with a song's key, and at a tempo within 8% of its own, or of half or double it. It tests nothing else, so it narrows the library and leaves the agent to choose a song that belongs there. Give it two songs to find one that goes between them, which has to pass for both. `tempo_percent` widens that, up to 25. `any_key` keeps songs in a clashing key too, listed after the others and marked `key_clash`, for bringing in by their drums alone. `not_in_set` leaves out the songs a saved set already has, in any version. `overview: true` returns the counts by artist and BPM band for whatever matches, in place of the songs. A tagged song's row has its tags, `energy_min` and `energy_max` keep songs by their energy tag, and `untagged` keeps the songs with no tags yet. `stems` keeps songs whose stems came from the sources named, with `any` for every stem file and `none` for files without stems, and `year_min` and `year_max` keep songs by year of release. `random` draws that many of the matches at random in place of the first ones, and returns its `seed`. Passing the seed back draws the same songs from the same matches, in any session |
 | `tag_songs` | Writes down what songs are like to hear: energy, style, what the lyrics are about, and whether the sound and the words disagree. See Tags |
-| `get_song` | Takes one song, or several as `songs`. A song's bars, vocal ranges, loudness and Sound Check gain, and its sections. Beats on request, and `bars: false` leaves the bar times out. `stems: true` adds each stem's level per section and bar by bar |
+| `get_song` | Takes one song, or several as `songs`. A song's bars, vocal ranges, loudness and Sound Check gain, and its sections, see Sections. Beats on request, and `bars: false` leaves the bar times out. `stems: true` adds each stem's level per section and bar by bar |
 | `set_song` | A song's key shift in semitones and its gain in dB, kept for the whole time it plays |
 | `set_genre` | Sets the genre the planner is given for one song, several, or all. It decides which styles the planner can pick and says nothing about how the song sounds. A song starts with the genre its genre tag names when that is one of Apple's twelve, and as Pop otherwise |
-| `get_transition` | The transition between two songs with edits applied: style, length, each side's start and end, handoff point, automation lanes, and the checks below |
+| `get_transition` | The transition between two songs with edits applied: style, length, each side's start and end and the sections it plays, handoff point, automation lanes, and the checks below |
+| `compare_transitions` | The transitions from one song to each of several, or from each of several into one, with their technique, length and checks and no lanes, 25 at most. It is for choosing the next song from a shortlist, and shows how each transition plans, not whether the songs belong together |
 | `list_variants` | The other plans the planner makes for the pair, as other genres or at lower complexity |
 | `list_parameters` | Every parameter a lane can automate: code, name, range, resting value, and what each value of a note-length or filter-type parameter selects |
 | `edit_transition` | Changes a transition. Only the fields given change |
 | `reset_transition` | Drops the edit and goes back to Apple's plan |
-| `plan_set` | The timeline of songs played in order, without rendering: where each transition starts, its technique and length, the checks below, which part of each song plays, how long it plays alone, the total length, any run of three or more transitions using the same technique, and any song that is there twice |
+| `plan_set` | The timeline of songs played in order, without rendering: where each transition starts, its technique and length, the checks below, which part of each song plays and its sections, how long it plays alone, the total length, any run of three or more transitions using the same technique, any song that is there twice, and under `unplanned` every transition in the set that could not be planned and plays as a cut |
 | `save_set`, `load_set`, `list_sets` | Saves songs and the edited transitions between them to a file, and loads them back after a restart |
 | `render_transition` | Renders one transition to a WAV with some of each song around it, and reports the result's level each second, its peak, and how many samples sit at full scale |
 | `render_set` | Renders songs in order with every transition to one WAV, with the same timeline as `plan_set` and the level each second around every transition |
@@ -42,13 +43,22 @@ A call with an argument its tool does not take is refused, and the error lists t
 
 `get_transition` and `edit_transition` take `detail`: `summary` leaves the lanes out, `moving` has the lanes that change, `all` has every lane and the effects each side can take. Reading defaults to `moving` and editing to `summary`.
 
-`plan_set` and `render_set` take `first` and `last`, positions in the song list counted from 1, to report only that stretch. pink diamond still plans or renders the whole set, and the times are still on its clock. A reply stays in the agent's context, and a long set's timeline is most of what fills it, so ask for the songs being worked on.
+`plan_set` and `render_set` take `first` and `last`, positions in the song list counted from 1, to report only that stretch. pink diamond still plans or renders the whole set, and the times are still on its clock. `unplanned` always covers the whole set, so a cut outside the stretch is not missed. A reply stays in the agent's context, and a long set's timeline is most of what fills it, so ask for the songs being worked on.
 
 Renders take a `name`, which puts the WAV in the renders folder, or `out` for a full path. With neither it goes in the cache under a random name.
 
 `render_transition` takes `solo`, `outgoing` or `incoming`, to render one song's part of the transition alone. It lines up with the full render to the sample, so the two solos show what each song is doing where the mix is hard to pick apart.
 
 Renders play every song at the same loudness, as the app does with Sound Check on. Pass `sound_check: false` to turn it off. The renderer ends in a limiter, so two songs at full volume are held just under full scale rather than clipped, and a peak near 0 dB means the limiter is working.
+
+## Prompts
+pink diamond offers three prompts, which clients such as Claude Code show as slash commands. Each one sets out the order to use the tools in for one job, and costs nothing until it is chosen.
+
+| Prompt | What |
+| --- | --- |
+| `tag_library` | Tags the songs the agent knows, 50 at a time, in a session that does nothing else. Takes an optional `folder` to add first |
+| `build_set` | Chooses songs, orders them, fixes the transitions whose checks show trouble, and saves and renders the set. Takes an optional `brief`, `minutes`, `name` and `folder` |
+| `review_set` | Loads a saved set, fixes its failed and weak transitions, and saves it under the same name. Takes the set's `name` |
 
 ## Tags
 The analysis says nothing about how a song sounds or what it is about, and key and tempo alone will put a house track into a country song. Tags are where an agent writes that down, once, for every later session to read in `list_songs`.
@@ -65,7 +75,9 @@ Tag the library in a session that does nothing else, in batches, searching with 
 pink diamond keeps tags in `~/Library/Application Support/pink diamond/tags.json`, by artist and title, so they outlast the session and every version of a song shares them. Two files of one song with different artist tags count as two songs.
 
 ## Sections
-Apple's analysis finds where a song's sections start but not what they are, so pink diamond cannot name a chorus or a drop. `get_song` gives each section its length in bars, its loudness against the whole song, and the share of it that has vocals, which is usually enough to tell them apart.
+Apple's analysis finds where a song's sections start but not what they are, so pink diamond cannot name a chorus or a drop. `get_song` numbers each section from 1 and gives its length in bars, its loudness against the whole song, and the share of it that has vocals. For a stem file it adds `plays`, the stems up in it, and in brackets those low, each judged against that stem's loudest section in the same song, so a breakdown shows as drums gone from the list in a quiet song and a loud one alike.
+
+`get_transition` and `plan_set` list the sections each side plays, one line each, such as `8: drums vocals (low: bass other), +1.3 dB`, then the section after the side and how many bars after its end it starts. For the outgoing song that is what it leaves before, and for the incoming song what it plays on into. Use them to choose which part of each song a transition sits in.
 
 ## Checks
 pink diamond works these out from the plan and the analyses, so they cost nothing and come with every transition, in `get_transition` and in `plan_set`.
@@ -75,7 +87,11 @@ pink diamond works these out from the plan and the analyses, so they cost nothin
 | `beats_apart_ms`, `beats_apart_worst_ms` | How far the outgoing song's beats land from the incoming song's on the mix clock, on average and at worst |
 | `bars_apart_ms` | The same for bars. Beats can line up while bars do not |
 | `beats_out_per_beat_in` | Present when one song runs at about half or double the other's tempo: 2 means two outgoing beats to each incoming one. The beat and bar checks allow for it |
-| `vocals_together_seconds` | How long both songs have vocals inside the transition. It ignores volume, so a vocal that is faded out still counts |
+| `tempo_change_percent` | How far each song is stretched off its own tempo at the most, positive when faster. The key stays put. Left out when neither moves by 1% |
+| `tempo_too_far` | The songs stretched past 8%, or 16% for a song above 140 BPM. Past that a song starts to sound processed and its groove dragged or rushed |
+| `phrase` | How far each side's start and end are from the nearest section start of its song, in bars to the nearest beat, negative before it. 0 everywhere is a transition that starts and lands on a phrase |
+| `vocals_together_seconds` | How long both songs have vocals that can be heard inside the transition. A vocal counts while its song's volume and vocal stem are up and no low-pass has closed below 300 Hz |
+| `outgoing_vocal_cut_at` | Present when the outgoing song stops within a third of a second partway through a vocal line, which is heard as a word cut off: the time on the mix clock. A fade through the line does not count |
 | `keys` | Both keys as they play, key shift included, with their Camelot numbers, and whether they are the same key, relative major and minor, a fifth apart, or a clash |
 | `level` | The predicted loudness before, through and after the transition, and `sag_db`, how far it dips below the quieter of the two songs either side. It counts volume and stem levels, not filters or effects, so treat it as a warning and not a measurement |
 | `stems` | For two stem files: how long the mix has no drums, no bass, two basses or two vocals. A stem counts when it is playing in the song and its level in the mix is up |
