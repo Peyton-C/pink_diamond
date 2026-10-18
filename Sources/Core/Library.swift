@@ -306,7 +306,7 @@ final class Library: ObservableObject {
         save()
     }
 
-    private nonisolated static func audioFiles(in folder: URL) -> [URL] {
+    nonisolated static func audioFiles(in folder: URL) -> [URL] {
         var files: [URL] = []
         let e = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
         while let f = e?.nextObject() as? URL {
@@ -359,14 +359,14 @@ final class Library: ObservableObject {
         await settle(Array(Set(fresh + untagged + changed)), new: Set(fresh))
     }
 
-    private struct FileTags {
+    struct FileTags {
         var path: String
         var title: String?, artist: String?, album: String?, genre: Genre?
         var duration = 0.0
         var read = false
     }
 
-    private nonisolated static func tags(of url: URL, genre: Bool) async -> FileTags {
+    nonisolated static func tags(of url: URL, genre: Bool) async -> FileTags {
         var tags = FileTags(path: url.path)
         let asset = AVURLAsset(url: url)
         guard let items = try? await asset.load(.commonMetadata) else { return tags }
@@ -426,7 +426,7 @@ final class Library: ObservableObject {
     /// How far apart two files of a song can run and still be taken for the same cut of it. Stems of one recording
     /// from different sources differ by a few seconds of silence at either end (Poker Face: 236.8 s official,
     /// 240.0 s in Fortnite Festival), and a different cut by more (Bad Romance: 301.5 s against 292.5 s).
-    private static let sameCut = 5.0
+    nonisolated static let sameCut = 5.0
 
     /// The song that plays the file at `path`, has it as another version, or played it once.
     func song(forFile path: String) -> Song? {

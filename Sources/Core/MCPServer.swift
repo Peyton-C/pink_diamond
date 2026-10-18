@@ -262,6 +262,12 @@ final class MCPServer {
         return [
             tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. The first analysis of a song takes a few seconds; later ones come from the cache. Returns the songs added with their ids, or for more than 25 an overview: how many songs, how many by each artist and in each BPM band, each song counted once however many versions there are. Search them with list_songs.",
                  ["paths": ids("Absolute paths")], required: ["paths"]),
+            tool("find_versions", "Which versions of songs are already on disk, from the files' tags alone: nothing is analyzed or added. For each song, in the order given, every file of it, best source first, with its source, rank (lower is better), length in seconds, path and whether it is a game's cut. With marker, also a verdict: rip when no file is as good as that source, have when one is, different_cut when the only ones that are come from Fortnite Festival or Rock Band and run a different length from the album cut. Counts of each verdict come first.",
+                 ["songs": ["type": "array", "description": "Songs as Apple Music names them", "items": [
+                     "type": "object", "properties": ["title": string("Title"), "artist": string("Artist")], "required": ["title", "artist"]] as [String: Any]] as [String: Any],
+                  "folders": ids("Folders to search, with their subfolders. Defaults to ~/Music/Stereo Stems"),
+                  "marker": string("The source that would be made, as a stem file's marker without brackets, such as RF AT")],
+                 required: ["songs"]),
             tool("list_songs", "Search the songs added this session: id, title, artist, year of release when the file has it, BPM, key, length in seconds, planner_genre when it is not Pop, and for a stem file where its stems came from when the title doesn't end with it: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them, so search for what you want rather than paging through everything. planner_genre is the set_genre setting and says nothing about how a song sounds; go by the tags for that, and by the title, artist and year where a song has none. A tagged song has its energy from 1 to 10, its style, what its lyrics are about, and mood_clash when it sounds happier or sadder than its words.",
                  ["query": string("Words that must all appear in the title, artist or path"),
                   "bpm_min": number("Lowest BPM"), "bpm_max": number("Highest BPM"),
@@ -348,6 +354,8 @@ final class MCPServer {
         case "add_songs":
             guard let paths = args["paths"] as? [String] else { throw PlannerError("paths must be a list of file or folder paths") }
             return await add(paths)
+        case "find_versions":
+            return try await findVersions(args)
         case "list_songs":
             return try list(args)
         case "get_song":
@@ -569,6 +577,113 @@ final class MCPServer {
         // As the app's library: only on adding, so a genre set since with set_genre or load_set is kept.
         if let tagged = await Genre.tagged(in: asset) { song.genre = tagged }
         return song
+    }
+
+    // MARK: Versions on disk
+
+    /// A file as find_versions sees it: its tags, and what `SongName` and `StemSource` make of them.
+    private struct FoundFile {
+        let path: String
+        let duration: Double
+        let key: String
+        let source: StemSource
+    }
+
+    /// Kept for the session by path, with the `fileKey` it was read under, so a repeat call reads only the files
+    /// that are new or changed. It is the tags alone and never an analysis: add_songs analyzes every file first,
+    /// which is seconds a song, and this is for checking a playlist of a couple of hundred against the library.
+    private var foundFiles: [String: (fileKey: String, file: FoundFile)] = [:]
+
+    private func findVersions(_ args: [String: Any]) async throws -> [String: Any] {
+        guard let list = args["songs"] as? [[String: Any]], !list.isEmpty else { throw PlannerError("songs must be a list, each with a title and an artist") }
+        let wanted = try list.map { item -> (title: String, artist: String) in
+            let extra = item.keys.filter { $0 != "title" && $0 != "artist" }.sorted()
+            guard extra.isEmpty else { throw PlannerError("a song has no field \(extra.joined(separator: ", ")); it takes artist, title") }
+            guard let title = item["title"] as? String, !title.isEmpty, let artist = item["artist"] as? String else { throw PlannerError("each song needs a title and an artist") }
+            return (title, artist)
+        }
+        var marker: StemSource?
+        if let raw = args["marker"] {
+            let text = (raw as? String ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "() "))
+            guard let source = StemSource(marker: text) else { throw PlannerError("marker \(raw) is not a stem source marker; give one as a stem file's title ends with it, without brackets, such as RF AT, FN or Official") }
+            marker = source
+        }
+        let paths = args["folders"] == nil ? ["~/Music/Stereo Stems"] : args["folders"] as? [String] ?? []
+        guard !paths.isEmpty else { throw PlannerError("folders must be a list of folder paths") }
+        var folders: [URL] = []
+        for path in paths {
+            let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { throw PlannerError("no folder at \(path)") }
+            folders.append(url)
+        }
+
+        let files = await indexFiles(in: folders)
+        let byKey = Dictionary(grouping: files, by: \.key)
+        var counts: [String: Int] = marker == nil ? ["found": 0, "not_found": 0] : ["rip": 0, "have": 0, "different_cut": 0]
+        let songs = wanted.map { song -> [String: Any] in
+            let versions = (byKey[SongName.key(title: song.title, artist: song.artist)] ?? []).sorted { ($0.source.rank, $0.path) < ($1.source.rank, $1.path) }
+            var json: [String: Any] = ["title": song.title, "artist": song.artist, "versions": versions.map { v -> [String: Any] in
+                ["source": v.source.label, "rank": v.source.rank, "length": Int(v.duration.rounded()), "path": v.path, "game_cut": v.source.gameCut]
+            }]
+            if let marker {
+                let verdict = Self.verdict(versions, against: marker)
+                json["verdict"] = verdict
+                counts[verdict, default: 0] += 1
+            } else {
+                counts[versions.isEmpty ? "not_found" : "found", default: 0] += 1
+            }
+            return json
+        }
+        return ["summary": counts, "files_searched": files.count, "songs": songs]
+    }
+
+    /// Whether making `marker` would beat what is on disk. A game's cut that is as good only counts as having the
+    /// song when it runs within `Library.sameCut` of the longest cut that isn't a game's, the rule the library
+    /// replaces a file by: Therefore I Am is 80 s in Rock Band and 171 s in Fortnite Festival, and neither stands in
+    /// for the album cut. With no album cut on disk to measure against, the user decides.
+    private static func verdict(_ versions: [FoundFile], against marker: StemSource) -> String {
+        let asGood = versions.filter { $0.source.rank <= marker.rank }
+        guard !asGood.isEmpty else { return "rip" }
+        let album = versions.filter { !$0.source.gameCut && $0.duration > 0 }.map(\.duration).max()
+        let have = asGood.contains { v in
+            guard v.source.gameCut else { return true }
+            guard let album, v.duration > 0 else { return false }
+            return abs(v.duration - album) <= Library.sameCut
+        }
+        return have ? "have" : "different_cut"
+    }
+
+    /// Every audio file in `folders` and their subfolders, reading the tags of those not already in `foundFiles`
+    /// under the same `fileKey`, eight at a time as the app's library reads them.
+    private func indexFiles(in folders: [URL]) async -> [FoundFile] {
+        var urls: [String: URL] = [:]
+        for url in folders.flatMap(Library.audioFiles(in:)) { urls[url.path] = url }
+        let keys = urls.mapValues(fileKey)
+        let stale = urls.filter { foundFiles[$0.key]?.fileKey != keys[$0.key] }.map(\.value)
+        await withTaskGroup(of: (URL, Library.FileTags).self) { group in
+            var next = 0
+            func addTask() {
+                guard next < stale.count else { return }
+                let url = stale[next]
+                next += 1
+                group.addTask { (url, await Library.tags(of: url, genre: false)) }
+            }
+            for _ in 0..<8 { addTask() }
+            while let (url, tags) = await group.next() {
+                // An untagged file is named by its file, as the library names it.
+                var title = tags.title ?? ""
+                if title.isEmpty {
+                    title = url.deletingPathExtension().lastPathComponent
+                    if AudioSource.isStem(url), title.lowercased().hasSuffix(".stem") { title = String(title.dropLast(5)) }
+                }
+                let file = FoundFile(path: url.path, duration: tags.duration, key: SongName.key(title: title, artist: tags.artist ?? ""),
+                                     source: StemSource.of(title: title, path: url.path))
+                foundFiles[url.path] = (keys[url.path] ?? "", file)
+                addTask()
+            }
+        }
+        return urls.keys.sorted().compactMap { foundFiles[$0]?.file }
     }
 
     private func summary(_ s: Entry) -> [String: Any] {
