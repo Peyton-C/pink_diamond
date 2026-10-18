@@ -45,6 +45,8 @@ final class MCPServer {
     private var matched: Set<String> = []                   // transitions whose tempo match is the server's, by plan key
     private var handTempo: Set<String> = []                 // transitions whose tempo lanes the agent drew, which are then left alone
     private var lastOrder: [String] = []                    // the songs last planned, rendered or loaded as a set, for save_set
+    private var client: (name: String?, version: String?) = (nil, nil)   // from the client's handshake, stamped on saved sets
+    private var run: String?                                // the run id save_set was last given, kept for later saves that leave it out
     private let renders: URL                                // where a render given a name goes
     /// Whether the server offers what Apple's AutoMix has no counterpart for: stems, loops and outgoing tails. Off,
     /// an agent can do what the app's editor can and no more.
@@ -84,6 +86,8 @@ final class MCPServer {
         let result: [String: Any]
         switch method {
         case "initialize":
+            let info = params["clientInfo"] as? [String: Any]
+            client = (info?["name"] as? String, info?["version"] as? String)
             let asked = params["protocolVersion"] as? String ?? ""
             result = ["protocolVersion": Self.protocolVersions.contains(asked) ? asked : Self.protocolVersions[0],
                       "capabilities": ["tools": [String: Any](), "prompts": [String: Any]()],
@@ -229,7 +233,7 @@ final class MCPServer {
                            "description": "How the outgoing song leaves, built on a blank transition: " + moves(leaving)] as [String: Any],
                   "entry": ["type": "string", "enum": entries.map(\.0),
                             "description": "How the incoming song arrives, built on a blank transition: " + moves(entries)] as [String: Any],
-                  "outgoing_start": number("Song seconds where the outgoing song's side starts. Use a bar time from get_song"),
+                  "outgoing_start": number("Song seconds where the outgoing song's side starts, moved to the nearest beat. Use a bar time from get_song to start on a bar"),
                   "incoming_start": number("The same for the incoming song"),
                   "length_bars": number("The transition's length in the outgoing song's bars. Both songs stretch together and stay beat-matched"),
                   "outgoing_shift_bars": integer("Bars to move the outgoing song's side from where Apple planned it. Positive is later in the song"),
@@ -307,12 +311,12 @@ final class MCPServer {
             tool("render_transition", "Render one transition to a WAV, with some of each song either side of it. Returns the level of the result second by second and its peak, in dB below full scale, and how many samples sit at full scale. The renderer ends in a limiter, which pumps when it works hard.",
                  ["from": from, "to": to, "name": named, "out": out, "margin": number("Seconds of each song around the transition. Defaults to 15"), "sound_check": soundCheck,
                   "solo": ["type": "string", "enum": ["outgoing", "incoming"], "description": "Render this song's part alone, on the same clock"]], required: ["from", "to"]),
-            tool("plan_set", "The timeline of playing songs in order, without rendering: where each transition starts in the mix, its technique and length, the checks get_transition makes, which part of each song plays and its sections, the total length, any run of three or more transitions in a row that use the same technique, any song that is there twice, and under unplanned every transition in the set that could not be planned and plays as a cut.",
+            tool("plan_set", "The timeline of playing songs in order, without rendering: where each transition starts in the mix, its technique and length, the checks get_transition makes, which part of each song plays and its sections, the total length, any run of three or more transitions in a row that use the same technique, any song that is there twice, under unplanned every transition in the set that could not be planned and plays as a cut, and under overlapping every song whose transition out starts before the one in has finished, so three songs play at once.",
                  ["songs": ids("Song ids in playing order"), "first": first, "last": last], required: ["songs"]),
             tool("render_set", "Render songs in order, with every transition, to one WAV. Returns the same timeline as plan_set, with the level each second around each transition. A transition that can't be planned becomes a straight cut.",
                  ["songs": ids("Song ids in playing order"), "first": first, "last": last, "name": named, "out": out, "sound_check": soundCheck], required: ["songs"]),
             tool("save_set", "Save songs, their genres and settings, and every edited transition between them, to carry on after a restart. Saving under a name that exists replaces it.",
-                 ["name": string("A name for the set"), "songs": ids("Song ids in playing order. Left out, the songs last given to plan_set or render_set or loaded with load_set, or with none of those every song added this session")], required: ["name"]),
+                 ["name": string("A name for the set"), "run": string("A run id you were given to pass on. Kept for later saves in this session"), "songs": ids("Song ids in playing order. Left out, the songs last given to plan_set or render_set or loaded with load_set, or with none of those every song added this session")], required: ["name"]),
             tool("load_set", "Load a saved set: adds its songs, puts back their genres, settings and transition edits, and returns its songs in order: position, id, title and artist.",
                  ["name": string("The set's name, from list_sets")], required: ["name"]),
             tool("list_sets", "The saved sets, newest first."),
@@ -418,6 +422,8 @@ final class MCPServer {
             return songs.filter { ids.contains($0.id) }.map(summary)
         case "save_set":
             guard let set = args["name"] as? String, !set.isEmpty else { throw PlannerError("name the set") }
+            // Kept for the session once given: a model told to pass it to every save tends to drop it after a while.
+            if let id = args["run"] as? String, !id.isEmpty { run = id }
             // Without songs it saves the set last planned, rendered or loaded. It used to save every song of the
             // session, which after add_songs on a folder is the library: an agent rendered a 14-song set, saved it
             // without naming the songs, and the app imported a mix of 763 (PINK DIAMOND FLASH; Vroom Zai, 619, the
@@ -1380,6 +1386,17 @@ final class MCPServer {
         return grid[min(max(i + bars, 0), grid.count - 1)] - grid[i]
     }
 
+    /// The song's beat nearest song time `t`, the grid continued past both ends at the edge spacing so a side can
+    /// start outside the song.
+    private func onBeat(_ s: Entry, _ t: Double) -> Double {
+        let beats = s.analysis.beats
+        guard beats.count > 1 else { return t }
+        let head = beats[1] - beats[0], tail = beats[beats.count - 1] - beats[beats.count - 2]
+        if t < beats[0] { return beats[0] - ((beats[0] - t) / head).rounded() * head }
+        if t > beats[beats.count - 1] { return beats[beats.count - 1] + ((t - beats[beats.count - 1]) / tail).rounded() * tail }
+        return beats.min { abs($0 - t) < abs($1 - t) }!
+    }
+
     /// The song's bars, continued 64 bars past both ends at the edge spacing.
     private func barGrid(_ s: Entry) -> [Double]? {
         let grid = s.analysis.bars.count > 1 ? s.analysis.bars : s.analysis.beats
@@ -1593,8 +1610,12 @@ final class MCPServer {
         if let bars = number(args["incoming_shift_bars"]) { edit.incomingShift = shift(b, from: base.incoming.start, bars: Int(bars)) }
         if let seconds = number(args["outgoing_shift_seconds"]) { edit.outgoingShift = seconds }
         if let seconds = number(args["incoming_shift_seconds"]) { edit.incomingShift = seconds }
-        if let start = number(args["outgoing_start"]) { edit.outgoingShift = start - base.outgoing.start }
-        if let start = number(args["incoming_start"]) { edit.incomingShift = start - base.incoming.start }
+        // Snapped to the song's nearest beat. Qwen gave every start in seconds rounded to a tenth, which left sides up to
+        // 50 ms off their beats for the whole transition: 11 of 14 transitions in Qwen's Neon Confessions were over
+        // 15 ms apart, and on the nearest beats the same transitions came to 0.1 ms. A move meant to sit between beats
+        // has the shift in seconds.
+        if let start = number(args["outgoing_start"]) { edit.outgoingShift = onBeat(a, start) - base.outgoing.start }
+        if let start = number(args["incoming_start"]) { edit.incomingShift = onBeat(b, start) - base.incoming.start }
         if let bars = number(args["length_bars"]) {
             guard bars > 0 else { throw PlannerError("length_bars must be above 0") }
             // Measured against the plan's length at the side's new place. Against the bars where Apple planned it,
@@ -1759,7 +1780,8 @@ final class MCPServer {
             transitions.append(.init(from: i, to: j, edit: edit, technique: moves[key], serverTempo: matched.contains(key), handTempo: handTempo.contains(key)))
         }
         let saved = SavedSet(songs: list.map { .init(path: $0.path, genre: $0.genre, keyShift: $0.keyShift, gainDB: $0.gainDB) },
-                             transitions: transitions.sorted { ($0.from, $0.to) < ($1.from, $1.to) })
+                             transitions: transitions.sorted { ($0.from, $0.to) < ($1.from, $1.to) },
+                             saved: .init(at: ISO8601DateFormatter().string(from: Date()), client: client.name, clientVersion: client.version, run: run))
         try FileManager.default.createDirectory(at: setsFolder, withIntermediateDirectories: true)
         let url = setsFolder.appendingPathComponent(Self.fileName(name) + ".json")
         let encoder = JSONEncoder()
@@ -1810,8 +1832,10 @@ final class MCPServer {
     private func outputURL(_ args: [String: Any]) throws -> URL {
         if let path = args["out"] as? String { return URL(fileURLWithPath: (path as NSString).expandingTildeInPath) }
         guard let name = args["name"] as? String, !name.isEmpty else { return AppPaths.cacheDir("mcp").appendingPathComponent(UUID().uuidString + ".wav") }
-        try FileManager.default.createDirectory(at: renders, withIntermediateDirectories: true)
-        return renders.appendingPathComponent(Self.fileName(name) + ".wav")
+        // In a folder of the run's own once save_set has been given one, so runs going at once keep their renders apart.
+        let folder = run.map { renders.appendingPathComponent(Self.fileName($0)) } ?? renders
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder.appendingPathComponent(Self.fileName(name) + ".wav")
     }
 
     private static func fileName(_ name: String) -> String {
@@ -1949,6 +1973,15 @@ final class MCPServer {
         let twice = duplicates(list)
         if !twice.isEmpty { json["duplicates"] = twice }
         if !unplanned.isEmpty { json["unplanned"] = unplanned }
+        // A song whose transition out starts before the one in has finished, so three songs play at once. It was only
+        // a negative alone_seconds in the song's row, and Qwen's Neon Confessions went out with Get Into It (Yuh)
+        // entering and leaving over the same 21 seconds of itself, and Faint leaving 18 seconds before it had arrived.
+        let overlapping = played.compactMap { s -> [String: Any]? in
+            // Under half a second is two plans meeting at one bar line with rounding between them (wildcard 30 had 0.02).
+            guard let alone = (s["alone_seconds"] as? NSNumber)?.doubleValue, alone < -0.5 else { return nil }
+            return ["n": s["n"] ?? 0, "title": s["title"] ?? "", "seconds": r(-alone)]
+        }
+        if !overlapping.isEmpty { json["overlapping"] = overlapping }
         return (entering, leaving, json)
     }
 

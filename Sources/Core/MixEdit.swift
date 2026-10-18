@@ -280,8 +280,14 @@ struct EffectPreset: Identifiable {
 struct SavedSet: Codable {
     struct Song: Codable { var path: String; var genre: Genre; var keyShift: Int; var gainDB: Double }
     struct Transition: Codable { var from: Int; var to: Int; var edit: TransitionEdit; var technique: String?; var serverTempo: Bool; var handTempo: Bool }
+    /// Who saved it and when, as the server knows it for certain: the MCP client's own name and version from its
+    /// handshake, never the model's word for itself. Models misname themselves (every Claude 5.5 called itself Clawd),
+    /// so which model it was is recorded outside the server, by whoever ran it. Nil in sets saved before this.
+    /// `run` is an id the agent was given to pass on, which a model copies reliably where it doesn't name itself reliably.
+    struct Saved: Codable { var at: String; var client: String?; var clientVersion: String?; var run: String? }   // `at` in ISO 8601, so no decoder needs a date strategy
     var songs: [Song]
     var transitions: [Transition]
+    var saved: Saved? = nil
 }
 
 /// A saved set as the app holds it once imported, on the playlist made for it: each song's genre and settings and each

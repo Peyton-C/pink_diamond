@@ -34,7 +34,7 @@ A large library is meant to be searched, not listed. The overview shows what is 
 | `list_parameters` | Every parameter a lane can automate: code, name, range, resting value, and what each value of a note-length or filter-type parameter selects |
 | `edit_transition` | Changes a transition. Only the fields given change |
 | `reset_transition` | Drops the edit and goes back to Apple's plan |
-| `plan_set` | The timeline of songs played in order, without rendering: where each transition starts, its technique and length, the checks below, which part of each song plays and its sections, how long it plays alone, the total length, any run of three or more transitions using the same technique, any song that is there twice, and under `unplanned` every transition in the set that could not be planned and plays as a cut |
+| `plan_set` | The timeline of songs played in order, without rendering: where each transition starts, its technique and length, the checks below, which part of each song plays and its sections, how long it plays alone, the total length, any run of three or more transitions using the same technique, any song that is there twice, under `unplanned` every transition in the set that could not be planned and plays as a cut, and under `overlapping` every song whose transition out starts before the one in has finished, so three songs play at once |
 | `save_set`, `load_set`, `list_sets` | Saves songs and the edited transitions between them to a file, and loads them back after a restart |
 | `render_transition` | Renders one transition to a WAV with some of each song around it, and reports the result's level each second, its peak, and how many samples sit at full scale |
 | `render_set` | Renders songs in order with every transition to one WAV, with the same timeline as `plan_set` and the level each second around every transition |
@@ -43,9 +43,9 @@ A call with an argument its tool does not take is refused, and the error lists t
 
 `get_transition` and `edit_transition` take `detail`: `summary` leaves the lanes out, `moving` has the lanes that change, `all` has every lane and the effects each side can take. Reading defaults to `moving` and editing to `summary`.
 
-`plan_set` and `render_set` take `first` and `last`, positions in the song list counted from 1, to report only that stretch. pink diamond still plans or renders the whole set, and the times are still on its clock. `unplanned` always covers the whole set, so a cut outside the stretch is not missed. A reply stays in the agent's context, and a long set's timeline is most of what fills it, so ask for the songs being worked on.
+`plan_set` and `render_set` take `first` and `last`, positions in the song list counted from 1, to report only that stretch. pink diamond still plans or renders the whole set, and the times are still on its clock. `unplanned` and `overlapping` always cover the whole set, so a fault outside the stretch is not missed. A reply stays in the agent's context, and a long set's timeline is most of what fills it, so ask for the songs being worked on.
 
-Renders take a `name`, which puts the WAV in the renders folder, or `out` for a full path. With neither it goes in the cache under a random name.
+Renders take a `name`, which puts the WAV in the renders folder, in a folder of its own named after the run once `save_set` has been given one, or `out` for a full path. With neither it goes in the cache under a random name.
 
 `render_transition` takes `solo`, `outgoing` or `incoming`, to render one song's part of the transition alone. It lines up with the full render to the sample, so the two solos show what each song is doing where the mix is hard to pick apart.
 
@@ -105,7 +105,7 @@ pink diamond works these out from the plan and the analyses, so they cost nothin
 | `style` | The plan with this style name. Only styles the planner makes for the pair can be chosen, and the error lists them |
 | `outgoing_shift_bars`, `incoming_shift_bars` | Moves a song's side along its bar grid, counted from where Apple planned it. Positive is later in the song |
 | `outgoing_shift_seconds`, `incoming_shift_seconds` | The same move in song seconds, for moves off the bar grid |
-| `outgoing_start`, `incoming_start` | Where a song's side starts, in song seconds. Use a bar time from `get_song` to stay on the grid |
+| `outgoing_start`, `incoming_start` | Where a song's side starts, in song seconds, moved to the song's nearest beat. Use a bar time from `get_song` to start on a bar |
 | `length_bars` | The transition's length in the outgoing song's bars, where its side is now. Both songs stretch together, and lanes already set stretch with them |
 | `blank` | Starts from a blank beat-matched transition, see below |
 | `outgoing_tail_bars` | Bars the outgoing song plays on after the window ends, with its lanes carrying on |
@@ -147,7 +147,7 @@ A transition's `technique` is its moves, or the planner's style, or for one draw
 `set_song` changes how a song plays for its whole length, in every transition and render. `key_shift` moves its key by up to 6 semitones either way without changing its tempo, and the key checks use the shifted key. A couple of semitones is clean, more starts to sound processed. `gain_db` adds up to 12 dB either way on top of Sound Check.
 
 ## Saved sets
-`save_set` writes the songs you name, or without `songs` the ones last given to `plan_set` or `render_set` or loaded with `load_set`, in order, with their genres and settings and every edited transition between any two of them, to `~/Library/Application Support/pink diamond/sets/`. `load_set` adds the songs again and puts the edits back, so a set can be fixed after a restart instead of rebuilt. It returns the set's songs in order, each with its position, id, title and artist, which is enough to carry on without planning all of it.
+`save_set` writes the songs you name, or without `songs` the ones last given to `plan_set` or `render_set` or loaded with `load_set`, in order, with their genres and settings and every edited transition between any two of them, to `~/Library/Application Support/pink diamond/sets/`. pink diamond stamps the file with the time and the name and version the MCP client gave in its handshake, such as Claude desktop or Codex. It does not ask the model which model it is, since models misname themselves, so record that wherever you start the run. `save_set` also takes `run`, an id the agent was given to pass on, and stamps it too, keeping it for later saves in the session that leave it out. `load_set` adds the songs again and puts the edits back, so a set can be fixed after a restart instead of rebuilt. It returns the set's songs in order, each with its position, id, title and artist, which is enough to carry on without planning all of it.
 
 To add to a set or replace a song in it, search with `not_in_set` so nothing is repeated, plan only the songs around the change, and save the new order. Transitions are kept by pair of songs, so the ones that did not change keep their edits. `save_set` and `plan_set` list any song that is there twice as `duplicates`, counting two versions of a song as one. A set saved with extensions loads without its extended transitions when the server runs with `--automix-only`.
 
