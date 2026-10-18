@@ -89,8 +89,12 @@ enum SongName {
     /// What a song is called whichever file it is: its first artist and its title without the marker, ignoring
     /// case, accents and punctuation. Files that share it are versions of one song, and nothing else makes them so.
     ///
-    /// Only the first artist, because sources credit the same recording differently: Cheap Thrills is by "Sia" in
-    /// the official stems and "Sia ft. Sean Paul" in Fortnite's. The rest of the title is kept whole, so All Too
+    /// Only the first artist, because sources credit the same recording differently: Just Dance is by "Lady Gaga" in
+    /// Rock Band and "Lady Gaga ft. Colby O'Donis" in Fortnite Festival. Of the eight songs in the library whose
+    /// files disagree on the full credit, Cheap Thrills is the one where a feature marks another recording: the
+    /// official stems are Sia alone and both games have the Sean Paul remix, at the same 216 s, so neither the credit
+    /// rule nor length can part them. What parts them is the title: "Cheap Thrills (feat. Sean Paul)" on the game
+    /// files, as Apple Music names the remix. The rest of the title is kept whole, so All Too
     /// Well stays apart from its ten-minute version, and Monster by Lady Gaga from Monster by Slayyyter.
     static func key(title: String, artist: String) -> String {
         func folded(_ s: String) -> String {

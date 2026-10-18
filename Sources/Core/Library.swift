@@ -30,6 +30,14 @@ struct SongVersion: Codable, Hashable {
     var path: String
     var title: String                // as tagged, with the marker its source is read from
     var duration: Double             // 0 when the file couldn't be read
+    /// As tagged, so a song that moves to this file shows its credits and not the last file's: a library that met
+    /// Cheap Thrills in Fortnite first moved it to the official stems and went on showing Fortnite's "Sia ft. Sean
+    /// Paul" and no album. Nil in libraries saved before versions kept them, and for a file written over in place.
+    var artist: String?
+    var album: String?
+    /// The file's `fileKey` when its tags were read, so a scan notices a version written over and reads it again.
+    /// Nil in libraries saved before versions kept it, which reads every version again once.
+    var fileKey: String?
     var source: StemSource { StemSource.of(title: title, path: path) }
 }
 
@@ -327,20 +335,26 @@ final class Library: ObservableObject {
         defer { scanning = false }
         let folders = folders, skip = ignored
         let playing = songs.map { ($0.id, $0.path, $0.fileKey) }
-        let others = Set(songs.flatMap { ($0.versions ?? []).map(\.path) })
-        let (found, gone, changed) = await Task.detached(priority: .utility) { () -> ([URL], Set<String>, [UUID]) in
+        let others = songs.flatMap { song in (song.versions ?? []).filter { $0.path != song.path }.map { ($0.path, $0.fileKey) } }
+        let (found, gone, changed, rewritten) = await Task.detached(priority: .utility) { () -> ([URL], Set<String>, [UUID], Set<String>) in
+            let files = FileManager.default
             let found = folders.flatMap { Self.audioFiles(in: URL(fileURLWithPath: $0)) }.filter { !skip.contains($0.path) }
-            var gone = Set(others.filter { !FileManager.default.fileExists(atPath: $0) }), changed: [UUID] = []
+            var gone = Set(others.map(\.0).filter { !files.fileExists(atPath: $0) }), changed: [UUID] = []
             for (id, path, key) in playing {
-                if !FileManager.default.fileExists(atPath: path) { gone.insert(path) } else if fileKey(URL(fileURLWithPath: path)) != key { changed.append(id) }
+                if !files.fileExists(atPath: path) { gone.insert(path) } else if fileKey(URL(fileURLWithPath: path)) != key { changed.append(id) }
             }
-            return (found, gone, changed)
+            let rewritten = Set(others.filter { !skip.contains($0.0) && files.fileExists(atPath: $0.0) && fileKey(URL(fileURLWithPath: $0.0)) != $0.1 }.map(\.0))
+            return (found, gone, changed, rewritten)
         }.value
 
+        // A version written over may be another song now: the Fortnite and Rock Band Cheap Thrills, retitled
+        // "(feat. Sean Paul)" as the remix they are, stayed versions of the solo official stems, and adding them
+        // again did nothing, since the library knew their paths. Taken off the song, they come back through
+        // `addRows` as files turning up, and `reconcile` puts each back with its song or makes it one.
         var list = songs, pruned = false
         for i in list.indices {
             guard let versions = list[i].versions else { continue }
-            let kept = versions.filter { $0.path == list[i].path || !gone.contains($0.path) }
+            let kept = versions.filter { $0.path == list[i].path || !gone.contains($0.path) && !rewritten.contains($0.path) }
             if kept.count != versions.count { list[i].versions = kept; pruned = true }
         }
         if pruned { songs = list }
@@ -352,8 +366,12 @@ final class Library: ObservableObject {
         }
         // A file that was gone and is back, on a drive that was unplugged say.
         for song in songs where states[song.id] == .missing && !gone.contains(song.path) { enqueue(song.id) }
-        let fresh = addRows(found)
-        let untagged = songs.filter { $0.versions == nil && !gone.contains($0.path) && !settling.contains($0.id) }.map(\.id)
+        let fresh = addRows(found + rewritten.map { URL(fileURLWithPath: $0) })
+        // Also a song whose file's version has no credits, from a library saved before versions kept them, or one
+        // `use` moved without them: its tags are read again, which puts back the artist and album of the file it plays.
+        let untagged = songs.filter { song in
+            (song.versions?.first { $0.path == song.path }?.artist == nil) && !gone.contains(song.path) && !settling.contains(song.id)
+        }.map(\.id)
         let lost = songs.contains { gone.contains($0.path) && states[$0.id] != .missing }
         guard !fresh.isEmpty || !untagged.isEmpty || !changed.isEmpty || pruned || lost else { return }
         await settle(Array(Set(fresh + untagged + changed)), new: Set(fresh))
@@ -410,7 +428,8 @@ final class Library: ObservableObject {
             if let artist = tags.artist { list[i].artist = artist }
             if tags.read { list[i].album = tags.album ?? "" }
             if let genre = tags.genre { list[i].genre = genre }
-            let version = SongVersion(path: list[i].path, title: list[i].title, duration: tags.duration)
+            let version = SongVersion(path: list[i].path, title: list[i].title, duration: tags.duration, artist: list[i].artist, album: list[i].album,
+                                      fileKey: list[i].fileKey)
             list[i].versions = (list[i].versions ?? []).filter { $0.path != version.path } + [version]
         }
         songs = list
@@ -510,7 +529,8 @@ final class Library: ObservableObject {
             let keep = settled.first ?? best
             if best != keep, files.fileExists(atPath: list[best].path) {
                 let length = list[best].versions?.first { $0.path == list[best].path }?.duration ?? 0
-                moves.append((list[keep].id, SongVersion(path: list[best].path, title: list[best].title, duration: length)))
+                moves.append((list[keep].id, SongVersion(path: list[best].path, title: list[best].title, duration: length,
+                                                         artist: list[best].artist, album: list[best].album, fileKey: list[best].fileKey)))
             }
             for i in members where i != keep {
                 into[list[i].id] = list[keep].id
@@ -570,6 +590,10 @@ final class Library: ObservableObject {
         }
         songs[i].path = version.path
         songs[i].title = version.title
+        if let artist = version.artist {
+            songs[i].artist = artist
+            songs[i].album = version.album
+        }
         songs[i].isStem = AudioSource.isStem(songs[i].url)
         songs[i].fileKey = fileKey(songs[i].url)
         playable[id] = nil
