@@ -58,6 +58,57 @@ enum AudioSource {
 
     static let stemNames = ["drums", "bass", "other", "vocals"]
 
+    /// The names a stem file gives its four stems, in `stemNames` order, when they aren't the stock Drums, Bass,
+    /// Other and Vocals: a graft can put a sax where Other usually is (Run Away with Me (RF IN SX) has Drums,
+    /// Bass & Synths, Sax, Vocals), and an agent that reads `other` pulls the hook out as background. Nil otherwise.
+    ///
+    /// Native Instruments keeps them as JSON at moov/udta/stem. Read the way Track 10's stemfile.c reads them: walk
+    /// the top-level boxes to moov, which sits after the audio, and read only moov, so a file costs a few hundred KB
+    /// of reads whatever its size.
+    static func customStemNames(for url: URL) -> [String]? {
+        guard let file = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? file.close() }
+        func u64(_ bytes: [UInt8]) -> UInt64 { bytes.reduce(0) { $0 << 8 | UInt64($1) } }
+        /// A box's size and header length from its first 16 bytes, or nil when they don't make sense.
+        func header(_ b: [UInt8], left: UInt64) -> (size: UInt64, header: UInt64)? {
+            guard b.count >= 8 else { return nil }
+            var size = u64(Array(b[0..<4])), head: UInt64 = 8
+            if size == 1 { guard b.count >= 16 else { return nil }; size = u64(Array(b[8..<16])); head = 16 }
+            if size == 0 { size = left }
+            return size >= head && size <= left ? (size, head) : nil
+        }
+        // To moov on disk. 64 MB is far beyond any moov: it is sample tables and tags.
+        let end = (try? file.seekToEnd()) ?? 0
+        var offset: UInt64 = 0, moov: [UInt8]?
+        while offset + 8 <= end {
+            try? file.seek(toOffset: offset)
+            guard let b = try? file.read(upToCount: 16), let (size, head) = header(Array(b), left: end - offset) else { return nil }
+            if Array(b[4..<8]) == Array("moov".utf8) {
+                guard size - head <= 64 << 20 else { return nil }
+                try? file.seek(toOffset: offset + head)
+                moov = (try? file.read(upToCount: Int(size - head))).map(Array.init)
+                break
+            }
+            offset += size
+        }
+        // Then udta/stem inside it, in memory.
+        func child(_ type: String, in data: ArraySlice<UInt8>) -> ArraySlice<UInt8>? {
+            var pos = data.startIndex
+            while pos + 8 <= data.endIndex {
+                guard let (size, head) = header(Array(data[pos..<min(pos + 16, data.endIndex)]), left: UInt64(data.endIndex - pos)) else { return nil }
+                if Array(data[(pos + 4)..<(pos + 8)]) == Array(type.utf8) { return data[(pos + Int(head))..<(pos + Int(size))] }
+                pos += Int(size)
+            }
+            return nil
+        }
+        guard let moov, let udta = child("udta", in: moov[...]), let stem = child("stem", in: udta),
+              let json = try? JSONSerialization.jsonObject(with: Data(stem)) as? [String: Any],
+              let stems = json["stems"] as? [[String: Any]], stems.count == 4 else { return nil }
+        let names = stems.map { $0["name"] as? String ?? "" }
+        guard zip(names, stemNames).contains(where: { $0.lowercased() != $1 }) else { return nil }
+        return names
+    }
+
     /// The four stems of a stem file (drums, bass, other, vocals: tracks 1 to 4, in Native Instruments' order), each
     /// extracted once into the cache the way the mixdown is. Taking them out the same way matters: decoded by the
     /// same path they share the mixdown's encoder delay, so they sit on the beat grid its analysis found.

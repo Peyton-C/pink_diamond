@@ -19,6 +19,7 @@ final class MCPServer {
         var genre: Genre = .pop      // what the planner is told, not what the song sounds like
         var keyShift = 0             // semitones the whole song plays shifted by
         var gainDB = 0.0             // on top of Sound Check
+        var stemLabels: [String]?    // a stem file's own names for its stems, when they aren't the stock four
         let playable: URL
         let analysis: SongAnalysis
     }
@@ -292,7 +293,7 @@ final class MCPServer {
             tool("get_song", "A song's analysis: bars and vocal ranges in song seconds, its loudness, and its sections, numbered from 1, each with its length in bars, how loud it is against the whole song, how much of it has vocals, and for a stem file which stems play in it: all, or those up and those low against their loudest section. Sections have no names; a breakdown shows as drums gone from plays.",
                  ["song": string("Song id"), "songs": ids("Song ids, to get several in one call as a list"), "beats": bool("Include every beat time"),
                   "bars": bool("Include every bar time. Defaults to true; turn it off when scanning many songs"),
-                  "stems": bool("For a stem file, include how loud each stem is: per section in dB, and bar by bar as a row of digits, where 0 is silent, each step up is 6 dB and 9 is -6 dB or louder")]),
+                  "stems": bool("For a stem file whose stems have names of their own, stem_names always gives them, by the code their lane goes under. With this, include how loud each stem is: per section in dB, and bar by bar as a row of digits, where 0 is silent, each step up is 6 dB and 9 is -6 dB or louder")]),
             tool("set_genre", "Set the genre of one song, several, or all. Genres decide which transition styles Apple's planner can pick, and an edit belongs to the genres it was made with. It is a setting for the planner and not a description of the song: setting a song to Dance does not make it sit well next to a dance song.",
                  ["song": string("Song id"), "songs": ids("Song ids"), "all": bool("Every song added"), "genre": genre], required: ["genre"]),
             tool("get_transition", "The planned transition between two songs with any edits applied: style, length, where each side starts and ends in song seconds, the handoff point, the sections of each song each side plays and the one after it, the automation lanes, and checks made without rendering: how far apart the beats and bars land, how far each side's start and end are from a section start in bars, whether the keys go together, how long both songs have vocals that can be heard at once, whether the outgoing song is cut off mid-vocal, the predicted level in LUFS with any sag, and for two stem files how long the mix has no drums, no bass, two basses or two vocals.",
@@ -550,6 +551,7 @@ final class MCPServer {
         var name = url.deletingPathExtension().lastPathComponent
         if AudioSource.isStem(url), name.lowercased().hasSuffix(".stem") { name = String(name.dropLast(5)) }
         var song = Entry(id: String(key.prefix(8)), path: url.path, title: name, artist: "", playable: playable, analysis: analysis)
+        if AudioSource.isStem(url) { song.stemLabels = AudioSource.customStemNames(for: url) }
         let asset = AVURLAsset(url: url)
         for item in (try? await asset.load(.commonMetadata)) ?? [] {
             guard let value = try? await item.load(.stringValue), !value.isEmpty else { continue }
@@ -835,6 +837,11 @@ final class MCPServer {
         var detail = summary(s)
         let a = s.analysis
         detail["path"] = s.path
+        // Only the ones that differ, by the code their lane and levels go under: stem_other is the sax in Run Away with Me.
+        if let labels = s.stemLabels {
+            let named = AudioSource.stemNames.indices.filter { !labels[$0].isEmpty && labels[$0].lowercased() != AudioSource.stemNames[$0] }
+            detail["stem_names"] = Dictionary(uniqueKeysWithValues: named.map { (AudioSource.stemNames[$0], labels[$0]) })
+        }
         if bars { detail["bars"] = a.bars.map(r) } else { detail["bar_count"] = a.bars.count }
         detail["vocals"] = a.vocals.map { [r($0.lowerBound), r($0.upperBound)] }
         detail["beat_count"] = a.beats.count
@@ -893,12 +900,15 @@ final class MCPServer {
         }
         stemPeaks[s.id] = peaks
         var up: [String] = [], low: [String] = []
-        for (k, name) in AudioSource.stemNames.enumerated() where peaks[k] > -50 {   // a stem the song barely has is never up
+        for (k, code) in AudioSource.stemNames.enumerated() where peaks[k] > -50 {   // a stem the song barely has is never up
+            // In the song's own words where it has them, so a sax reads as sax and not as other.
+            let name = s.stemLabels.map { $0[k].isEmpty ? code : $0[k].lowercased() } ?? code
             let under = peaks[k] - level(levels[k], s, from: lo, to: hi)
             if under <= 6 { up.append(name) } else if under <= 18 { low.append(name) }
         }
-        if up.count == 4 { return "all" }
-        if low.count == 4 { return "all low" }
+        // Named in full for a song with its own stem names, or "all" would hide the sax.
+        if up.count == 4, s.stemLabels == nil { return "all" }
+        if low.count == 4, s.stemLabels == nil { return "all low" }
         if up.isEmpty && low.isEmpty { return "nothing" }
         return (up + (low.isEmpty ? [] : ["(low: " + low.joined(separator: " ") + ")"])).joined(separator: " ")
     }

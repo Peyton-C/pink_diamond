@@ -168,7 +168,7 @@ An outgoing loop makes the window longer by its repeats, for both songs. Lanes a
 An incoming loop leaves the window as it is and changes what fills it: the incoming song repeats the stretch and gets less far into itself by the end.
 
 ## Stems
-For a stem file, lanes named `stem_drums`, `stem_bass`, `stem_other` and `stem_vocals` set each stem's level from 0 to 2, where 1 is as recorded. A stem is at 1 wherever no lane sets it, so bring it back to 1 before the incoming side ends or it jumps back. A song with a stem lane plays as the sum of its stems for the whole song, which is close to the mixdown but not identical; every other song plays its mixdown.
+For a stem file, lanes named `stem_drums`, `stem_bass`, `stem_other` and `stem_vocals` set each stem's level from 0 to 2, where 1 is as recorded. A stem is at 1 wherever no lane sets it, so bring it back to 1 before the incoming side ends or it jumps back. A stem file can name its stems itself, as Run Away with Me (RF IN SX) does with Bass & Synths and Sax in place of bass and other. `get_song` gives those names as `stem_names` by lane code, and the section lines use them, but the lanes keep their codes. A song with a stem lane plays as the sum of its stems for the whole song, which is close to the mixdown but not identical; every other song plays its mixdown.
 
 ## Limits
 The server has no playback, playlists or live mode. Tails, loops, stems and song settings are made only here: the app shows and plays them in an imported set, and its editor does not set them. An agent hears nothing: rendering gives it a WAV file and timings.
