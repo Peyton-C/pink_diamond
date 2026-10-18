@@ -586,6 +586,7 @@ final class MCPServer {
         let path: String
         let duration: Double
         let key: String
+        let words: [String]      // the title's, from `SongName.words`
         let source: StemSource
     }
 
@@ -627,15 +628,17 @@ final class MCPServer {
             ["source": v.source.label, "rank": v.source.rank, "length": Int(v.duration.rounded()), "path": v.path, "game_cut": v.source.gameCut]
         }
         let songs = wanted.map { song -> [String: Any] in
-            let key = SongName.key(title: song.title, artist: song.artist), asked = Self.parts(key)
+            let key = SongName.key(title: song.title, artist: song.artist), artist = Self.parts(key).artist
+            let words = SongName.words(title: song.title)
             let versions = (byKey[key] ?? []).sorted(by: best)
             // Files by the same first artist whose title holds this one or sits inside it, which can be the same
             // recording tagged differently or a different one: Dance The Night against Dance The Night (From Barbie
             // The Album), and against a remix. Whole titles must match to be a version, which keeps remixes and
             // re-recordings apart, so these are listed for the agent to judge and never count as having the song.
-            let candidates = asked.title.isEmpty ? [] : (byArtist[asked.artist] ?? []).filter { f in
-                let title = Self.parts(f.key).title
-                return f.key != key && !title.isEmpty && (title.contains(asked.title) || asked.title.contains(title))
+            // Whole words in order, so Bon Appétit doesn't take in E.T., as it did when the folded titles were
+            // compared letter by letter.
+            let candidates = words.isEmpty ? [] : (byArtist[artist] ?? []).filter { f in
+                f.key != key && !f.words.isEmpty && (Self.holds(f.words, words) || Self.holds(words, f.words))
             }.sorted(by: best)
             var json: [String: Any] = ["title": song.title, "artist": song.artist, "versions": versions.map(row)]
             if !candidates.isEmpty { json["candidates"] = candidates.map(row) }
@@ -655,6 +658,12 @@ final class MCPServer {
     }
 
     /// A `SongName.key` taken apart, so near matches compare titles folded exactly as versions are.
+    /// Whether `words` holds `run` as consecutive words.
+    private static func holds(_ words: [String], _ run: [String]) -> Bool {
+        guard run.count <= words.count else { return false }
+        return (0...(words.count - run.count)).contains { Array(words[$0..<($0 + run.count)]) == run }
+    }
+
     private static func parts(_ key: String) -> (artist: String, title: String) {
         let split = key.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
         return (String(split[0]), split.count > 1 ? String(split[1]) : "")
@@ -700,7 +709,7 @@ final class MCPServer {
                     if AudioSource.isStem(url), title.lowercased().hasSuffix(".stem") { title = String(title.dropLast(5)) }
                 }
                 let file = FoundFile(path: url.path, duration: tags.duration, key: SongName.key(title: title, artist: tags.artist ?? ""),
-                                     source: StemSource.of(title: title, path: url.path))
+                                     words: SongName.words(title: title), source: StemSource.of(title: title, path: url.path))
                 foundFiles[url.path] = (keys[url.path] ?? "", file)
                 addTask()
             }

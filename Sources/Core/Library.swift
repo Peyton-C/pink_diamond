@@ -450,7 +450,8 @@ final class Library: ObservableObject {
     /// The song that plays the file at `path`, has it as another version, or played it once.
     func song(forFile path: String) -> Song? {
         songs.first { $0.path == path }
-            ?? songs.first { ($0.versions ?? []).contains { $0.path == path } || ($0.formerPaths ?? []).contains(path) }
+            ?? songs.first { ($0.versions ?? []).contains { $0.path == path } }
+            ?? songs.first { ($0.formerPaths ?? []).contains(path) }
     }
 
     /// The songs that files and folders given to `add` ended up as, whether as rows of their own or as versions.
@@ -575,6 +576,17 @@ final class Library: ObservableObject {
         for song in songs {
             if let version = choice(for: song) { use(version, for: song.id) }
         }
+        // A file that is now another song's is no longer one this song played: the Fortnite Cheap Thrills, split off
+        // the official stems as the Sean Paul remix, stayed in the official row's former paths.
+        let held = Set(songs.flatMap { [$0.path] + ($0.versions ?? []).map(\.path) })
+        var cleaned = songs, stale = false
+        for i in cleaned.indices {
+            guard let former = cleaned[i].formerPaths else { continue }
+            let own = Set([cleaned[i].path] + (cleaned[i].versions ?? []).map(\.path))
+            let kept = former.filter { !held.contains($0) || own.contains($0) }
+            if kept.count != former.count { cleaned[i].formerPaths = kept.isEmpty ? nil : kept; stale = true }
+        }
+        if stale { songs = cleaned }
         let missing = songs.filter { states[$0.id] != .missing && !files.fileExists(atPath: $0.path) }
         if !missing.isEmpty { states.merge(missing.map { ($0.id, .missing) }) { _, new in new } }
         loadPlaylistSongs()

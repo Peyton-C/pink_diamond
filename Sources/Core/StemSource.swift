@@ -97,15 +97,23 @@ enum SongName {
     /// files, as Apple Music names the remix. The rest of the title is kept whole, so All Too
     /// Well stays apart from its ten-minute version, and Monster by Lady Gaga from Monster by Slayyyter.
     static func key(title: String, artist: String) -> String {
-        func folded(_ s: String) -> String {
-            let plain = s.folding(options: [.diacriticInsensitive, .caseInsensitive, .widthInsensitive], locale: nil)
-                .replacingOccurrences(of: "$", with: "s")   // Ke$ha, A$AP
-            return String(String.UnicodeScalarView(plain.unicodeScalars.filter(CharacterSet.alphanumerics.contains)))
-        }
         var first = artist.lowercased()
         for mark in [",", "&", ";", "(", " ft ", " ft.", " feat ", " feat.", " featuring ", " f. ", " f/", " x ", " with "] {
             if let range = first.range(of: mark) { first = String(first[..<range.lowerBound]) }
         }
         return folded(first) + "|" + folded(StemSource.split(title).name)
+    }
+
+    /// The title's words without the marker, each folded as `key` folds it. Joined, they are the title half of the
+    /// key. Kept apart, a short title can be looked for in a longer one: folded whole, E.T. is "et", which sits
+    /// inside "bonappetit".
+    static func words(title: String) -> [String] {
+        StemSource.split(title).name.split(whereSeparator: \.isWhitespace).map { folded(String($0)) }.filter { !$0.isEmpty }
+    }
+
+    private static func folded(_ s: String) -> String {
+        let plain = s.folding(options: [.diacriticInsensitive, .caseInsensitive, .widthInsensitive], locale: nil)
+            .replacingOccurrences(of: "$", with: "s")   // Ke$ha, A$AP
+        return String(String.UnicodeScalarView(plain.unicodeScalars.filter(CharacterSet.alphanumerics.contains)))
     }
 }
