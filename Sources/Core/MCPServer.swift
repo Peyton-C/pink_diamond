@@ -262,7 +262,7 @@ final class MCPServer {
         return [
             tool("add_songs", "Add audio files, Native Instruments stem files or folders, and analyze them. The first analysis of a song takes a few seconds; later ones come from the cache. Returns the songs added with their ids, or for more than 25 an overview: how many songs, how many by each artist and in each BPM band, each song counted once however many versions there are. Search them with list_songs.",
                  ["paths": ids("Absolute paths")], required: ["paths"]),
-            tool("find_versions", "Which versions of songs are already on disk, from the files' tags alone: nothing is analyzed or added. For each song, in the order given, every file of it, best source first, with its source, rank (lower is better), length in seconds, path and whether it is a game's cut. With marker, also a verdict: rip when no file is as good as that source, have when one is, different_cut when the only ones that are come from Fortnite Festival or Rock Band and run a different length from the album cut. Counts of each verdict come first.",
+            tool("find_versions", "Which versions of songs are already on disk, from the files' tags alone: nothing is analyzed or added. For each song, in the order given, every file of it, best source first, with its source, rank (lower is better), length in seconds, path and whether it is a game's cut. With marker, also a verdict: rip when no file is as good as that source, have when one is, different_cut when the only ones that are come from Fortnite Festival or Rock Band and run a different length from the album cut. Counts of each verdict come first. candidates are files by the same artist whose title contains the song's or sits inside it, which can be the same recording tagged differently (feat., From the X Album) or a different one (a remix, an edit, Taylor's Version); they never count as having the song. The verdict is check when a candidate could change it: judge each from what you know of the recordings and the lengths.",
                  ["songs": ["type": "array", "description": "Songs as Apple Music names them", "items": [
                      "type": "object", "properties": ["title": string("Title"), "artist": string("Artist")], "required": ["title", "artist"]] as [String: Any]] as [String: Any],
                   "folders": ids("Folders to search, with their subfolders. Defaults to ~/Music/Stereo Stems"),
@@ -620,22 +620,44 @@ final class MCPServer {
 
         let files = await indexFiles(in: folders)
         let byKey = Dictionary(grouping: files, by: \.key)
-        var counts: [String: Int] = marker == nil ? ["found": 0, "not_found": 0] : ["rip": 0, "have": 0, "different_cut": 0]
+        let byArtist = Dictionary(grouping: files) { Self.parts($0.key).artist }
+        var counts: [String: Int] = marker == nil ? ["found": 0, "check": 0, "not_found": 0] : ["rip": 0, "have": 0, "different_cut": 0, "check": 0]
+        let best = { (a: FoundFile, b: FoundFile) in (a.source.rank, a.path) < (b.source.rank, b.path) }
+        let row = { (v: FoundFile) -> [String: Any] in
+            ["source": v.source.label, "rank": v.source.rank, "length": Int(v.duration.rounded()), "path": v.path, "game_cut": v.source.gameCut]
+        }
         let songs = wanted.map { song -> [String: Any] in
-            let versions = (byKey[SongName.key(title: song.title, artist: song.artist)] ?? []).sorted { ($0.source.rank, $0.path) < ($1.source.rank, $1.path) }
-            var json: [String: Any] = ["title": song.title, "artist": song.artist, "versions": versions.map { v -> [String: Any] in
-                ["source": v.source.label, "rank": v.source.rank, "length": Int(v.duration.rounded()), "path": v.path, "game_cut": v.source.gameCut]
-            }]
+            let key = SongName.key(title: song.title, artist: song.artist), asked = Self.parts(key)
+            let versions = (byKey[key] ?? []).sorted(by: best)
+            // Files by the same first artist whose title holds this one or sits inside it, which can be the same
+            // recording tagged differently or a different one: Dance The Night against Dance The Night (From Barbie
+            // The Album), and against a remix. Whole titles must match to be a version, which keeps remixes and
+            // re-recordings apart, so these are listed for the agent to judge and never count as having the song.
+            let candidates = asked.title.isEmpty ? [] : (byArtist[asked.artist] ?? []).filter { f in
+                let title = Self.parts(f.key).title
+                return f.key != key && !title.isEmpty && (title.contains(asked.title) || asked.title.contains(title))
+            }.sorted(by: best)
+            var json: [String: Any] = ["title": song.title, "artist": song.artist, "versions": versions.map(row)]
+            if !candidates.isEmpty { json["candidates"] = candidates.map(row) }
+            var verdict: String
             if let marker {
-                let verdict = Self.verdict(versions, against: marker)
+                verdict = Self.verdict(versions, against: marker)
+                // Only where a candidate could change the answer, so the agent judges as few songs as it can.
+                if verdict != "have", candidates.contains(where: { $0.source.rank <= marker.rank }) { verdict = "check" }
                 json["verdict"] = verdict
-                counts[verdict, default: 0] += 1
             } else {
-                counts[versions.isEmpty ? "not_found" : "found", default: 0] += 1
+                verdict = !versions.isEmpty ? "found" : !candidates.isEmpty ? "check" : "not_found"
             }
+            counts[verdict, default: 0] += 1
             return json
         }
         return ["summary": counts, "files_searched": files.count, "songs": songs]
+    }
+
+    /// A `SongName.key` taken apart, so near matches compare titles folded exactly as versions are.
+    private static func parts(_ key: String) -> (artist: String, title: String) {
+        let split = key.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+        return (String(split[0]), split.count > 1 ? String(split[1]) : "")
     }
 
     /// Whether making `marker` would beat what is on disk. A game's cut that is as good only counts as having the
