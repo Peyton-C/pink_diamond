@@ -92,7 +92,8 @@ final class MCPServer {
             let asked = params["protocolVersion"] as? String ?? ""
             result = ["protocolVersion": Self.protocolVersions.contains(asked) ? asked : Self.protocolVersions[0],
                       "capabilities": ["tools": [String: Any](), "prompts": [String: Any]()],
-                      "serverInfo": ["name": "pink diamond", "version": "1.0.0"]]
+                      "serverInfo": ["name": "pink diamond", "version": "1.0.0"],
+                      "instructions": "pink diamond knows only the songs added this session with add_songs; list_songs, plan_set and the rest search nothing else. Start a session by adding ~/Music/Stereo Stems. Songs already analyzed come from the cache, so adding the folders again is quick."]
         case "ping":
             result = [:]
         case "tools/list":
