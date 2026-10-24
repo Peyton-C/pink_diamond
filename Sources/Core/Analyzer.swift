@@ -119,7 +119,7 @@ enum Analyzer {
     static let workerLimit = 2
 
     static func analyze(playable url: URL, id: String) async throws -> SongAnalysis {
-        let asset = AVURLAsset(url: url)
+        let asset = try await AudioSource.mixdown(of: url)
         let duration = try await asset.load(.duration).seconds
         let session = try await MusicUnderstandingSession(asset: asset)
         let r = try await session.analyze()

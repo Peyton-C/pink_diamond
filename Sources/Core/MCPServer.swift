@@ -20,7 +20,6 @@ final class MCPServer {
         var keyShift = 0             // semitones the whole song plays shifted by
         var gainDB = 0.0             // on top of Sound Check
         var stemLabels: [String]?    // a stem file's own names for its stems, when they aren't the stock four
-        let playable: URL
         let analysis: SongAnalysis
     }
 
@@ -65,6 +64,7 @@ final class MCPServer {
     }
 
     func run() async -> Int32 {
+        AppPaths.clear("mcp", olderThan: 7 * 86400)
         while let line = readLine(strippingNewline: true) {
             guard !line.isEmpty else { continue }
             guard let response = await handle(line), let data = try? JSONSerialization.data(withJSONObject: response, options: [.withoutEscapingSlashes]) else { continue }
@@ -245,10 +245,10 @@ final class MCPServer {
                   "outgoing_lanes": lanes,
                   "incoming_lanes": ["type": "object", "description": "The same as outgoing_lanes, for the incoming song"] as [String: Any],
                   "add_effects": effects]
-        let out = string("Where to write the WAV, as a full path")
+        let out = string("Where to write the render, as a full path. It is AAC unless the path ends in .wav")
         let first = integer("Report only from the song at this position in songs, counted from 1. The whole set is still planned, and times are still on its clock")
         let last = integer("Report only up to the song at this position")
-        let named = string("A name for the WAV, which goes in the renders folder. Without a name or a path it goes in the cache")
+        let named = string("A name for the render, an .m4a in the renders folder. Without a name or a path it goes in the cache")
         if extensions {
             editing["outgoing_tail_bars"] = number("Bars the outgoing song plays on after the window ends, with its lanes carrying on, so an echo can ring out. 0 removes it")
             editing["outgoing_loop"] = [
@@ -316,12 +316,12 @@ final class MCPServer {
             tool("edit_transition", "Change a transition. Only the fields given change; the rest of the edit is kept. Returns the transition as get_transition does." + (extensions ? " For stem files, lanes named stem_drums, stem_bass, stem_other and stem_vocals set each stem's level from 0 to 2, where 1 is as recorded; bring a stem back to 1 before the incoming side ends." : ""),
                  editing, required: ["from", "to"]),
             tool("reset_transition", "Drop every edit to a transition and go back to Apple's plan.", ["from": from, "to": to], required: ["from", "to"]),
-            tool("render_transition", "Render one transition to a WAV, with some of each song either side of it. Returns the level of the result second by second and its peak, in dB below full scale, and how many samples sit at full scale. The renderer ends in a limiter, which pumps when it works hard.",
+            tool("render_transition", "Render one transition to an audio file, with some of each song either side of it. Returns the level of the result second by second and its peak, in dB below full scale, and how many samples sit at full scale. The renderer ends in a limiter, which pumps when it works hard.",
                  ["from": from, "to": to, "name": named, "out": out, "margin": number("Seconds of each song around the transition. Defaults to 15"), "sound_check": soundCheck,
                   "solo": ["type": "string", "enum": ["outgoing", "incoming"], "description": "Render this song's part alone, on the same clock"]], required: ["from", "to"]),
             tool("plan_set", "The timeline of playing songs in order, without rendering: where each transition starts in the mix, its technique and length, the checks get_transition makes, which part of each song plays and its sections, the total length, any run of three or more transitions in a row that use the same technique, any song that is there twice, under unplanned every transition in the set that could not be planned and plays as a cut, and under overlapping every song whose transition out starts before the one in has finished, so three songs play at once.",
                  ["songs": ids("Song ids in playing order"), "first": first, "last": last], required: ["songs"]),
-            tool("render_set", "Render songs in order, with every transition, to one WAV. Returns the same timeline as plan_set, with the level each second around each transition. A transition that can't be planned becomes a straight cut.",
+            tool("render_set", "Render songs in order, with every transition, to one audio file. Returns the same timeline as plan_set, with the level each second around each transition. A transition that can't be planned becomes a straight cut.",
                  ["songs": ids("Song ids in playing order"), "first": first, "last": last, "name": named, "out": out, "sound_check": soundCheck], required: ["songs"]),
             tool("save_set", "Save songs, their genres and settings, and every edited transition between them, to carry on after a restart. Saving under a name that exists replaces it.",
                  ["name": string("A name for the set"), "run": string("A run id you were given to pass on. Kept for later saves in this session"), "songs": ids("Song ids in playing order. Left out, the songs last given to plan_set or render_set or loaded with load_set, or with none of those every song added this session")], required: ["name"]),
@@ -538,12 +538,10 @@ final class MCPServer {
         return ["added": added.count, "songs": added.map(summary), "failed": failed]
     }
 
-    /// One file as a song: its mixdown, its analysis from the cache or made now, and its tags. Nil when the analysis
-    /// isn't cached and `analyze` is off. Static and touching none of the server's state, so `add` can run several
-    /// at once.
+    /// One file as a song: its analysis from the cache or made now, and its tags. Nil when the analysis isn't cached
+    /// and `analyze` is off. Static and touching none of the server's state, so `add` can run several at once.
     private static func load(_ url: URL, analyze: Bool) async throws -> Entry? {
         let key = fileKey(url)
-        let playable = try await AudioSource.playableURL(for: url)
         // The app's analysis cache, by the same key and under the same catalog ID, so a song analyzed by
         // either is ready in both.
         let cache = AppPaths.cacheDir("analysis").appendingPathComponent(key + ".json")
@@ -554,12 +552,12 @@ final class MCPServer {
             if analysis.loudness == nil { analysis.loudness = Loudness(audioAnalysis: analysis.audioAnalysisJSON) }
         } else {
             guard analyze else { return nil }
-            analysis = try await Analyzer.analyze(playable: playable, id: "99" + String(key.prefix(8)))
+            analysis = try await Analyzer.analyze(playable: url, id: "99" + String(key.prefix(8)))
             try? JSONEncoder().encode(analysis).write(to: cache)
         }
         var name = url.deletingPathExtension().lastPathComponent
         if AudioSource.isStem(url), name.lowercased().hasSuffix(".stem") { name = String(name.dropLast(5)) }
-        var song = Entry(id: String(key.prefix(8)), path: url.path, title: name, artist: "", playable: playable, analysis: analysis)
+        var song = Entry(id: String(key.prefix(8)), path: url.path, title: name, artist: "", analysis: analysis)
         if AudioSource.isStem(url) { song.stemLabels = AudioSource.customStemNames(for: url) }
         let asset = AVURLAsset(url: url)
         for item in (try? await asset.load(.commonMetadata)) ?? [] {
@@ -1343,8 +1341,9 @@ final class MCPServer {
         }
         let beats = s.analysis.beats
         var all: [[Double]] = []
-        for stem in try await AudioSource.stemURLs(for: url) {
-            let audio = try AudioSource.loadPCM(stem)
+        let stems = try await AudioSource.stems(of: url)
+        for k in stems.tracks.indices {
+            let audio = try stems.decode(k)   // one at a time: four decoded stems of a long song run to hundreds of MB
             let frames = Int(audio.frameLength), channels = Int(audio.format.channelCount), data = audio.floatChannelData!
             all.append(zip(beats, beats.dropFirst() + [s.analysis.duration]).map { lo, hi in
                 let from = max(0, min(frames, Int(lo * sampleRate))), to = max(from, min(frames, Int(hi * sampleRate)))
@@ -1986,28 +1985,35 @@ final class MCPServer {
 
     // MARK: Rendering
 
+    /// Where a render goes: `out` as given, WAV if it ends in .wav, or else an AAC .m4a, which is all a render to
+    /// listen to needs at a twelfth of the size. Unnamed renders go in the cache, and those over a week old are
+    /// cleared when the server starts: nothing refers to them after the session that made them.
     private func outputURL(_ args: [String: Any]) throws -> URL {
-        if let path = args["out"] as? String { return URL(fileURLWithPath: (path as NSString).expandingTildeInPath) }
-        guard let name = args["name"] as? String, !name.isEmpty else { return AppPaths.cacheDir("mcp").appendingPathComponent(UUID().uuidString + ".wav") }
+        if let path = args["out"] as? String {
+            let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            return ["wav", "m4a"].contains(url.pathExtension.lowercased()) ? url : url.appendingPathExtension("m4a")
+        }
+        guard let name = args["name"] as? String, !name.isEmpty else { return AppPaths.cacheDir("mcp").appendingPathComponent(UUID().uuidString + ".m4a") }
         // In a folder of the run's own once save_set has been given one, so runs going at once keep their renders apart.
         let folder = run.map { renders.appendingPathComponent(Self.fileName($0)) } ?? renders
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        return folder.appendingPathComponent(Self.fileName(name) + ".wav")
+        return folder.appendingPathComponent(Self.fileName(name) + ".m4a")
     }
 
     private static func fileName(_ name: String) -> String {
         name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
     }
 
-    /// A song as the renderer plays it. Its stems are extracted only if one of its sides sets a stem's level: the
+    /// A song as the renderer plays it. It plays its stems only if one of its sides sets a stem's level: the
     /// sum of the stems is not the mixdown sample for sample, so a song nobody remixes plays the mixdown, as it does
     /// in the app.
     private func item(_ s: Entry, entering: TransitionSide?, leaving: TransitionSide?, soundCheck: Bool) async throws -> MixRenderer.Item {
         let remixed = [entering, leaving].contains { side in TransitionEdit.stemLanes.contains { side?.automations[$0] != nil } }
-        return MixRenderer.Item(audio: s.playable, beats: s.analysis.beats, entering: entering, leaving: leaving,
+        let url = URL(fileURLWithPath: s.path)
+        return MixRenderer.Item(audio: url, beats: s.analysis.beats, entering: entering, leaving: leaving,
                                 gain: (soundCheck ? s.analysis.loudness?.gain ?? 1 : 1) * Float(pow(10, s.gainDB / 20)),
                                 loops: [entering?.loop, leaving?.loop].compactMap { $0 },
-                                stems: remixed ? try await AudioSource.stemURLs(for: URL(fileURLWithPath: s.path)) : [],
+                                stems: remixed ? try await AudioSource.stems(of: url) : nil,
                                 pitch: Double(s.keyShift))
     }
 
@@ -2019,10 +2025,11 @@ final class MCPServer {
         // runs the clock, so the three files line up to the sample and can be compared second by second.
         if let solo { items[solo == "outgoing" ? 1 : 0].gain = 0 }
         let start = max(0, plan.outgoing.start - margin)
-        let seconds = try MixRenderer.render(items, startTime: start, tail: margin, to: url)
+        let meter = Meter()
+        let seconds = try MixRenderer.render(items, startTime: start, tail: margin, to: url, observe: meter.add)
         var json: [String: Any] = ["path": url.path, "seconds": r(seconds), "transition_starts_at": r(plan.outgoing.start - start),
                                    "transition_duration": r(plan.duration)]
-        let levels = levels(url)
+        let levels = meter.result(r)
         json["level_db_per_second"] = levels.seconds
         json.merge(levels.summary) { a, _ in a }
         return json
@@ -2030,29 +2037,39 @@ final class MCPServer {
 
     /// The render's level each second (RMS over both channels), its peak and how many samples sit at full scale, in
     /// dB below full scale. Not loudness as LUFS measures it, but enough to see a dip, a jump or a hole across a
-    /// transition, and whether two songs at full volume are being held down by the renderer's limiter. Read a
-    /// second at a time: a 30-minute set is over 600 MB as one buffer.
-    private func levels(_ url: URL) -> (seconds: [NSNumber], summary: [String: Any]) {
-        guard let file = try? AVAudioFile(forReading: url) else { return ([], [:]) }
-        let format = file.processingFormat, second = AVAudioFrameCount(format.sampleRate)
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: second) else { return ([], [:]) }
-        let db = { (x: Double) in x > 0 ? max(20 * log10(x), -100) : -100 }
-        var seconds: [NSNumber] = [], peak = 0.0, full = 0
-        while file.framePosition < file.length, (try? file.read(into: buffer, frameCount: second)) != nil,
-              buffer.frameLength > 0, let data = buffer.floatChannelData {
-            var sum = 0.0
-            for c in 0..<Int(format.channelCount) {
-                for i in 0..<Int(buffer.frameLength) {
+    /// transition, and whether two songs at full volume are being held down by the renderer's limiter.
+    /// Measured as the renderer hands its blocks over, not read back from the file: renders are AAC, and its decode
+    /// overshoots the limiter's ceiling, which would count samples at full scale that the mix never had.
+    private final class Meter {
+        private var sum = 0.0, frames = 0, peak = 0.0, full = 0
+        private var seconds: [NSNumber] = []
+        private let db = { (x: Double) in x > 0 ? max(20 * log10(x), -100) : -100 }
+
+        func add(_ buffer: AVAudioPCMBuffer) {
+            guard let data = buffer.floatChannelData else { return }
+            let channels = Int(buffer.format.channelCount)
+            for i in 0..<Int(buffer.frameLength) {
+                for c in 0..<channels {
                     let x = abs(Double(data[c][i]))
                     sum += x * x
                     peak = max(peak, x)
                     if x >= 0.999 { full += 1 }
                 }
+                frames += 1
+                if frames == Int(sampleRate) { close(channels) }
             }
-            let rms = (sum / Double(Int(buffer.frameLength) * Int(format.channelCount))).squareRoot()
-            seconds.append(NSDecimalNumber(string: String(format: "%.1f", db(rms))))
         }
-        return (seconds, ["peak_db": r(db(peak)), "samples_at_full_scale": full])
+
+        private func close(_ channels: Int) {
+            seconds.append(NSDecimalNumber(string: String(format: "%.1f", db((sum / Double(frames * channels)).squareRoot()))))
+            sum = 0; frames = 0
+        }
+
+        /// The level each second, the last part-second included, and the summary.
+        func result(_ r: (Double) -> NSNumber) -> (seconds: [NSNumber], summary: [String: Any]) {
+            if frames > 0 { close(2) }
+            return (seconds, ["peak_db": r(db(peak)), "samples_at_full_scale": full])
+        }
     }
 
     /// Playing `list` in order: each song's sides as the renderer needs them (nil where planning failed, which plays
@@ -2146,9 +2163,10 @@ final class MCPServer {
         var (entering, leaving, json) = timeline(list, report: report)
         var items: [MixRenderer.Item] = []
         for (i, s) in list.enumerated() { items.append(try await item(s, entering: entering[i], leaving: leaving[i], soundCheck: soundCheck)) }
-        json["seconds"] = r(try MixRenderer.render(items, startTime: 0, tail: nil, to: url))
+        let meter = Meter()
+        json["seconds"] = r(try MixRenderer.render(items, startTime: 0, tail: nil, to: url, observe: meter.add))
         json["path"] = url.path
-        let levels = levels(url)
+        let levels = meter.result(r)
         json.merge(levels.summary) { a, _ in a }
         // The level around each handoff, where an abrupt cut or a hole shows as a sudden drop.
         json["transitions"] = (json["transitions"] as? [[String: Any]] ?? []).map { t -> [String: Any] in

@@ -28,6 +28,15 @@ enum AppPaths {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
+    /// Deletes what cache folder `name` holds that was last changed more than `age` seconds ago.
+    static func clear(_ name: String, olderThan age: TimeInterval) {
+        let files = FileManager.default
+        let dir = cache.appendingPathComponent(name)
+        for url in (try? files.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] {
+            let changed = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            if Date().timeIntervalSince(changed) > age { try? files.removeItem(at: url) }
+        }
+    }
 }
 
 /// Stable cache key for a file: path + size + modification date.
@@ -43,17 +52,21 @@ enum AudioSource {
     /// Native Instruments stem files: 5 stereo tracks, track 0 is the mixdown (the default track).
     static func isStem(_ url: URL) -> Bool { url.lastPathComponent.lowercased().hasSuffix(".stem.mp4") }
 
-    /// A plain audio file for `url`: the file itself, or for a stem file its mixdown (track 0), extracted once by
-    /// passthrough export (no re-encode) into the cache.
-    static func playableURL(for url: URL) async throws -> URL {
+    /// The file as an asset of its first audio track alone, which in a stem file is the mixdown. `AVAudioFile` reads
+    /// only that track, but MusicUnderstanding plays every track of an asset at once: given a stem file whole it
+    /// heard the mixdown and the four stems on top, the song twice over, and measured Shake It Off at -12.8 LUFS
+    /// with a peak of 1.78 against -18.8 and 0.89 for the mixdown alone. Built in memory, nothing is written.
+    static func mixdown(of url: URL) async throws -> AVAsset {
         let asset = AVURLAsset(url: url)
         let tracks = try await asset.loadTracks(withMediaType: .audio)
-        guard isStem(url) || tracks.count > 1 else { return url }
-        let out = AppPaths.cacheDir("mixdowns").appendingPathComponent(fileKey(url) + ".m4a")
-        if FileManager.default.fileExists(atPath: out.path) { return out }
-        guard let mixdown = tracks.min(by: { $0.trackID < $1.trackID }) else { throw PlannerError("no audio track in \(url.lastPathComponent)") }
-        try await extract(mixdown, of: asset, to: out)
-        return out
+        guard tracks.count > 1, let first = tracks.min(by: { $0.trackID < $1.trackID }) else { return asset }
+        let composition = AVMutableComposition()
+        guard let track = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            throw PlannerError("could not read the mixdown of \(url.lastPathComponent)")
+        }
+        // From zero on the file's clock, as the cache's extracted mixdowns were, so beats land where they did.
+        try track.insertTimeRange(CMTimeRange(start: .zero, duration: try await asset.load(.duration)), of: first, at: .zero)
+        return composition
     }
 
     static let stemNames = ["drums", "bass", "other", "vocals"]
@@ -109,36 +122,63 @@ enum AudioSource {
         return names
     }
 
-    /// The four stems of a stem file (drums, bass, other, vocals: tracks 1 to 4, in Native Instruments' order), each
-    /// extracted once into the cache the way the mixdown is. Taking them out the same way matters: decoded by the
-    /// same path they share the mixdown's encoder delay, so they sit on the beat grid its analysis found.
-    static func stemURLs(for url: URL) async throws -> [URL] {
+    /// A stem file's four stems (drums, bass, other, vocals: tracks 1 to 4, in Native Instruments' order), read
+    /// straight from the file when a mix plays them. A stem file plays as its mixdown without any of this:
+    /// `AVAudioFile` reads a file's first track, which in a stem file is the mixdown.
+    ///
+    /// Both used to be extracted into the cache by passthrough export, which came to 28 GB for the library, half of
+    /// it copies of files since retagged or moved. Read in place they are the same audio: the mixdown is sample for
+    /// sample what the extracted one was, and a stem decoded here is within 1e-7 of it and starts on the same sample,
+    /// so stems stay on the beat grid the mixdown's analysis found (12 songs across Official, FN, RF, RF AT and RB).
+    /// The extracted copies were only ever 1088 frames short at the end.
+    struct Stems {
+        let asset: AVURLAsset
+        let tracks: [AVAssetTrack]
+        let duration: Double
+
+        /// All four, decoded to 44.1 kHz stereo float.
+        func decode() throws -> [AVAudioPCMBuffer] { try tracks.indices.map(decode) }
+
+        /// Stem `index` (in `stemNames` order), decoded to 44.1 kHz stereo float.
+        func decode(_ index: Int) throws -> AVAudioPCMBuffer {
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: tracks[index], outputSettings: [
+                AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true,
+                AVLinearPCMIsNonInterleaved: true, AVLinearPCMIsBigEndianKey: false,
+                AVSampleRateKey: sampleRate, AVNumberOfChannelsKey: 2,
+            ])
+            reader.add(output)
+            try reader.start()
+            let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
+            var buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(duration * sampleRate) + 8192)!
+            while let sample = output.copyNextSampleBuffer() {
+                let n = CMSampleBufferGetNumSamples(sample), at = Int(buffer.frameLength)
+                if at + n > Int(buffer.frameCapacity) {   // the duration undercounted: grow rather than drop the end
+                    let bigger = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount((at + n) * 2))!
+                    for c in 0..<2 { bigger.floatChannelData![c].update(from: buffer.floatChannelData![c], count: at) }
+                    bigger.frameLength = buffer.frameLength
+                    buffer = bigger
+                }
+                let list = AudioBufferList.allocate(maximumBuffers: 2)
+                defer { free(list.unsafeMutablePointer) }
+                for c in 0..<2 {
+                    list[c] = AudioBuffer(mNumberChannels: 1, mDataByteSize: UInt32(n * 4), mData: buffer.floatChannelData![c] + at)
+                }
+                let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(sample, at: 0, frameCount: Int32(n), into: list.unsafeMutablePointer)
+                guard status == noErr else { throw PlannerError("could not decode \(asset.url.lastPathComponent) (\(status))") }
+                buffer.frameLength = AVAudioFrameCount(at + n)
+            }
+            if reader.status == .failed { throw reader.error ?? PlannerError("could not decode \(asset.url.lastPathComponent)") }
+            return buffer
+        }
+    }
+
+    /// The stems of the stem file at `url`, ready to decode.
+    static func stems(of url: URL) async throws -> Stems {
         let asset = AVURLAsset(url: url)
         let tracks = try await asset.loadTracks(withMediaType: .audio).sorted { $0.trackID < $1.trackID }
         guard tracks.count >= 5 else { throw PlannerError("\(url.lastPathComponent) has no stems") }
-        var urls: [URL] = []
-        for (i, track) in tracks[1...4].enumerated() {
-            let out = AppPaths.cacheDir("mixdowns").appendingPathComponent("\(fileKey(url)).\(stemNames[i]).m4a")
-            if !FileManager.default.fileExists(atPath: out.path) { try await extract(track, of: asset, to: out) }
-            urls.append(out)
-        }
-        return urls
-    }
-
-    /// One track of `asset` as an m4a of its own, by passthrough export (no re-encode).
-    private static func extract(_ mixdown: AVAssetTrack, of asset: AVURLAsset, to out: URL) async throws {
-        let composition = AVMutableComposition()
-        guard let track = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
-            throw PlannerError("could not create composition track")
-        }
-        let duration = try await asset.load(.duration)
-        try track.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: mixdown, at: .zero)
-        guard let export = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetPassthrough) else {
-            throw PlannerError("could not export mixdown")
-        }
-        let tmp = out.deletingLastPathComponent().appendingPathComponent(UUID().uuidString + ".m4a")
-        try await export.export(to: tmp, as: .m4a)
-        try FileManager.default.moveItem(at: tmp, to: out)
+        return Stems(asset: asset, tracks: Array(tracks[1...4]), duration: try await asset.load(.duration).seconds)
     }
 
     /// The file's cover art as a JPEG thumbnail, read from its tags once and cached at `cache` (an empty file there

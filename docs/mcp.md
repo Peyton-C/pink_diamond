@@ -37,8 +37,8 @@ A large library is meant to be searched, not listed. The overview shows what is 
 | `reset_transition` | Drops the edit and goes back to Apple's plan |
 | `plan_set` | The timeline of songs played in order, without rendering: where each transition starts, its technique and length, the checks below, which part of each song plays and its sections, how long it plays alone, the total length, any run of three or more transitions using the same technique, any song that is there twice, under `unplanned` every transition in the set that could not be planned and plays as a cut, and under `overlapping` every song whose transition out starts before the one in has finished, so three songs play at once |
 | `save_set`, `load_set`, `list_sets` | Saves songs and the edited transitions between them to a file, and loads them back after a restart |
-| `render_transition` | Renders one transition to a WAV with some of each song around it, and reports the result's level each second, its peak, and how many samples sit at full scale |
-| `render_set` | Renders songs in order with every transition to one WAV, with the same timeline as `plan_set` and the level each second around every transition |
+| `render_transition` | Renders one transition to an audio file with some of each song around it, and reports the result's level each second, its peak, and how many samples sit at full scale |
+| `render_set` | Renders songs in order with every transition to one audio file, with the same timeline as `plan_set` and the level each second around every transition |
 
 A call with an argument its tool does not take is refused, and the error lists the arguments it does take.
 
@@ -46,7 +46,7 @@ A call with an argument its tool does not take is refused, and the error lists t
 
 `plan_set` and `render_set` take `first` and `last`, positions in the song list counted from 1, to report only that stretch. pink diamond still plans or renders the whole set, and the times are still on its clock. `unplanned` and `overlapping` always cover the whole set, so a fault outside the stretch is not missed. A reply stays in the agent's context, and a long set's timeline is most of what fills it, so ask for the songs being worked on.
 
-Renders take a `name`, which puts the WAV in the renders folder, in a folder of its own named after the run once `save_set` has been given one, or `out` for a full path. With neither it goes in the cache under a random name.
+Renders are AAC .m4a files. They take a `name`, which puts the file in the renders folder, in a folder of its own named after the run once `save_set` has been given one, or `out` for a full path, which is written as WAV when it ends in .wav. With neither it goes in the cache under a random name, and pink diamond deletes those a week later.
 
 `render_transition` takes `solo`, `outgoing` or `incoming`, to render one song's part of the transition alone. It lines up with the full render to the sample, so the two solos show what each song is doing where the mix is hard to pick apart.
 
@@ -172,7 +172,7 @@ An incoming loop leaves the window as it is and changes what fills it: the incom
 For a stem file, lanes named `stem_drums`, `stem_bass`, `stem_other` and `stem_vocals` set each stem's level from 0 to 2, where 1 is as recorded. A stem is at 1 wherever no lane sets it, so bring it back to 1 before the incoming side ends or it jumps back. A stem file can name its stems itself, as Run Away with Me (RF IN SX) does with Bass & Synths and Sax in place of bass and other. `get_song` gives those names as `stem_names` by lane code, and the section lines use them, but the lanes keep their codes. A song with a stem lane plays as the sum of its stems for the whole song, which is close to the mixdown but not identical; every other song plays its mixdown.
 
 ## Limits
-The server has no playback, playlists or live mode. Tails, loops, stems and song settings are made only here: the app shows and plays them in an imported set, and its editor does not set them. An agent hears nothing: rendering gives it a WAV file and timings.
+The server has no playback, playlists or live mode. Tails, loops, stems and song settings are made only here: the app shows and plays them in an imported set, and its editor does not set them. An agent hears nothing: rendering gives it an audio file and timings.
 
 One request runs at a time, and a render blocks until it finishes.
 

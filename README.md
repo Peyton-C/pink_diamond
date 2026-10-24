@@ -26,7 +26,7 @@ Needs macOS 27 and Xcode 27.
 ## How it works
 | Path | What |
 | --- | --- |
-| `Sources/Core/AudioSource.swift` | Stem detection and mixdown extraction (track 0, passthrough), decoding, DJ-style waveform data |
+| `Sources/Core/AudioSource.swift` | Stem detection, reading the mixdown and stems in place, decoding, DJ-style waveform data |
 | `Sources/Core/StemSource.swift` | Where a stem file's stems came from and how sources rank, and the name that makes files versions of one song |
 | `Sources/Core/Library.swift` | Songs, playlists and edits: watched folders, versions and replacement, and the analyses and plans the UI reads |
 | `Sources/Core/Analyzer.swift` | MusicUnderstanding → Apple Music's AutoMix analysis format (incl. structure-based video cues, which the planner needs for genre styles) |
@@ -38,4 +38,4 @@ Needs macOS 27 and Xcode 27.
 | `Sources/Core/MixPlayer.swift` | Playlist playback: runs the renderer ahead of a realtime engine |
 | `Sources/UI/` | SwiftUI: library, playlists, deck view |
 
-Data lives in `~/Library/Application Support/pink diamond/` (library, playlists, transition edits) and `~/Library/Caches/pink diamond/` (analysis, stem mixdowns, cover art, previews).
+Data lives in `~/Library/Application Support/pink diamond/` (library, playlists, transition edits) and `~/Library/Caches/pink diamond/` (analysis, cover art, stem levels, and previews and MCP renders until they are cleared).

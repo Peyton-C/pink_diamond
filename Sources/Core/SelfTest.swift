@@ -14,18 +14,17 @@ enum SelfTest {
         do {
             print("planner available: \(SonicPlanner.shared.isAvailable), RemixFX available: \(MixRenderer.remixFXAvailable)")
             var analyses: [SongAnalysis] = []
-            var playable: [URL] = []
-            for url in [from, to] {
+            let playable = [from, to]
+            for url in playable {
                 let t0 = Date()
-                let p = try await AudioSource.playableURL(for: url)
-                let a = try await Analyzer.analyze(playable: p, id: "99" + String(fileKey(url).prefix(8)))
-                print("\(url.lastPathComponent): stem=\(AudioSource.isStem(url)) playable=\(p.lastPathComponent) " +
+                let a = try await Analyzer.analyze(playable: url, id: "99" + String(fileKey(url).prefix(8)))
+                print("\(url.lastPathComponent): stem=\(AudioSource.isStem(url)) " +
                       "\(a.bpm) BPM, \(a.key), \(String(format: "%.1f", a.duration)) s, \(a.beats.count) beats, " +
                       "\(a.sections.count) sections, waveform \(a.waveform.peak.count) pts (\(String(format: "%.1f", Date().timeIntervalSince(t0))) s)")
                 if let l = a.loudness {
                     print(String(format: "  loudness %.1f LUFS, peak %.2f, Sound Check %+.1f dB", l.integrated, l.peak, 20 * log10(Double(l.gain))))
                 }
-                analyses.append(a); playable.append(p)
+                analyses.append(a)
             }
             let json = try SonicPlanner.shared.plan(from: try Analyzer.songJSON(analyses[0], genre: ga),
                                                     to: try Analyzer.songJSON(analyses[1], genre: gb))

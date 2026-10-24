@@ -80,8 +80,7 @@ final class Library: ObservableObject {
         didSet { UserDefaults.standard.set(soundCheck, forKey: "soundCheck") }
     }
     private var albumArtwork: [String: NSImage] = [:]   // updated alongside `artwork`, whose publish redraws
-    private var playable: [UUID: URL] = [:]
-    private var stemFiles: [UUID: [URL]] = [:]   // for songs a mix plays as their stems
+    private var stemFiles: [UUID: AudioSource.Stems] = [:]   // for songs a mix plays as their stems
     private var pendingPlans: Set<String> = []
     private var analysisQueue: [UUID] = []
     private var analysisWorkers = 0
@@ -566,7 +565,7 @@ final class Library: ObservableObject {
             edits = rekeyed(edits)
             saveEdits()
             for id in into.keys {
-                playable[id] = nil; stemFiles[id] = nil
+                stemFiles[id] = nil
                 states[id] = nil; summaries[id] = nil; analyses[id] = nil; artwork[id] = nil
                 invalidatePlans(involving: id)
             }
@@ -608,7 +607,6 @@ final class Library: ObservableObject {
         }
         songs[i].isStem = AudioSource.isStem(songs[i].url)
         songs[i].fileKey = fileKey(songs[i].url)
-        playable[id] = nil
         stemFiles[id] = nil
         analyses[id] = nil
         summaries[id] = nil
@@ -716,20 +714,16 @@ final class Library: ObservableObject {
         guard FileManager.default.fileExists(atPath: song.path) else { states[id] = .missing; return }
         do {
             let a: SongAnalysis
-            var extracted: URL?
             if let cached = await Self.readAnalysis(Self.cacheFile(song)) {
                 a = cached
             } else {
                 states[id] = .analyzing
-                let url = try await AudioSource.playableURL(for: song.url)
-                extracted = url
-                a = try await Analyzer.analyze(playable: url, id: song.fakeCatalogID)
+                a = try await Analyzer.analyze(playable: song.url, id: song.fakeCatalogID)
                 let file = Self.cacheFile(song)
                 await Task.detached(priority: .utility) { try? JSONEncoder().encode(a).write(to: file) }.value
             }
             // The song moved to another file while this one was being read, and that file's analysis is on its way.
             guard self.song(id)?.fileKey == song.fileKey else { return }
-            if let extracted { playable[id] = extracted }
             summaries[id] = a.summary
             summaryIndex[song.fileKey] = a.summary
             saveSummariesSoon()
@@ -755,13 +749,13 @@ final class Library: ObservableObject {
         }
     }
 
-    /// Queues full analyses (and playable files) for every analyzed song in a playlist that doesn't have them yet.
+    /// Queues full analyses (and stems) for every analyzed song in a playlist that doesn't have them yet.
     private func loadPlaylistSongs() {
         guard started else { return }
         var seen = Set<UUID>()
         let remixed = remixedSongs
         for id in playlists.flatMap(\.songIDs) where seen.insert(id).inserted {
-            guard states[id] == .ready, analyses[id] == nil || playable[id] == nil || remixed.contains(id) && stemFiles[id] == nil,
+            guard states[id] == .ready, analyses[id] == nil || remixed.contains(id) && stemFiles[id] == nil,
                   !fullLoading.contains(id) else { continue }
             fullLoading.insert(id)
             fullQueue.append(id)
@@ -784,15 +778,10 @@ final class Library: ObservableObject {
         // Nothing read here is kept if the song moved to another file meanwhile: `use` has queued that one.
         let current = { self.song(id)?.fileKey == song.fileKey }
         do {
-            if playable[id] == nil {
-                let url = try await AudioSource.playableURL(for: song.url)
-                guard current() else { return }
-                playable[id] = url
-            }
             if stems, stemFiles[id] == nil {
-                let urls = try await AudioSource.stemURLs(for: song.url)
+                let found = try await AudioSource.stems(of: song.url)
                 guard current() else { return }
-                stemFiles[id] = urls
+                stemFiles[id] = found
             }
             if analyses[id] == nil {
                 let cached = await Self.readAnalysis(Self.cacheFile(song))
@@ -808,8 +797,6 @@ final class Library: ObservableObject {
             if current() { states[id] = .failed(String(describing: error)) }
         }
     }
-
-    func playableURL(_ id: UUID) -> URL? { playable[id] }
 
     /// The gain Sound Check plays a song at: 1 when it is off, or the song's loudness isn't known.
     func gain(_ id: UUID) -> Float { soundCheck ? analyses[id]?.loudness?.gain ?? 1 : 1 }
@@ -971,14 +958,14 @@ final class Library: ObservableObject {
     /// mixdown sample for sample, so a song nobody remixes plays the mixdown.
     private func item(_ id: UUID, entering: TransitionSide?, leaving: TransitionSide?, in playlist: UUID?) throws -> MixRenderer.Item {
         let remixed = [entering, leaving].contains { side in TransitionEdit.stemLanes.contains { side?.automations[$0] != nil } }
-        guard let audio = playableURL(id), let a = analyses[id], !remixed || stemFiles[id] != nil else {
+        guard let audio = song(id)?.url, let a = analyses[id], !remixed || stemFiles[id] != nil else {
             throw PlannerError("\(song(id)?.title ?? "A song") isn't ready yet.")
         }
         let settings = mix(playlist)?.songs[id.uuidString]
         return MixRenderer.Item(audio: audio, beats: a.beats, entering: entering, leaving: leaving,
                                 gain: gain(id) * Float(pow(10, (settings?.gainDB ?? 0) / 20)),
                                 loops: [entering?.loop, leaving?.loop].compactMap { $0 },
-                                stems: remixed ? stemFiles[id] ?? [] : [], pitch: Double(settings?.keyShift ?? 0))
+                                stems: remixed ? stemFiles[id] : nil, pitch: Double(settings?.keyShift ?? 0))
     }
 
     /// Renderer items for one transition on its own, for the deck view's preview.
@@ -996,7 +983,7 @@ final class Library: ObservableObject {
             case .planning, nil: throw PlannerError("Some transitions aren't planned yet; wait for every ◆ to appear.")
             }
         }
-        if let missing = ids.first(where: { playableURL($0) == nil || analyses[$0] == nil }) {
+        if let missing = ids.first(where: { analyses[$0] == nil }) {
             throw PlannerError("\(song(missing)?.title ?? "A song") isn't ready yet.")
         }
         return try ids.enumerated().map { i, id in

@@ -722,12 +722,15 @@ final class PreviewPlayer: ObservableObject {
     private var player: AVAudioPlayer?
     private var timer: Timer?
     private var offset = 0.0
+    // Previews left behind by quitting mid-render. An hour old, so one another deck view is rendering is left alone.
+    private static let leftovers: Void = AppPaths.clear("previews", olderThan: 3600)
 
     func renderAndPlay(_ items: [MixRenderer.Item], startTime: Double, tail: Double, offset: Double) {
         stop()
+        _ = Self.leftovers
         isRendering = true
         self.offset = offset
-        let url = AppPaths.cacheDir("previews").appendingPathComponent(UUID().uuidString + ".wav")
+        let url = AppPaths.cacheDir("previews").appendingPathComponent(UUID().uuidString + ".m4a")
         Task.detached {
             do {
                 _ = try MixRenderer.render(items, startTime: startTime, tail: tail, to: url)
@@ -740,6 +743,9 @@ final class PreviewPlayer: ObservableObject {
 
     private func play(_ url: URL) {
         isRendering = false
+        // The player holds the file open, which keeps it readable once it is unlinked, so the preview is gone from
+        // the cache the moment it stops.
+        defer { try? FileManager.default.removeItem(at: url) }
         guard let p = try? AVAudioPlayer(contentsOf: url) else { return }
         player = p
         p.play()

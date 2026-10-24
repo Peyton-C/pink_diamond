@@ -8,7 +8,7 @@ import Foundation
 /// so it renders single-transition previews and whole-playlist mixes.
 final class MixRenderer {
     struct Item {
-        let audio: URL                 // playable file (stem mixdowns already extracted)
+        let audio: URL                 // the song's file; a stem file plays its first track, the mixdown
         let beats: [Double]
         let entering: TransitionSide?  // this song's side of the transition into it
         let leaving: TransitionSide?   // this song's side of the transition out of it
@@ -17,8 +17,8 @@ final class MixRenderer {
         /// everything after it later, the side that leaves the song included.
         var loops: [SongLoop] = []
         /// The song's four stems (drums, bass, other, vocals), played in place of `audio` and mixed by the sides'
-        /// `stem_` automations. Empty plays `audio`, which is all Apple's AutoMix has.
-        var stems: [URL] = []
+        /// `stem_` automations. Nil plays `audio`, which is all Apple's AutoMix has.
+        var stems: AudioSource.Stems?
         /// Semitones the whole song is shifted by, to bring its key to the next song's. 0 is all Apple's AutoMix has.
         var pitch = 0.0
     }
@@ -55,13 +55,20 @@ final class MixRenderer {
         let deckIn: Double?     // the incoming song's song time, once it has started
     }
 
-    /// Renders `items` in sequence to a file. See `render(_:startTime:tail:progress:write:)`.
+    /// Renders `items` in sequence to a file, handing each block to `observe` as well. A `.wav` path is written as
+    /// float WAV, which only the app's export asks for; anything else is 256 kbps AAC, about a twelfth the size,
+    /// for previews and the MCP server's renders, which are listened to and thrown away. See
+    /// `render(_:startTime:tail:progress:write:)`.
     static func render(_ items: [Item], startTime: Double, tail: Double?, to output: URL,
-                       progress: ((Double) -> Void)? = nil) throws -> Double {
-        let file = try AVAudioFile(forWriting: output, settings: format.settings)
+                       progress: ((Double) -> Void)? = nil, observe: ((AVAudioPCMBuffer) -> Void)? = nil) throws -> Double {
+        let settings: [String: Any] = output.pathExtension.lowercased() == "wav" ? format.settings : [
+            AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: sampleRate, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 256_000,
+        ]
+        let file = try AVAudioFile(forWriting: output, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
         defer { file.close() }
         return try render(items, startTime: startTime, tail: tail, progress: progress) { buffer, _ in
             try file.write(from: buffer)
+            observe?(buffer)
             return true
         }
     }
@@ -290,7 +297,7 @@ private final class Chain {
     /// stop (Womanizer with a stem lane, last of ten: a 32-minute file for a 14:37 mix).
     var ended: Bool { position >= Double(remixes ? frames : min(frames, audio.map { Int($0.frameLength) } ?? frames)) }
     /// Whether the song is read through `fill` rather than copied straight from the file.
-    var remixes: Bool { !loops.isEmpty || !item.stems.isEmpty }
+    var remixes: Bool { !loops.isEmpty || item.stems != nil }
 
     init(item: MixRenderer.Item, slot: Slot) throws {
         self.item = item
@@ -302,11 +309,11 @@ private final class Chain {
 
     func load() throws {
         guard audio == nil, !finished else { return }
-        if item.stems.isEmpty {
-            audio = try AudioSource.loadPCM(item.audio)
-        } else {
-            stems = try item.stems.map(AudioSource.loadPCM)
+        if let source = item.stems {
+            stems = try source.decode()
             audio = stems.first
+        } else {
+            audio = try AudioSource.loadPCM(item.audio)
         }
         slot.claim(self)
     }
