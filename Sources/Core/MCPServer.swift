@@ -20,7 +20,17 @@ final class MCPServer {
         var keyShift = 0             // semitones the whole song plays shifted by
         var gainDB = 0.0             // on top of Sound Check
         var stemLabels: [String]?    // a stem file's own names for its stems, when they aren't the stock four
+        var mashup: Mashup?
         let analysis: SongAnalysis
+    }
+
+    /// What a mashup is made of, from three iTunes freeform atoms the user writes (MASHUP_FORM, MASHUP_VOCALS,
+    /// MASHUP_BEAT). Its title says which songs are in it but not whose beat carries it, and the beat is what
+    /// sets its tempo and feel. Songs are separated by " | " because titles hold commas: "yes, and?".
+    private struct Mashup {
+        var form: String?        // blend: several songs' beats heavily present; overlay: one main beat
+        var vocals: [String]
+        var beat: [String]
     }
 
     /// What a song is like to hear, which nothing in its analysis says. An agent writes it once with tag_songs, in a
@@ -269,7 +279,7 @@ final class MCPServer {
                   "folders": ids("Folders to search, with their subfolders. Defaults to ~/Music/Stereo Stems"),
                   "marker": string("The source that would be made, as a stem file's marker without brackets, such as RF AT")],
                  required: ["songs"]),
-            tool("list_songs", "Search the songs added this session: id, title, artist, year of release when the file has it, BPM, key, length in seconds, planner_genre when it is not Pop, and for a stem file where its stems came from when the title doesn't end with it: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them, so search for what you want rather than paging through everything. planner_genre is the set_genre setting and says nothing about how a song sounds; go by the tags for that, and by the title, artist and year where a song has none. A tagged song has its energy from 1 to 10, its style, what its lyrics are about, and mood_clash when it sounds happier or sadder than its words.",
+            tool("list_songs", "Search the songs added this session: id, title, artist, year of release when the file has it, BPM, key, length in seconds, planner_genre when it is not Pop, and for a stem file where its stems came from when the title doesn't end with it: Official, FN, RF AT, DE AT, RF, DE or stemgen, cleanest first. Returns the total that match and up to `limit` of them, so search for what you want rather than paging through everything. planner_genre is the set_genre setting and says nothing about how a song sounds; go by the tags for that, and by the title, artist and year where a song has none. A tagged song has its energy from 1 to 10, its style, what its lyrics are about, and mood_clash when it sounds happier or sadder than its words. A mashup whose file says what it is made of has mashup: the songs whose vocals and whose beat it uses, main one first, and its form, blend when several songs' beats are heavily present or overlay when one beat carries it. Its tempo and feel are its beat's.",
                  ["query": string("Words that must all appear in the title, artist or path"),
                   "bpm_min": number("Lowest BPM"), "bpm_max": number("Highest BPM"),
                   "key": string("A key as list_songs shows it, such as G minor"), "genre": string("A planner genre set_genre takes"),
@@ -569,9 +579,16 @@ final class MCPServer {
         // identifier. A bare year or a dashed date is the release. Eight digits run together is the day a video
         // was uploaded, which yt-dlp writes in the same tag: Flashing Lights, from 2007, carries 20190215.
         let dates: [AVMetadataIdentifier] = [.iTunesMetadataReleaseDate, .id3MetadataYear, .id3MetadataRecordingTime, .quickTimeMetadataYear]
+        var mashup: [String: String] = [:]
         for item in (try? await asset.load(.metadata)) ?? [] {
-            guard let identifier = item.identifier, dates.contains(identifier), let value = try? await item.load(.stringValue) else { continue }
-            if value.count == 4 || value.dropFirst(4).hasPrefix("-") { song.year = Int(value.prefix(4)) }
+            guard let identifier = item.identifier, let value = try? await item.load(.stringValue) else { continue }
+            if dates.contains(identifier), value.count == 4 || value.dropFirst(4).hasPrefix("-") { song.year = Int(value.prefix(4)) }
+            // A freeform atom "----:com.apple.iTunes:MASHUP_FORM" is named with a dot in place of the colon here.
+            if identifier.rawValue.hasPrefix("itlk/com.apple.iTunes.MASHUP_") { mashup[String(identifier.rawValue.dropFirst(29))] = value }
+        }
+        if !mashup.isEmpty {
+            let songs = { (key: String) in (mashup[key] ?? "").components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
+            song.mashup = Mashup(form: mashup["FORM"], vocals: songs("VOCALS"), beat: songs("BEAT"))
         }
         // As the app's library: only on adding, so a genre set since with set_genre or load_set is kept.
         if let tagged = await Genre.tagged(in: asset) { song.genre = tagged }
@@ -720,6 +737,11 @@ final class MCPServer {
         var json: [String: Any] = ["id": s.id, "title": s.title, "artist": s.artist, "planner_genre": s.genre.rawValue,
                                    "bpm": s.analysis.bpm, "key": key(s), "duration": r(s.analysis.duration)]
         if let year = s.year { json["year"] = year }
+        if let m = s.mashup {
+            var mashup: [String: Any] = ["vocals": m.vocals, "beat": m.beat]
+            mashup["form"] = m.form
+            json["mashup"] = mashup
+        }
         if let source = stemSource(s) { json["stems"] = source.name }
         if s.keyShift != 0 { json["key_shift"] = s.keyShift }
         if s.gainDB != 0 { json["gain_db"] = r(s.gainDB) }
