@@ -2,6 +2,7 @@
 # Builds "pink diamond.app" into build/. Needs macOS 27 and Xcode (SwiftUI, MusicUnderstanding).
 #   ./bundle.sh            build
 #   ./bundle.sh --install  and copy it to /Applications
+#   ./bundle.sh --test     build Core with Tests/ instead of the UI, and run the tests
 set -e
 cd "${0:A:h}"
 APP_NAME="pink diamond"
@@ -12,6 +13,11 @@ TARGET=arm64-apple-macos27.0
 
 rm -rf build/obj && mkdir -p build/obj
 xcrun clang -target $TARGET -c Sources/Core/Trampoline.s -o build/obj/Trampoline.o
+if [[ "$1" == "--test" ]]; then
+    xcrun swiftc -target $TARGET -O -swift-version 5 -parse-as-library -module-name PinkDiamond \
+        Sources/Core/*.swift Tests/*.swift build/obj/Trampoline.o -o build/obj/tests
+    exec build/obj/tests
+fi
 xcrun swiftc -target $TARGET -O -swift-version 5 -parse-as-library -module-name PinkDiamond \
     Sources/Core/*.swift Sources/UI/*.swift build/obj/Trampoline.o \
     -o build/obj/pinkdiamond

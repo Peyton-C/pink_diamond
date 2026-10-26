@@ -10,7 +10,7 @@ import Foundation
 /// The protocol is written out by hand (newline-delimited JSON-RPC, three methods) because `bundle.sh` compiles the
 /// sources directly and has no way to pull in the MCP SDK.
 final class MCPServer {
-    private struct Entry {
+    struct Entry {
         let id: String
         let path: String
         var title: String
@@ -27,7 +27,7 @@ final class MCPServer {
     /// What a mashup is made of, from three iTunes freeform atoms the user writes (MASHUP_FORM, MASHUP_VOCALS,
     /// MASHUP_BEAT). Its title says which songs are in it but not whose beat carries it, and the beat is what
     /// sets its tempo and feel. Songs are separated by " | " because titles hold commas: "yes, and?".
-    private struct Mashup {
+    struct Mashup {
         var form: String?        // blend: several songs' beats heavily present; overlay: one main beat
         var vocals: [String]
         var beat: [String]
@@ -38,7 +38,7 @@ final class MCPServer {
     /// by what it knows of the songs, and did while the set was short: deep into a long one it chose on the numbers
     /// in the row, and put One More Time into Love Story and Lipgloss into Flowers, which match on key and tempo.
     /// Written into the row, what it knows is there to read however much it is carrying.
-    private struct Tag: Codable {
+    struct Tag: Codable {
         var energy: Int?         // 1 to 10
         var style: String?
         var lyrics: String?      // what the words are about and how they feel
@@ -48,7 +48,7 @@ final class MCPServer {
     }
 
     private var songs: [Entry] = []
-    private var tags: [String: Tag] = [:]                   // by `name`, so every version of a song has the one tag
+    var tags: [String: Tag] = [:]                   // by `name`, so every version of a song has the one tag
     private var basePlans: [String: TransitionPlan] = [:]   // Apple's plans, by plan key and variant
     private var edits: [String: TransitionEdit] = [:]       // by plan key
     private var moves: [String: String] = [:]               // the exit and entry moves a transition was built from, by plan key
@@ -637,7 +637,7 @@ final class MCPServer {
 
     /// One file as a song: its analysis from the cache or made now, and its tags. Nil when the analysis isn't cached
     /// and `analyze` is off. Static and touching none of the server's state, so `add` can run several at once.
-    private static func load(_ url: URL, analyze: Bool) async throws -> Entry? {
+    static func load(_ url: URL, analyze: Bool) async throws -> Entry? {
         let key = fileKey(url)
         // The app's analysis cache, by the same key and under the same catalog ID, so a song analyzed by
         // either is ready in both.
@@ -857,7 +857,7 @@ final class MCPServer {
     /// Read again before every call that uses them and not once at launch. Several servers run at a time, one for
     /// each client session, and each writes the whole file: one that had held its tags since launch put back 59
     /// entries cleared on disk, and would have dropped whatever another session had tagged since.
-    private func readTags() {
+    func readTags() {
         tags = (try? Data(contentsOf: AppPaths.tags)).flatMap { try? JSONDecoder().decode([String: Tag].self, from: $0) } ?? [:]
     }
 
@@ -901,7 +901,7 @@ final class MCPServer {
 
     /// Where a stem file's stems came from and how they rank, as the app's library reads it (`StemSource`). A
     /// cleaner separation is the better one to pull a vocal or the drums out of.
-    private func stemSource(_ s: Entry) -> (name: String, rank: Int)? {
+    func stemSource(_ s: Entry) -> (name: String, rank: Int)? {
         guard AudioSource.isStem(URL(fileURLWithPath: s.path)) else { return nil }
         let source = StemSource.of(title: s.title, path: s.path)
         return (source.label, source.rank)
@@ -909,7 +909,7 @@ final class MCPServer {
 
     /// What one song is called whichever version it is: its artist and its title without the bracketed tags at
     /// the end, such as (FN) or (Official).
-    private func name(_ s: Entry) -> String {
+    func name(_ s: Entry) -> String {
         let title = s.title.replacingOccurrences(of: #"(\s*[\(\[][^\)\]]*[\)\]])+\s*$"#, with: "", options: .regularExpression)
         return "\(s.artist)|\(title)".lowercased()
     }
@@ -1119,21 +1119,21 @@ final class MCPServer {
 
     /// A song's sections as get_song numbers them, from 1: Apple's section starts, with the song's start put in
     /// front when the first one is later than that.
-    private func sections(_ s: Entry) -> [(lo: Double, hi: Double)] {
+    func sections(_ s: Entry) -> [(lo: Double, hi: Double)] {
         let a = s.analysis
         let starts = a.sections.first.map { $0 > 0.5 ? [0] + a.sections : a.sections } ?? [0]
         return Array(zip(starts, starts.dropFirst() + [a.duration]))
     }
 
     /// A stretch's loudness against the whole song in dB, from Apple's loudness curve, leaving out silence.
-    private func loudness(_ s: Entry, from lo: Double, to hi: Double) -> Double? {
+    func loudness(_ s: Entry, from lo: Double, to hi: Double) -> Double? {
         let levels = curve(s).enumerated().filter { 0.5 * Double($0.offset + 1) >= lo && 0.5 * Double($0.offset + 1) < hi && $0.element > -70 }.map(\.element)
         guard !levels.isEmpty, let l = s.analysis.loudness else { return nil }
         return levels.reduce(0, +) / Double(levels.count) - l.integrated
     }
 
     /// The share of a stretch that has vocals, from the analysis.
-    private func sung(_ s: Entry, from lo: Double, to hi: Double) -> Double {
+    func sung(_ s: Entry, from lo: Double, to hi: Double) -> Double {
         guard hi > lo else { return 0 }
         return s.analysis.vocals.map { max(0, min($0.upperBound, hi) - max($0.lowerBound, lo)) }.reduce(0, +) / (hi - lo)
     }
@@ -1147,12 +1147,17 @@ final class MCPServer {
     /// groove, at the bar before the breakdown, and inside it, and the breakdown, with its drums gone, is what
     /// matches Love Story's energy. It shows in the stems at once, as `drums` dropping out of this list.
     private func plays(_ s: Entry, from lo: Double, to hi: Double) -> String? {
-        guard let levels = stemLevels[s.id] else { return nil }
-        let peaks = stemPeaks[s.id] ?? AudioSource.stemNames.indices.map { k in
-            // Sections of a couple of bars or more, so a one-bar hit at the end doesn't set the peak.
-            sections(s).filter { $0.hi - $0.lo >= 4 }.map { level(levels[k], s, from: $0.lo, to: $0.hi) }.max() ?? -100
-        }
-        stemPeaks[s.id] = peaks
+        guard let (up, low) = stemsPlaying(s, from: lo, to: hi) else { return nil }
+        // Named in full for a song with its own stem names, or "all" would hide the sax.
+        if up.count == 4, s.stemLabels == nil { return "all" }
+        if low.count == 4, s.stemLabels == nil { return "all low" }
+        if up.isEmpty && low.isEmpty { return "nothing" }
+        return (up + (low.isEmpty ? [] : ["(low: " + low.joined(separator: " ") + ")"])).joined(separator: " ")
+    }
+
+    /// The stems up and low in a stretch, as `plays` judges them, each by the song's own name for it.
+    func stemsPlaying(_ s: Entry, from lo: Double, to hi: Double) -> (up: [String], low: [String])? {
+        guard let levels = stemLevels[s.id], let peaks = self.peaks(s) else { return nil }
         var up: [String] = [], low: [String] = []
         for (k, code) in AudioSource.stemNames.enumerated() where peaks[k] > -50 {   // a stem the song barely has is never up
             // In the song's own words where it has them, so a sax reads as sax and not as other.
@@ -1160,11 +1165,18 @@ final class MCPServer {
             let under = peaks[k] - level(levels[k], s, from: lo, to: hi)
             if under <= 6 { up.append(name) } else if under <= 18 { low.append(name) }
         }
-        // Named in full for a song with its own stem names, or "all" would hide the sax.
-        if up.count == 4, s.stemLabels == nil { return "all" }
-        if low.count == 4, s.stemLabels == nil { return "all low" }
-        if up.isEmpty && low.isEmpty { return "nothing" }
-        return (up + (low.isEmpty ? [] : ["(low: " + low.joined(separator: " ") + ")"])).joined(separator: " ")
+        return (up, low)
+    }
+
+    /// Each stem's level in the song's loudest section for it, which `plays` judges every stretch against.
+    func peaks(_ s: Entry) -> [Double]? {
+        guard let levels = stemLevels[s.id] else { return nil }
+        let peaks = stemPeaks[s.id] ?? AudioSource.stemNames.indices.map { k in
+            // Sections of a couple of bars or more, so a one-bar hit at the end doesn't set the peak.
+            sections(s).filter { $0.hi - $0.lo >= 4 }.map { level(levels[k], s, from: $0.lo, to: $0.hi) }.max() ?? -100
+        }
+        stemPeaks[s.id] = peaks
+        return peaks
     }
 
     /// One section in a line: its number, what plays in it (or for a file without stems, how much has vocals) and
@@ -1435,17 +1447,23 @@ final class MCPServer {
 
     // MARK: What is heard
 
-    private var stemLevels: [String: [[Double]]] = [:]   // by song id: each stem's level in dB over each beat
+    var stemLevels: [String: [[Double]]] = [:]   // by song id: each stem's level in dB over each beat
     private var curves: [String: [Double]] = [:]         // by song id: Apple's loudness curve
 
     /// Each stem's level over each beat of the song (from that beat to the next), in dB below full scale. Measured
     /// once per file and kept in the cache: it means decoding all four stems.
     private func levels(ofStems s: Entry) async throws -> [[Double]] {
         if let known = stemLevels[s.id] { return known }
+        let all = try await Self.measureStems(s)
+        stemLevels[s.id] = all
+        return all
+    }
+
+    /// `levels(ofStems:)` without the server's memory of them, so the metadata export can measure several at once.
+    static func measureStems(_ s: Entry) async throws -> [[Double]] {
         let url = URL(fileURLWithPath: s.path)
         let cache = AppPaths.cacheDir("stem-levels").appendingPathComponent(fileKey(url) + ".json")
         if let saved = (try? Data(contentsOf: cache)).flatMap({ try? JSONDecoder().decode([[Double]].self, from: $0) }), saved.count == 4 {
-            stemLevels[s.id] = saved
             return saved
         }
         let beats = s.analysis.beats
@@ -1464,7 +1482,6 @@ final class MCPServer {
             })
         }
         try? JSONEncoder().encode(all).write(to: cache)
-        stemLevels[s.id] = all
         return all
     }
 
@@ -2301,5 +2318,5 @@ final class MCPServer {
 
     /// Rounded to the millisecond to keep responses short, and never non-finite, which JSONSerialization can't write.
     /// As a decimal number, because JSONSerialization writes a Double out to 17 digits (268.1 as 268.10000000000002).
-    private func r(_ x: Double) -> NSNumber { NSDecimalNumber(string: String(x.isFinite ? (x * 1000).rounded() / 1000 : 0)) }
+    func r(_ x: Double) -> NSNumber { NSDecimalNumber(string: String(x.isFinite ? (x * 1000).rounded() / 1000 : 0)) }
 }

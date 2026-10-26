@@ -4,12 +4,16 @@ import SwiftUI
 struct Main {
     static func main() {
         let args = Array(CommandLine.arguments.dropFirst())
-        if args.first == "--selftest" || args.first == "--mcp" {
+        if args.first == "--selftest" || args.first == "--mcp" || args.first == "--export-metadata" {
             let done = DispatchSemaphore(value: 0)
             var status: Int32 = 0
             Task.detached {
                 let value = { (flag: String) in args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
-                status = args.first == "--mcp" ? await MCPServer(extensions: !args.contains("--automix-only"), renders: value("--renders"), brand: value("--brand").map(MCPServer.Brand.init)).run() : await SelfTest.run(Array(args.dropFirst()))
+                switch args.first {
+                case "--mcp": status = await MCPServer(extensions: !args.contains("--automix-only"), renders: value("--renders"), brand: value("--brand").map(MCPServer.Brand.init)).run()
+                case "--export-metadata": status = await MCPServer.exportMetadata(Array(args.dropFirst()))
+                default: status = await SelfTest.run(Array(args.dropFirst()))
+                }
                 done.signal()
             }
             done.wait()

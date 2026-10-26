@@ -9,11 +9,14 @@ Needs macOS 27 and Xcode 27.
 ```sh
 ./bundle.sh            # build/pink diamond.app
 ./bundle.sh --install  # and copy it to /Applications
+./bundle.sh --test     # build Core with the tests and run them
 ```
 
 `pink diamond --selftest <from> <to> [out.wav] [from genre] [to genre]` runs the whole pipeline without the UI.
 
 `pink diamond --mcp` runs it as an MCP server, so an agent can plan, edit and render transitions. See [docs/mcp.md](docs/mcp.md).
+
+`pink diamond --export-metadata <out.json> [files or folders]` writes the analysis of a crate to one file, for other DJ apps to read. See [docs/metadata.md](docs/metadata.md).
 
 ## Use
 - **Library**: drop in audio files, Native Instruments `.stem.mp4` files, or whole folders. Each song is analyzed once (tempo, beats, bars, sections, key, loudness, vocals). Browse by Songs, Artists, Albums or Genres with the tabs in the toolbar; cover art comes from each file's tags, and every column sorts. pink diamond looks through the folders you add for new files, keeps one row per song and plays the best version it has, replacing it when a better one turns up or its file is gone. See [docs/library.md](docs/library.md). A song's genre comes from its genre tag when that names one of Apple's twelve (Pop, Dance, Hip-Hop/Rap, R&B/Soul, Electronic, Alternative, Rock, Country, Latin, K-Pop, Reggae, Singer/Songwriter) and is Pop otherwise; change it in the Genre column. Keys show in Mixxx's key colours, in Lancelot (8A) or musical (Am) names, set in Settings.
@@ -35,7 +38,9 @@ Needs macOS 27 and Xcode 27.
 | `Sources/Core/MixEdit.swift` | Transition edits applied over the plan: moved and stretched sides, replaced or added automation, planner variants, and the MCP server's loops, tails and stem levels |
 | `Sources/Core/MixRenderer.swift` | Offline AVAudioEngine rebuilding the plan's DSP graph per song, including Apple's private AURemixFX |
 | `Sources/Core/MCPServer.swift` | The `--mcp` server: its own songs and edits over the same analysis, planner and renderer |
+| `Sources/Core/MetadataExport.swift` | `--export-metadata`: the crate's analysis in one file, as `get_song` gives it, in seconds |
 | `Sources/Core/MixPlayer.swift` | Playlist playback: runs the renderer ahead of a realtime engine |
 | `Sources/UI/` | SwiftUI: library, playlists, deck view |
+| `Tests/` | Tests of Core, built with it by `./bundle.sh --test` |
 
 Data lives in `~/Library/Application Support/pink diamond/` (library, playlists, transition edits) and `~/Library/Caches/pink diamond/` (analysis, cover art, stem levels, and previews and MCP renders until they are cleared).
