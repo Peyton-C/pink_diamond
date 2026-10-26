@@ -61,14 +61,16 @@ final class MCPServer {
     /// Whether the server offers what Apple's AutoMix has no counterpart for: stems, loops and outgoing tails. Off,
     /// an agent can do what the app's editor can and no more.
     private let extensions: Bool
-    private lazy var tools = Self.tools(extensions: extensions)
+    private let brand: Brand?
+    private lazy var tools = Self.tools(extensions: extensions).map { say($0) as! [String: Any] }
     private let output: FileHandle
 
     /// Frameworks under the planner and renderer may print, and anything on stdout that isn't a response breaks the
     /// client's parser, so responses go to a copy of stdout and descriptor 1 is pointed at stderr.
-    init(extensions: Bool, renders: String?) {
+    init(extensions: Bool, renders: String?, brand: Brand? = nil) {
         self.extensions = extensions
-        self.renders = URL(fileURLWithPath: ((renders ?? "~/Music/pink diamond") as NSString).expandingTildeInPath)
+        self.brand = brand
+        self.renders = URL(fileURLWithPath: ((renders ?? "~/Music/\(brand?.folder ?? AppPaths.appName)") as NSString).expandingTildeInPath)
         output = FileHandle(fileDescriptor: dup(STDOUT_FILENO))
         dup2(STDERR_FILENO, STDOUT_FILENO)
     }
@@ -82,6 +84,91 @@ final class MCPServer {
         }
         return 0
     }
+
+    // MARK: Brand
+
+    /// `--brand`: the server goes by another name, for seeing how what a model knows of a DJ app changes what it does.
+    /// A model knows nothing of pink diamond, and the name leads it to Charli XCX's song of that name, but it knows
+    /// rekordbox or Serato. Only the server's own words change: song titles, tags and file paths in replies stay as they
+    /// are, which is why the match below is case-sensitive, since that song's title is "Pink Diamond".
+    ///
+    /// A DJ app's brand has to read as the app's own feature, so the planner goes by that app's name for it (Cruise
+    /// Mode, Auto DJ) rather than Automix everywhere, and nothing is set apart as beyond some streaming service's
+    /// feature: under `--automix-only` what is left out is just not in this version. Only a brand that, like pink
+    /// diamond, reproduces a service's feature keeps that split.
+    struct Brand {
+        let name: String     // in a sentence
+        let start: String    // at the start of one
+        let server: String   // in the handshake
+        let folder: String   // under ~/Music, for named renders
+        private let phrases: [(String, String)]   // in order, before the name itself
+
+        /// Each DJ app's name and what it calls planning transitions itself. Where the app has no such feature, the
+        /// name is made up in its style.
+        static let apps: [String: (name: String, feature: String)] = [
+            "serato": ("Serato DJ Pro", "Autoplay"), "ableton": ("Ableton Live", "Warp Transitions"),
+            "rekordbox": ("rekordbox", "Automix"), "engine": ("Engine DJ", "Auto DJ"), "traktor": ("Traktor Pro", "Cruise Mode"),
+            "djay": ("djay Pro", "Automix"), "mixxx": ("Mixxx", "Auto DJ"), "virtualdj": ("VirtualDJ", "Automix"),
+            "generic-branded": ("Fadeline", "Smart Blend"),
+            "slop": ("SynapseMix AI Pro", "Generative Neural AutoBlend™ Copilot"),
+            // Morph is PowerPoint's own transition, and Help me mix is Gemini's Help me write in Docs and Gmail.
+            "microsoft": ("Microsoft PowerMix 365", "Morph"), "google": ("Google Decks", "Help me mix"),
+        ]
+
+        /// A key from `apps`; `immaterial`, pink diamond's counterpart for Spotify's Mix; `generic` for no product at
+        /// all; or any other name, used as given.
+        init(_ arg: String) {
+            let key = arg.lowercased()
+            if key == "immaterial" {
+                // Named, as pink diamond is, for a SOPHIE song.
+                (name, start, server, folder) = ("immaterial", "immaterial", "immaterial", "immaterial")
+                phrases = [("Apple Music", "Spotify"), ("Apple's AutoMix", "Spotify's Mix"), ("Apple", "Spotify")]
+                return
+            }
+            let refused = "beyond Apple's AutoMix, and this server is running without extensions"
+            let catalog = ("as Apple Music names them", "as streaming services name them")
+            if key == "generic" {
+                (name, start, server, folder) = ("the server", "The server", "dj", "DJ Renders")
+                phrases = [catalog, (refused, "not available on this server"), ("where Apple planned", "where the planner put"),
+                           ("Apple's planner", "the planner"), ("Apple's own plan", "the planner's own plan"), ("Apple's plan", "the planner's plan")]
+                return
+            }
+            let (name, feature) = Self.apps[key] ?? (arg, "")
+            // Its own folder and not the app's: ~/Music/rekordbox and the like are real apps' folders.
+            (self.name, start, server, folder) = (name, name, name, name + " Renders")
+            let possessive = name.hasSuffix("s") ? "\(name)'" : "\(name)'s"   // Google Decks', not Decks's
+            let planner = feature.isEmpty ? "\(possessive) planner" : "\(possessive) \(feature)"
+            let plan = feature.isEmpty ? "\(possessive) own plan" : "the \(feature) plan"
+            phrases = [catalog, (refused, "not available in this version of \(name)"), ("where Apple planned", "where \(feature.isEmpty ? name : feature) planned"),
+                       ("Apple's planner", planner), ("Apple's own plan", plan), ("Apple's plan", plan),
+                       ("pink diamond's", possessive)]
+        }
+
+        func say(_ text: String) -> String {
+            let text = phrases.reduce(text) { $0.replacingOccurrences(of: $1.0, with: $1.1) }
+            // pink diamond is lowercase everywhere, so only the generic name needs a capital at a sentence's start.
+            var parts = text.components(separatedBy: "pink diamond")
+            for i in parts.indices.dropFirst() {
+                let before = parts[i - 1]
+                let atStart = before.isEmpty || before.hasSuffix(". ") || before.hasSuffix("\n")
+                parts[i] = (atStart ? start : name) + parts[i]
+            }
+            return parts.joined()
+        }
+    }
+
+    /// What the server says, under its brand when it has one. Applied to every string in a tool's schema.
+    private func say(_ value: Any) -> Any {
+        guard let brand else { return value }
+        switch value {
+        case let s as String: return brand.say(s)
+        case let a as [Any]: return a.map(say)
+        case let d as [String: Any]: return d.mapValues(say)
+        default: return value
+        }
+    }
+
+    private func say(_ text: String) -> String { brand?.say(text) ?? text }
 
     // MARK: Protocol
 
@@ -102,15 +189,15 @@ final class MCPServer {
             let asked = params["protocolVersion"] as? String ?? ""
             result = ["protocolVersion": Self.protocolVersions.contains(asked) ? asked : Self.protocolVersions[0],
                       "capabilities": ["tools": [String: Any](), "prompts": [String: Any]()],
-                      "serverInfo": ["name": "pink diamond", "version": "1.0.0"],
-                      "instructions": "pink diamond knows only the songs added this session with add_songs; list_songs, plan_set and the rest search nothing else. Start a session by adding ~/Music/Stereo Stems. Songs already analyzed come from the cache, so adding the folders again is quick."]
+                      "serverInfo": ["name": brand?.server ?? AppPaths.appName, "version": "1.0.0"],
+                      "instructions": say("pink diamond knows only the songs added this session with add_songs; list_songs, plan_set and the rest search nothing else. Start a session by adding ~/Music/Stereo Stems. Songs already analyzed come from the cache, so adding the folders again is quick.")]
         case "ping":
             result = [:]
         case "tools/list":
             result = ["tools": tools]
         case "prompts/list":
             result = ["prompts": Self.prompts.map { p in
-                ["name": p.name, "description": p.description,
+                ["name": p.name, "description": say(p.description),
                  "arguments": p.arguments.map { ["name": $0.name, "description": $0.description, "required": $0.required] }] as [String: Any]
             }]
         case "prompts/get":
@@ -121,8 +208,8 @@ final class MCPServer {
             if let missing = prompt.arguments.first(where: { $0.required && given[$0.name] == nil }) {
                 return ["jsonrpc": "2.0", "id": id, "error": ["code": -32602, "message": "\(prompt.name) needs \(missing.name)"]]
             }
-            result = ["description": prompt.description,
-                      "messages": [["role": "user", "content": ["type": "text", "text": prompt.text(given)]]]]
+            result = ["description": say(prompt.description),
+                      "messages": [["role": "user", "content": ["type": "text", "text": say(prompt.text(given))]]]]
         case "tools/call":
             let name = params["name"] as? String ?? "", started = Date()
             var text: String, failed = false
@@ -141,7 +228,7 @@ final class MCPServer {
                 let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
                 text = String(decoding: data, as: UTF8.self)
             } catch {
-                (text, failed) = (String(describing: error), true)
+                (text, failed) = (say(String(describing: error)), true)
             }
             result = ["content": [["type": "text", "text": text]], "isError": failed]
             // A reply stays in the agent's context and is read again on every later call, so what a session costs
@@ -496,7 +583,7 @@ final class MCPServer {
             } else if audioExtensions.contains(url.pathExtension.lowercased()) {
                 files.append(url)
             } else {
-                failed.append(["path": path, "error": "not an audio file pink diamond reads"])
+                failed.append(["path": path, "error": say("not an audio file pink diamond reads")])
             }
         }
         // Two passes, as the app's library does it: cached analyses are read 8 at a time, which is only decoding
@@ -1959,13 +2046,16 @@ final class MCPServer {
         }
         let saved = SavedSet(songs: list.map { .init(path: $0.path, genre: $0.genre, keyShift: $0.keyShift, gainDB: $0.gainDB) },
                              transitions: transitions.sorted { ($0.from, $0.to) < ($1.from, $1.to) },
-                             saved: .init(at: ISO8601DateFormatter().string(from: Date()), client: client.name, clientVersion: client.version, run: run))
+                             saved: .init(at: ISO8601DateFormatter().string(from: Date()), client: client.name, clientVersion: client.version, run: run, brand: brand?.name))
         try FileManager.default.createDirectory(at: setsFolder, withIntermediateDirectories: true)
         let url = setsFolder.appendingPathComponent(Self.fileName(name) + ".json")
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(saved).write(to: url, options: .atomic)
-        return ["name": name, "path": url.path, "songs": list.count, "transitions": transitions.count]
+        var result: [String: Any] = ["name": name, "songs": list.count, "transitions": transitions.count]
+        // The sets folder is under Application Support/pink diamond, so a branded server leaves the path out.
+        if brand == nil { result["path"] = url.path }
+        return result
     }
 
     private func saved(_ name: String) throws -> SavedSet {
@@ -2015,7 +2105,12 @@ final class MCPServer {
             let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
             return ["wav", "m4a"].contains(url.pathExtension.lowercased()) ? url : url.appendingPathExtension("m4a")
         }
-        guard let name = args["name"] as? String, !name.isEmpty else { return AppPaths.cacheDir("mcp").appendingPathComponent(UUID().uuidString + ".m4a") }
+        guard let name = args["name"] as? String, !name.isEmpty else {
+            // The cache is under Caches/pink diamond, which a branded server's replies must not show, so its unnamed
+            // renders go in the system's temporary folder, which macOS clears itself.
+            let folder = brand == nil ? AppPaths.cacheDir("mcp") : FileManager.default.temporaryDirectory
+            return folder.appendingPathComponent(UUID().uuidString + ".m4a")
+        }
         // In a folder of the run's own once save_set has been given one, so runs going at once keep their renders apart.
         let folder = run.map { renders.appendingPathComponent(Self.fileName($0)) } ?? renders
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

@@ -12,6 +12,30 @@ Add `--automix-only` after `--mcp` to leave out everything Apple's AutoMix has n
 
 Add `--renders <folder>` to choose where named renders go. Without it they go to `~/Music/pink diamond`.
 
+Add `--brand <name>` to have the server present itself as another DJ app, to see how what a model knows of that app changes what it does. pink diamond then uses that name in its handshake, instructions, tool descriptions, prompts and errors, in place of its own and Apple's. Song titles, tags and file paths are left as they are. Saved sets record the brand.
+
+A DJ app's brand presents the planner as that app's own feature, and under `--automix-only` what is left out is simply not in this version, with no mention of Apple or extensions. Only `immaterial` keeps that split, since it reproduces Spotify's Mix as pink diamond reproduces Apple's AutoMix.
+
+| Brand | Name | Planner |
+| --- | --- | --- |
+| `serato` | Serato DJ Pro | Autoplay |
+| `ableton` | Ableton Live | Warp Transitions, made up |
+| `rekordbox` | rekordbox | Automix |
+| `engine` | Engine DJ | Auto DJ |
+| `traktor` | Traktor Pro | Cruise Mode |
+| `djay` | djay Pro | Automix |
+| `mixxx` | Mixxx | Auto DJ |
+| `virtualdj` | VirtualDJ | Automix |
+| `generic-branded` | Fadeline, made up | Smart Blend |
+| `slop` | SynapseMix AI Pro | Generative Neural AutoBlend™ Copilot |
+| `microsoft` | Microsoft PowerMix 365, made up | Morph |
+| `google` | Google Decks, made up | Help me mix |
+| `immaterial` | immaterial | Spotify's planner |
+| `generic` | the server, with no product named | the planner |
+| anything else | the name as given | its planner |
+
+Under a brand, named renders go to `~/Music/<name> Renders` and unnamed ones to the system's temporary folder, and `save_set` leaves out the set's path, since pink diamond's own folders would give the name away. The client still shows the name you registered the server under, and tool names carry it, so register a branded server under a neutral name such as `dj`.
+
 ## Session
 The server keeps its songs, genres and edits in memory and forgets them when it exits, unless they are saved as a set. Tags are kept, see below. It does not read or change the app's library, playlists or saved edits. It shares only the analysis cache, so a song either has analyzed is ready in both. A saved set can be brought into the app, see below.
 

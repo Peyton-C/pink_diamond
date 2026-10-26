@@ -8,7 +8,8 @@ struct Main {
             let done = DispatchSemaphore(value: 0)
             var status: Int32 = 0
             Task.detached {
-                status = args.first == "--mcp" ? await MCPServer(extensions: !args.contains("--automix-only"), renders: args.firstIndex(of: "--renders").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }).run() : await SelfTest.run(Array(args.dropFirst()))
+                let value = { (flag: String) in args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
+                status = args.first == "--mcp" ? await MCPServer(extensions: !args.contains("--automix-only"), renders: value("--renders"), brand: value("--brand").map(MCPServer.Brand.init)).run() : await SelfTest.run(Array(args.dropFirst()))
                 done.signal()
             }
             done.wait()
