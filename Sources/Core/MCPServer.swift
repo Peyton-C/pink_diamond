@@ -377,6 +377,7 @@ final class MCPServer {
                   "any_key": bool("With key_tempo_like, keep songs in a clashing key too, after the others and marked key_clash. They can work when only the drums come in, since every other stem is pitched"),
                   "energy_min": integer("Lowest energy tag, 1 to 10. Leaves out songs with no energy tag"), "energy_max": integer("Highest energy tag"),
                   "untagged": bool("Only songs tag_songs has not been given yet"),
+                  "mood_clash": bool("Only songs tagged mood_clash, or with false only tagged songs without it"),
                   "stems": ids("Only songs whose stems came from one of these, as list_songs shows them: Official, FN, RF AT and so on. any is every stem file, none every file without stems"),
                   "year_min": integer("Earliest year of release. Leaves out songs with no year"), "year_max": integer("Latest year of release"),
                   "random": integer("Draw this many songs at random from what matches, in place of the first ones. 100 at most"),
@@ -976,6 +977,9 @@ final class MCPServer {
                 && (key == nil || self.key(s).lowercased() == key) && (genre == nil || s.genre.rawValue == genre)
         }
         if args["untagged"] as? Bool == true { matches = matches.filter { tags[name($0)] == nil } }
+        if let clash = args["mood_clash"] as? Bool {
+            matches = matches.filter { s in tags[name(s)].map { ($0.moodClash == true) == clash } ?? false }
+        }
         if args["energy_min"] != nil || args["energy_max"] != nil {
             let least = number(args["energy_min"]) ?? 1, most = number(args["energy_max"]) ?? 10
             matches = matches.filter { s in tags[name(s)]?.energy.map { Double($0) >= least && Double($0) <= most } ?? false }
