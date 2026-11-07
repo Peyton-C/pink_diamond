@@ -566,7 +566,7 @@ final class MCPServer {
 
     private func pair(_ args: [String: Any]) throws -> (Entry, Entry) { (try entry(args["from"]), try entry(args["to"])) }
 
-    private func add(_ paths: [String]) async -> [String: Any] {
+    func add(_ paths: [String]) async -> [String: Any] {
         let audioExtensions: Set<String> = ["mp3", "m4a", "mp4", "aac", "wav", "aif", "aiff", "flac", "caf", "alac"]
         var files: [URL] = [], failed: [[String: Any]] = []
         for path in paths {
@@ -966,7 +966,9 @@ final class MCPServer {
         return order.compactMap { at[$0] }.filter { $0.count > 1 }.map { ["title": list[$0[0] - 1].title, "positions": $0] }
     }
 
-    private func list(_ args: [String: Any]) throws -> [String: Any] {
+    /// The songs list_songs answers from, before any are drawn or paged, and which of them are in a clashing key. Apart
+    /// from `list` so that --find-seed searches the very matches an agent's call will draw from.
+    func matching(_ args: [String: Any]) throws -> (songs: [Entry], clashing: Set<String>) {
         readTags()
         let words = (args["query"] as? String ?? "").lowercased().split(separator: " ")
         let low = number(args["bpm_min"]) ?? 0, high = number(args["bpm_max"]) ?? .infinity
@@ -1030,7 +1032,12 @@ final class MCPServer {
         if args["unique"] as? Bool ?? true { matches = unique(matches) }
         // With any key allowed most of the library is in reach (a typical song goes from 16 matches to 101), so
         // the ones that need no help come first and the first page is still the easy choices.
-        matches = matches.filter { !clashing.contains($0.id) } + matches.filter { clashing.contains($0.id) }
+        return (matches.filter { !clashing.contains($0.id) } + matches.filter { clashing.contains($0.id) }, clashing)
+    }
+
+    func list(_ args: [String: Any]) throws -> [String: Any] {
+        let found = try matching(args), clashing = found.clashing, total = found.songs.count
+        var matches = found.songs
         if args["overview"] as? Bool == true { return overview(matches) }
         // Capped, so the whole library can't be asked for in one call: an agent is meant to search it.
         var offset = max(0, Int(number(args["offset"]) ?? 0)), limit = max(1, min(100, Int(number(args["limit"]) ?? 50)))
@@ -1038,14 +1045,14 @@ final class MCPServer {
         if let count = number(args["random"]) {
             // Shuffled from the songs sorted by id and not in the order they were added, so a seed draws the same
             // songs in a later session that added the library in another order. Small enough to pass back exactly.
-            let seed = number(args["seed"]).map { Int($0) } ?? Int.random(in: 0..<1_000_000)
-            var generator = SeededGenerator(seed: UInt64(bitPattern: Int64(seed)))
-            matches = matches.sorted { $0.id < $1.id }.shuffled(using: &generator)
-            offset = 0
+            let seed = number(args["seed"]).map { Int($0) } ?? Int.random(in: 0..<Self.seeds)
             limit = max(1, min(100, Int(count)))
+            let sorted = matches.sorted { $0.id < $1.id }
+            matches = Self.draw(sorted.count, limit, seed: seed).map { sorted[$0] }
+            offset = 0
             drawn = seed
         }
-        var json: [String: Any] = ["total": matches.count, "songs": matches.dropFirst(offset).prefix(limit).map { s -> [String: Any] in
+        var json: [String: Any] = ["total": total, "songs": matches.dropFirst(offset).prefix(limit).map { s -> [String: Any] in
             var json = row(s)
             if clashing.contains(s.id) { json["key_clash"] = true }
             return json
@@ -1054,6 +1061,24 @@ final class MCPServer {
         if args["key_tempo_like"] != nil { json["note"] = "Matched on key and tempo only. Whether a song belongs next to it is yours to judge." }
         if let drawn { json["seed"] = drawn }
         return json
+    }
+
+    /// How many seeds list_songs picks from when it isn't given one. --find-seed searches the same range, so a seed it
+    /// finds looks like one the server would have picked.
+    static let seeds = 1_000_000
+
+    /// The first `count` of `n` songs in the order `seed` shuffles them into, as indices. A Fisher-Yates shuffle run from
+    /// the front and stopped once the songs drawn are settled, which draws what the whole shuffle would. Written out
+    /// here rather than Swift's `shuffled(using:)`, which the standard library doesn't promise to keep the same: a seed
+    /// written into a prompt has to draw the same songs after a toolchain update.
+    static func draw(_ n: Int, _ count: Int, seed: Int) -> [Int] {
+        var generator = SeededGenerator(seed: UInt64(bitPattern: Int64(seed)))
+        var order = Array(0..<n)
+        for i in 0..<min(count, n) {
+            // Multiply-high, a number below n - i from 64 random bits. Its bias is far too small to matter here.
+            order.swapAt(i, i + Int(generator.next().multipliedFullWidth(by: UInt64(n - i)).high))
+        }
+        return Array(order.prefix(count))
     }
 
     /// SplitMix64. Swift's own generator can't be seeded, and a draw has to come out the same from the same seed.

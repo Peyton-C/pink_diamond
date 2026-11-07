@@ -18,6 +18,8 @@ Needs macOS 27 and Xcode 27.
 
 `pink diamond --export-metadata <out.json> [files or folders]` writes the analysis of a crate to one file, for other DJ apps to read. See [docs/metadata.md](docs/metadata.md).
 
+`pink diamond --find-seed '<list_songs arguments>' <song>... [--adjacent] [--library <folder>]` finds a seed under which `list_songs` draws those songs, for a prompt to hand an agent. See [docs/mcp.md](docs/mcp.md).
+
 ## Use
 - **Library**: drop in audio files, Native Instruments `.stem.mp4` files, or whole folders. Each song is analyzed once (tempo, beats, bars, sections, key, loudness, vocals). Browse by Songs, Artists, Albums or Genres with the tabs in the toolbar; cover art comes from each file's tags, and every column sorts. pink diamond looks through the folders you add for new files, keeps one row per song and plays the best version it has, replacing it when a better one turns up or its file is gone. See [docs/library.md](docs/library.md). A song's genre comes from its genre tag when that names one of Apple's twelve (Pop, Dance, Hip-Hop/Rap, R&B/Soul, Electronic, Alternative, Rock, Country, Latin, K-Pop, Reggae, Singer/Songwriter) and is Pop otherwise; change it in the Genre column. Keys show in Mixxx's key colours, in Lancelot (8A) or musical (Am) names, set in Settings.
 - **Playlists**: right-click songs in the Library → Add to Playlist, or drop files onto a playlist; drag to reorder. Between every two songs, the ◆ row shows the planned transition. Click it to open the deck view.
@@ -39,6 +41,7 @@ Needs macOS 27 and Xcode 27.
 | `Sources/Core/MixRenderer.swift` | Offline AVAudioEngine rebuilding the plan's DSP graph per song, including Apple's private AURemixFX |
 | `Sources/Core/MCPServer.swift` | The `--mcp` server: its own songs and edits over the same analysis, planner and renderer |
 | `Sources/Core/MetadataExport.swift` | `--export-metadata`: the crate's analysis in one file, as `get_song` gives it, in seconds |
+| `Sources/Core/SeedSearch.swift` | `--find-seed`: a `list_songs` seed that draws the songs asked for |
 | `Sources/Core/MixPlayer.swift` | Playlist playback: runs the renderer ahead of a realtime engine |
 | `Sources/UI/` | SwiftUI: library, playlists, deck view |
 | `Tests/` | Tests of Core, built with it by `./bundle.sh --test` |

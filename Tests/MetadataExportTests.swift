@@ -16,9 +16,19 @@ enum Tests {
         firstEntry()
         version()
         document()
+        draw()
         await library()
         FileHandle.standardError.write(Data((failures == 0 ? "all tests passed\n" : "\(failures) failed\n").utf8))
         exit(failures == 0 ? 0 : 1)
+    }
+
+    /// list_songs' random draw, pinned: seeds written into prompts have to keep drawing the same songs. The expected
+    /// orders come from a Python copy of SplitMix64 and the front-run Fisher-Yates, not from this code.
+    static func draw() {
+        check(MCPServer.draw(600, 10, seed: 482113) == [236, 432, 167, 297, 431, 482, 195, 434, 479, 105], "a seed draws what it always has")
+        check(MCPServer.draw(5, 5, seed: 0) == [4, 2, 0, 3, 1], "a draw of every song")
+        check(MCPServer.draw(600, 3, seed: 7) == Array(MCPServer.draw(600, 40, seed: 7).prefix(3)), "a smaller draw is the front of a larger one")
+        check(MCPServer.draw(3, 10, seed: 1).count == 3, "a draw of more songs than match")
     }
 
     static func firstEntry() {
